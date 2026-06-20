@@ -1,6 +1,7 @@
 import re
 import json
 import shutil
+import sys
 import time
 import threading
 import datetime
@@ -112,6 +113,69 @@ APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 LANCEDB_PATH.mkdir(parents=True, exist_ok=True)
 LanceDBConfig.set_config("uri", str(LANCEDB_PATH))
 
+
+def apply_llmware_python314_sqlite_fix() -> None:
+    """LLMWare 0.4.x uses $1…$N SQLite placeholders with tuple bindings; Python 3.14 requires ?."""
+    if sys.version_info < (3, 14):
+        return
+
+    from llmware import resources as llmware_resources
+
+    writer_cls = llmware_resources.SQLiteWriter
+    if getattr(writer_cls, "_python314_sqlite_patched", False):
+        return
+
+    def write_new_parsing_record(self, rec):
+        sql_string = f"INSERT INTO {self.library_name}"
+        sql_string += (
+            " (block_ID, doc_ID, content_type, file_type, master_index, master_index2, "
+            "coords_x, coords_y, coords_cx, coords_cy, author_or_speaker, added_to_collection, "
+            "file_source, table_block, modified_date, created_date, creator_tool, external_files, "
+            "text_block, header_text, text_search, user_tags, special_field1, special_field2, "
+            "special_field3, graph_status, dialog, embedding_flags) "
+            "VALUES (" + ", ".join(["?"] * 28) + ");"
+        )
+        insert_arr = (
+            rec["block_ID"],
+            rec["doc_ID"],
+            rec["content_type"],
+            rec["file_type"],
+            rec["master_index"],
+            rec["master_index2"],
+            rec["coords_x"],
+            rec["coords_y"],
+            rec["coords_cx"],
+            rec["coords_cy"],
+            rec["author_or_speaker"],
+            rec["added_to_collection"],
+            rec["file_source"],
+            rec["table"],
+            rec["modified_date"],
+            rec["created_date"],
+            rec["creator_tool"],
+            rec["external_files"],
+            rec["text"],
+            rec["header_text"],
+            rec["text_search"],
+            rec["user_tags"],
+            rec["special_field1"],
+            rec["special_field2"],
+            rec["special_field3"],
+            rec["graph_status"],
+            rec["dialog"],
+            "",
+        )
+        self.conn.cursor().execute(sql_string, insert_arr)
+        self.conn.commit()
+        self.conn.close()
+        return True
+
+    writer_cls.write_new_parsing_record = write_new_parsing_record
+    writer_cls._python314_sqlite_patched = True
+
+
+apply_llmware_python314_sqlite_fix()
+
 _EMBEDDING_USE_GPU = False
 _EMBEDDING_PATCH_INSTALLED = False
 
@@ -188,14 +252,33 @@ def get_corpus_root_path() -> Path | None:
         text = str(raw).strip()
         if text:
             return Path(text).expanduser()
-        return None
-    return load_corpus_root_path()
+    saved = load_corpus_root_path()
+    if saved:
+        return saved
+    return None
 
 
 def persist_corpus_root_path() -> None:
     raw = str(st.session_state.get("corpus_root_path_input", "")).strip()
     if raw:
         save_app_settings({"corpus_root_path": raw})
+
+
+def sync_corpus_root_widget_from_settings() -> None:
+    """Keep the folder text field aligned with saved settings when widget state is blank."""
+    saved = load_corpus_root_path()
+    if not saved:
+        return
+    saved_text = str(saved)
+    if not str(st.session_state.get("corpus_root_path_input", "")).strip():
+        st.session_state["corpus_root_path_input"] = saved_text
+
+
+def ensure_corpus_root_persisted(corpus_root: Path | None) -> None:
+    """Write the active corpus root to app settings before long-running index jobs."""
+    if corpus_root is None:
+        return
+    save_app_settings({"corpus_root_path": str(corpus_root)})
 
 
 def browse_for_directory(initial_dir: str | None = None) -> str | None:
@@ -1268,10 +1351,12 @@ if st.sidebar.button("Browse…", key="browse_corpus_root", use_container_width=
     current = load_corpus_root_path()
     picked = browse_for_directory(str(current) if current else None)
     if picked:
+        picked = picked.strip()
         save_app_settings({"corpus_root_path": picked})
-        st.session_state.pop("corpus_root_path_input", None)
+        st.session_state["corpus_root_path_input"] = picked
         st.rerun()
 
+sync_corpus_root_widget_from_settings()
 _saved_corpus_root = load_corpus_root_path()
 st.sidebar.text_input(
     "Corpus root folder",
@@ -1338,7 +1423,9 @@ try:
 except Exception:
     _status_lib = None
     active_model = None
-    st.sidebar.warning("Library not yet initialised.")
+    st.sidebar.warning(
+        "Library not yet initialised. Use **Re-index (full rebuild)** below to create the search index."
+    )
 
 last_updated = get_last_updated(corpus_root_path / selected_lib)
 if last_updated:
@@ -1452,6 +1539,7 @@ rebuild_disabled = not first_index and model_change_pending and not reembed_ack
 
 if st.sidebar.button("⚡ Rescan (incremental)", disabled=sync_disabled, key=f"sync_{safe_lib}"):
     try:
+        ensure_corpus_root_persisted(corpus_root_path)
         set_embedding_acceleration(get_use_gpu_for_embeddings())
 
         def _sync_incremental() -> dict:
@@ -1476,6 +1564,7 @@ if st.sidebar.button("⚡ Rescan (incremental)", disabled=sync_disabled, key=f"s
 
 if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, key=f"rebuild_{safe_lib}"):
     try:
+        ensure_corpus_root_persisted(corpus_root_path)
         set_embedding_acceleration(get_use_gpu_for_embeddings())
 
         def _sync_rebuild() -> dict:

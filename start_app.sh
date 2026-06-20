@@ -13,6 +13,17 @@ else
     exit 1
 fi
 
+for pkg_import in transformers pydub; do
+    if ! python3 -c "import ${pkg_import}" 2>/dev/null; then
+        echo "Missing dependency: ${pkg_import} (required for indexing/embedding)."
+        echo "Run: pip install -r requirements.txt"
+        if [ "${pkg_import}" = "pydub" ]; then
+            echo "On Python 3.13+, pydub also needs: pip install audioop-lts"
+        fi
+        exit 1
+    fi
+done
+
 echo "Ensuring Ollama is running for Answer with LLM..."
 python3 ensure_ollama_ready.py || echo "Warning: Ollama warm-up failed; continuing anyway."
 

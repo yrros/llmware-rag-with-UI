@@ -1,0 +1,7 @@
+llmware>=0.4.6
+streamlit>=1.58
+lancedb>=0.33
+torch>=2.12
+transformers>=4.40
+pydub>=0.25
+audioop-lts>=0.2.2; python_version >= "3.13"

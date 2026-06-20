@@ -64,7 +64,13 @@ Apple Notes export (markdown folders)
 cd /path/to/rag_llmware
 python3 -m venv venv
 source venv/bin/activate
-pip install llmware streamlit lancedb torch
+pip install -r requirements.txt
+```
+
+Or manually:
+
+```bash
+pip install llmware streamlit lancedb torch transformers pydub
 ```
 
 Use the same `venv` for every run. The app expects `lancedb` to be available in the active environment.
