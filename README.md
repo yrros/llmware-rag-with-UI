@@ -92,6 +92,13 @@ Each **immediate subfolder** of the corpus root becomes a selectable library in 
 
 Set the corpus root to `/your/export/iCloud` (or whichever folder contains your library subfolders). There is no default — the path must be set in the UI or saved in `app_settings.json`.
 
+**Corpus mode** (sidebar radio, saved in `app_settings.json`):
+
+| Mode | Use when |
+|------|----------|
+| **Multi-Corpus** | Organised export with one subfolder per collection (default) |
+| **Single-Corpus** | Smaller or flat exports — one searchable index for every file under the root |
+
 ### 3. (Optional) Desktop launcher
 
 ```bash
@@ -235,6 +242,7 @@ On first run, the app may copy data from the legacy location `~/llmware_data/` i
 ### Global (`app_settings.json`)
 
 - `corpus_root_path` — top-level folder containing library subfolders
+- `corpus_mode` — `multi` (default) or `single`
 - `use_gpu_for_embeddings` — default `false`; CUDA only on supported hardware
 
 ### In-app constants (`UI-semantic-search.py`)

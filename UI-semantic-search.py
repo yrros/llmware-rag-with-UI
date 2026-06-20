@@ -12,7 +12,7 @@ from llmware.library import Library, LibraryCatalog
 from llmware.retrieval import Query
 from llmware.resources import Status
 from llmware.models import ModelCatalog, HFEmbeddingModel
-from llmware.configs import LLMWareConfig, LanceDBConfig
+from llmware.configs import LLMWareConfig, LanceDBConfig, SQLiteConfig
 from llmware.embeddings import _EmbeddingUtils
 
 # ---------------------------------------------------------------------------
@@ -92,7 +92,13 @@ APP_SETTINGS_PATH = APP_DATA_DIR / "app_settings.json"
 DEFAULT_APP_SETTINGS = {
     "use_gpu_for_embeddings": False,
     "hide_corpora_enabled": False,
+    "corpus_mode": "multi",
 }
+
+CORPUS_MODE_MULTI = "multi"
+CORPUS_MODE_SINGLE = "single"
+SINGLE_CORPUS_DISPLAY_NAME = "All notes"
+SINGLE_CORPUS_LIBRARY_NAME = "Single_Corpus"
 
 DEFAULT_CORPUS_CONFIG = {
     "embedding_model": DEFAULT_EMBEDDING_MODEL,
@@ -111,6 +117,8 @@ LLMWareConfig().set_config("hardware_accelerator", "mac_metal")
 LLMWareConfig().set_home(str(PROJECT_DIR))
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 LANCEDB_PATH.mkdir(parents=True, exist_ok=True)
+# SQLiteConfig captures get_library_path() at import time — refresh after set_home().
+SQLiteConfig.set_config("sqlite_db_folder_path", str(APP_DATA_DIR / "accounts"))
 LanceDBConfig.set_config("uri", str(LANCEDB_PATH))
 
 
@@ -175,6 +183,45 @@ def apply_llmware_python314_sqlite_fix() -> None:
 
 
 apply_llmware_python314_sqlite_fix()
+
+
+def apply_llmware_fts_query_fix() -> None:
+    """LLMWare FTS prep keeps empty tokens from trailing spaces, producing invalid `van OR` queries."""
+    from llmware import resources as llmware_resources
+
+    retrieval_cls = llmware_resources.SQLiteRetrieval
+    if getattr(retrieval_cls, "_fts_query_patched", False):
+        return
+
+    def _prep_query(self, query):
+        sqlite_strings = {"AND": " AND ", "OR": " OR "}
+        exact_match = query.startswith('"') and query.endswith('"')
+        q_clean = re.sub(r"[^\w\s]", "", query)
+        q_toks = [tok for tok in q_clean.split() if tok]
+        if not q_toks:
+            return ""
+        joiner = sqlite_strings["AND"] if exact_match else sqlite_strings["OR"]
+        return joiner.join(q_toks)
+
+    def basic_query(self, query):
+        query_str = self._prep_query(query)
+        if not query_str.strip():
+            return []
+        sql_query = (
+            f"SELECT rank, rowid, * FROM {self.library_name} "
+            f"WHERE text_search MATCH '{query_str}' ORDER BY rank"
+        )
+        results = self.conn.cursor().execute(sql_query)
+        output = self.unpack_search_result(results)
+        self.conn.close()
+        return output
+
+    retrieval_cls._prep_query = _prep_query
+    retrieval_cls.basic_query = basic_query
+    retrieval_cls._fts_query_patched = True
+
+
+apply_llmware_fts_query_fix()
 
 _EMBEDDING_USE_GPU = False
 _EMBEDDING_PATCH_INSTALLED = False
@@ -279,6 +326,53 @@ def ensure_corpus_root_persisted(corpus_root: Path | None) -> None:
     if corpus_root is None:
         return
     save_app_settings({"corpus_root_path": str(corpus_root)})
+
+
+def get_corpus_mode() -> str:
+    """Return active corpus layout mode: multi (subfolder per library) or single (whole tree)."""
+    mode = st.session_state.get("corpus_mode_toggle")
+    if mode in (CORPUS_MODE_MULTI, CORPUS_MODE_SINGLE):
+        return mode
+    saved = load_app_settings().get("corpus_mode", CORPUS_MODE_MULTI)
+    return saved if saved in (CORPUS_MODE_MULTI, CORPUS_MODE_SINGLE) else CORPUS_MODE_MULTI
+
+
+def is_single_corpus_mode() -> bool:
+    return get_corpus_mode() == CORPUS_MODE_SINGLE
+
+
+def persist_corpus_mode() -> None:
+    mode = st.session_state.get("corpus_mode_toggle", CORPUS_MODE_MULTI)
+    if mode not in (CORPUS_MODE_MULTI, CORPUS_MODE_SINGLE):
+        mode = CORPUS_MODE_MULTI
+    save_app_settings({"corpus_mode": mode})
+
+
+def sync_corpus_mode_from_settings() -> None:
+    if "corpus_mode_toggle" not in st.session_state:
+        st.session_state["corpus_mode_toggle"] = load_app_settings().get("corpus_mode", CORPUS_MODE_MULTI)
+
+
+def resolve_library_registry_name(selected_lib: str) -> str:
+    """LLMWare library key (sanitized) for SQLite and LanceDB."""
+    if is_single_corpus_mode():
+        return SINGLE_CORPUS_LIBRARY_NAME
+    return sanitize_library_name(selected_lib)
+
+
+def resolve_library_content_path(corpus_root: Path, selected_lib: str) -> Path:
+    """Folder on disk that is scanned during ingest for the active selection."""
+    if is_single_corpus_mode():
+        return corpus_root
+    return corpus_root / selected_lib
+
+
+def corpus_has_ingestible_files(corpus_root: Path) -> bool:
+    """True when the corpus root contains at least one supported ingest file."""
+    for path in corpus_root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in INGEST_EXTENSIONS:
+            return True
+    return False
 
 
 def browse_for_directory(initial_dir: str | None = None) -> str | None:
@@ -522,6 +616,25 @@ def load_embedding_model_catalog() -> tuple[dict, ...]:
 def get_model_dims(embedding_model: str) -> int:
     card = ModelCatalog().lookup_model_card(embedding_model)
     return int(card.get("embedding_dims", 384)) if card else 384
+
+
+def get_embedding_batch_size(embedding_model: str) -> int:
+    """Large HF models embed slowly — use smaller batches to avoid stalls/OOM."""
+    if embedding_model in {"gte-large", "gte-large-en-v1.5", "bge-large-en-v1.5"}:
+        return 16
+    if "large" in embedding_model.lower():
+        return 32
+    return 100
+
+
+def lancedb_table_names(db) -> list[str]:
+    """Return LanceDB table names across API versions."""
+    if hasattr(db, "list_tables"):
+        listed = db.list_tables()
+        if hasattr(listed, "tables"):
+            return list(listed.tables)
+        return list(listed)
+    return list(db.table_names())
 
 
 def get_model_label(embedding_model: str) -> str:
@@ -781,8 +894,9 @@ def render_debug_panel(
     """Show detailed library diagnostics (caller wraps in sidebar expander)."""
     st.caption(f"Internal library name: `{safe_lib}`")
     st.caption(f"Data directory: `{APP_DATA_DIR}`")
+    st.caption(f"SQLite catalog: `{SQLiteConfig.get_uri_string()}`")
     st.caption(f"Vector index path: `{LANCEDB_PATH}`")
-    st.caption(f"Corpus folder: `{get_corpus_root_path() / selected_lib if get_corpus_root_path() else 'not set'}`")
+    st.caption(f"Corpus folder: `{resolve_library_content_path(get_corpus_root_path(), selected_lib) if get_corpus_root_path() else 'not set'}`")
     st.caption(
         f"Embedding runtime device: **`{resolve_embedding_device_label(get_use_gpu_for_embeddings())}`** · "
         "LLM answers via Ollama use a separate Metal/GPU path."
@@ -791,7 +905,7 @@ def render_debug_panel(
     corpus_root = get_corpus_root_path()
     if not corpus_root:
         return
-    lib_path = corpus_root / selected_lib
+    lib_path = resolve_library_content_path(corpus_root, selected_lib)
     try:
         md_files = list(lib_path.rglob("*.md"))
         st.write(f"`.md` files on disk: **{len(md_files)}**")
@@ -838,10 +952,12 @@ def get_active_library_embedding(lib: Library) -> str | None:
 
 
 def get_libraries() -> list[str]:
-    """Return subfolder names under the corpus root — each becomes a Library."""
+    """Return selectable libraries for the active corpus mode."""
     corpus_root = get_corpus_root_path()
     if corpus_root is None or not corpus_root.exists():
         return []
+    if is_single_corpus_mode():
+        return [SINGLE_CORPUS_DISPLAY_NAME] if corpus_has_ingestible_files(corpus_root) else []
     return sorted(d.name for d in corpus_root.iterdir() if d.is_dir())
 
 def sanitize_library_name(name: str) -> str:
@@ -893,7 +1009,7 @@ def delete_vector_table(safe_lib: str, embedding_model: str) -> None:
             shutil.rmtree(lance_dir)
 
         db = lancedb.connect(str(LANCEDB_PATH))
-        if table_name in db.table_names():
+        if table_name in lancedb_table_names(db):
             db.drop_table(table_name)
     except Exception:
         pass
@@ -955,9 +1071,20 @@ def sync_library(lib: Library, folder_path: Path, embedding_model: str) -> dict:
     """Ingest all files recursively, then build embeddings."""
     ingest_stats = ingest_all_files(lib, folder_path)
     prepare_embeddings(lib, embedding_model)
-    lib.install_new_embedding(embedding_model, VECTOR_DB)
+    lib.install_new_embedding(
+        embedding_model,
+        VECTOR_DB,
+        batch_size=get_embedding_batch_size(embedding_model),
+        use_gpu=_EMBEDDING_USE_GPU,
+    )
     ingest_stats["vectors"] = get_vector_row_count(lib.library_name, embedding_model)
     ingest_stats["blocks_total"] = get_library_block_count(lib.library_name)
+    if ingest_stats["vectors"] == 0 and ingest_stats.get("blocks_total", 0) > 0:
+        raise RuntimeError(
+            f"Embedding finished with 0 vectors for `{embedding_model}` despite "
+            f"{ingest_stats['blocks_total']} text blocks. Try **Re-index** again or "
+            "switch to a smaller model (e.g. mini-lm-sbert) to confirm the pipeline."
+        )
     return ingest_stats
 
 
@@ -980,7 +1107,7 @@ def get_vector_row_count(safe_lib: str, embedding_model: str) -> int:
 
         db = lancedb.connect(str(LANCEDB_PATH))
         name = get_collection_name(safe_lib, embedding_model)
-        if name not in db.table_names():
+        if name not in lancedb_table_names(db):
             return 0
         return db.open_table(name).count_rows()
     except Exception:
@@ -1004,7 +1131,7 @@ def migrate_legacy_vectors(safe_lib: str, embedding_model: str = DEFAULT_EMBEDDI
         import lancedb
 
         legacy_db = lancedb.connect(str(LEGACY_LANCEDB_PATH))
-        if name not in legacy_db.table_names() or legacy_db.open_table(name).count_rows() == 0:
+        if name not in lancedb_table_names(legacy_db) or legacy_db.open_table(name).count_rows() == 0:
             return False
 
         dest = LANCEDB_PATH / f"{name}.lance"
@@ -1028,10 +1155,10 @@ def migrate_all_legacy_vectors() -> list[str]:
         legacy_db = lancedb.connect(str(LEGACY_LANCEDB_PATH))
         dest_db = lancedb.connect(str(LANCEDB_PATH))
 
-        for name in legacy_db.table_names():
+        for name in lancedb_table_names(legacy_db):
             if legacy_db.open_table(name).count_rows() == 0:
                 continue
-            if name in dest_db.table_names() and dest_db.open_table(name).count_rows() > 0:
+            if name in lancedb_table_names(dest_db) and dest_db.open_table(name).count_rows() > 0:
                 continue
 
             src = LEGACY_LANCEDB_PATH / f"{name}.lance"
@@ -1296,6 +1423,22 @@ def answer_with_ollama(
     return answer, usage
 
 
+def normalize_text_search_query(query: str) -> str | None:
+    """Collapse whitespace and drop punctuation so LLMWare FTS gets clean tokens."""
+    cleaned = re.sub(r"[^\w\s]", " ", query or "")
+    tokens = [tok for tok in cleaned.split() if tok]
+    return " ".join(tokens) if tokens else None
+
+
+def safe_text_query(q: Query, query: str, result_count: int = 20) -> list:
+    """Run a text pre-filter/fallback query, skipping empty or punctuation-only input."""
+    normalized = normalize_text_search_query(query)
+    if not normalized:
+        return []
+    results = q.text_query(normalized, result_count=result_count)
+    return results or []
+
+
 def perform_search(
     search_lib: Library,
     prompt_text: str,
@@ -1311,7 +1454,11 @@ def perform_search(
         vector_db=VECTOR_DB,
     )
 
-    filter_context = q.text_query(topic_query, result_count=1000) if topic_query.strip() else None
+    filter_context = (
+        safe_text_query(q, topic_query, result_count=1000)
+        if normalize_text_search_query(topic_query)
+        else None
+    )
     filtered_ids = {res.get("doc_ID") for res in filter_context} if filter_context else None
 
     semantic_count = min(result_limit * 3, 100) if filtered_ids else result_limit
@@ -1323,8 +1470,8 @@ def perform_search(
 
     used_text_fallback = False
     if not broad_results:
-        broad_results = q.text_query(prompt_text, result_count=semantic_count)
-        used_text_fallback = True
+        broad_results = safe_text_query(q, prompt_text, result_count=semantic_count)
+        used_text_fallback = bool(broad_results)
 
     if filtered_ids:
         final_results = [res for res in broad_results if res.get("doc_ID") in filtered_ids]
@@ -1363,7 +1510,7 @@ st.sidebar.text_input(
     value=str(_saved_corpus_root) if _saved_corpus_root else "",
     key="corpus_root_path_input",
     on_change=persist_corpus_root_path,
-    help="Top-level export folder with one subfolder per library (e.g. iCloud from Apple Notes).",
+    help="Notes export folder. Multi-Corpus: one subfolder per library. Single-Corpus: index the whole tree.",
     placeholder="Select or enter your notes export folder…",
 )
 
@@ -1376,6 +1523,25 @@ if not corpus_root_path.exists():
     st.stop()
 
 st.sidebar.caption(f"Saved in `{APP_SETTINGS_PATH.name}`")
+
+sync_corpus_mode_from_settings()
+st.sidebar.radio(
+    "Corpus mode",
+    options=[CORPUS_MODE_MULTI, CORPUS_MODE_SINGLE],
+    format_func=lambda mode: "Multi-Corpus" if mode == CORPUS_MODE_MULTI else "Single-Corpus",
+    key="corpus_mode_toggle",
+    horizontal=True,
+    on_change=persist_corpus_mode,
+    help=(
+        "**Multi-Corpus** — each immediate subfolder is a separate searchable library. "
+        "**Single-Corpus** — one library for all notes under the root (flat or mixed layouts)."
+    ),
+)
+if is_single_corpus_mode():
+    st.sidebar.caption("Single-Corpus indexes every supported file under the root, including subfolders.")
+else:
+    st.sidebar.caption("Multi-Corpus treats each top-level subfolder as its own library.")
+
 st.sidebar.divider()
 
 # ---------------------------------------------------------------------------
@@ -1395,20 +1561,32 @@ if _migrated_tables:
 
 all_libraries = get_libraries()
 if not all_libraries:
-    st.sidebar.error(f"No subfolders found in:\n`{corpus_root_path}`")
+    if is_single_corpus_mode():
+        st.sidebar.error(
+            f"No ingestible files found under:\n`{corpus_root_path}`\n\n"
+            f"Supported types: {', '.join(sorted(INGEST_EXTENSIONS))}"
+        )
+    else:
+        st.sidebar.error(f"No subfolders found in:\n`{corpus_root_path}`")
     st.stop()
 
-visible_libraries = filter_libraries_for_display(all_libraries)
-if not visible_libraries:
-    st.sidebar.warning("All corpora are hidden. Turn off hiding in Advanced or unhide a corpus.")
-    visible_libraries = all_libraries
+if is_single_corpus_mode():
+    selected_lib = SINGLE_CORPUS_DISPLAY_NAME
+    st.sidebar.markdown(f"**Library:** {SINGLE_CORPUS_DISPLAY_NAME}")
+else:
+    visible_libraries = filter_libraries_for_display(all_libraries)
+    if not visible_libraries:
+        st.sidebar.warning("All corpora are hidden. Turn off hiding in Advanced or unhide a corpus.")
+        visible_libraries = all_libraries
 
-selected_lib = st.sidebar.selectbox("Select Library", visible_libraries)
-if is_hide_corpora_enabled():
-    hidden_count = len(all_libraries) - len(filter_libraries_for_display(all_libraries))
-    if hidden_count:
-        st.sidebar.caption(f"{hidden_count} corpus/corpora hidden from this list.")
-safe_lib = sanitize_library_name(selected_lib)
+    selected_lib = st.sidebar.selectbox("Select Library", visible_libraries)
+    if is_hide_corpora_enabled():
+        hidden_count = len(all_libraries) - len(filter_libraries_for_display(all_libraries))
+        if hidden_count:
+            st.sidebar.caption(f"{hidden_count} corpus/corpora hidden from this list.")
+
+safe_lib = resolve_library_registry_name(selected_lib)
+library_content_path = resolve_library_content_path(corpus_root_path, selected_lib)
 corpus_config = get_corpus_config(safe_lib)
 
 model_catalog = list(load_embedding_model_catalog())
@@ -1427,7 +1605,7 @@ except Exception:
         "Library not yet initialised. Use **Re-index (full rebuild)** below to create the search index."
     )
 
-last_updated = get_last_updated(corpus_root_path / selected_lib)
+last_updated = get_last_updated(library_content_path)
 if last_updated:
     st.sidebar.caption(f"Last indexed: {last_updated}")
 
@@ -1522,7 +1700,8 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
         )
         st.success("Saved for this corpus.")
 
-    render_corpus_visibility_controls(all_libraries)
+    if not is_single_corpus_mode():
+        render_corpus_visibility_controls(all_libraries)
 
 with st.sidebar.expander("Debug details", expanded=False):
     render_debug_panel(selected_lib, safe_lib, _status_lib, corpus_config)
@@ -1543,8 +1722,8 @@ if st.sidebar.button("⚡ Rescan (incremental)", disabled=sync_disabled, key=f"s
         set_embedding_acceleration(get_use_gpu_for_embeddings())
 
         def _sync_incremental() -> dict:
-            lib = load_or_create_library(selected_lib, embedding_model=pending_model)
-            return sync_library(lib, corpus_root_path / selected_lib, pending_model)
+            lib = load_or_create_library(safe_lib, embedding_model=pending_model)
+            return sync_library(lib, library_content_path, pending_model)
 
         job_status = run_with_embedding_progress(
             f"Syncing '{selected_lib}'", safe_lib, pending_model, _sync_incremental
@@ -1568,8 +1747,8 @@ if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, 
         set_embedding_acceleration(get_use_gpu_for_embeddings())
 
         def _sync_rebuild() -> dict:
-            lib = load_or_create_library(selected_lib, force_create=True, embedding_model=pending_model)
-            return sync_library(lib, corpus_root_path / selected_lib, pending_model)
+            lib = load_or_create_library(safe_lib, force_create=True, embedding_model=pending_model)
+            return sync_library(lib, library_content_path, pending_model)
 
         job_status = run_with_embedding_progress(
             f"Rebuilding '{selected_lib}'", safe_lib, pending_model, _sync_rebuild
@@ -1593,7 +1772,7 @@ render_sidebar_job_summary(selected_lib, safe_lib)
 corpus_config = get_corpus_config(safe_lib)
 selected_embedding_model = corpus_config["embedding_model"]
 distance_threshold = float(corpus_config["distance_threshold"])
-library_folder = corpus_root_path / selected_lib
+library_folder = library_content_path
 
 
 # ---------------------------------------------------------------------------
