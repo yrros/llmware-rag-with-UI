@@ -1,0 +1,4 @@
+__pycache__/
+llmware_data/
+.venv/
+venv/
