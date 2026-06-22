@@ -979,22 +979,80 @@ def load_or_create_library(name: str, force_create: bool = False, embedding_mode
         return Library().create_new_library(safe_name)
 
 
+def get_library_folder_path(safe_lib: str) -> Path:
+    """Return the on-disk folder for a library under the active account."""
+    return APP_DATA_DIR / "accounts" / "llmware" / safe_lib
+
+
+def count_library_uploads(lib: Library) -> int:
+    """Count files already copied into the library uploads folder."""
+    try:
+        uploads = Path(lib.file_copy_path)
+        if not uploads.exists():
+            return 0
+        return sum(1 for path in uploads.iterdir() if path.is_file())
+    except Exception:
+        return 0
+
+
+def clear_library_uploads(lib: Library) -> None:
+    """Remove copied source files so ingest will parse them again."""
+    try:
+        uploads = Path(lib.file_copy_path)
+        if uploads.exists():
+            shutil.rmtree(uploads)
+        uploads.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def repair_library_index_state(lib: Library, embedding_model: str) -> list[str]:
+    """Fix split-brain states left by failed ingests or partial resets."""
+    actions: list[str] = []
+    blocks = get_library_block_count(lib.library_name)
+    vectors = get_vector_row_count(lib.library_name, embedding_model)
+    uploads = count_library_uploads(lib)
+
+    if blocks == 0 and uploads > 0:
+        clear_library_uploads(lib)
+        actions.append(f"cleared {uploads} stale upload(s)")
+
+    if blocks == 0 and vectors > 0:
+        delete_vector_table(lib.library_name, embedding_model)
+        try:
+            lib.delete_installed_embedding(embedding_model, VECTOR_DB)
+        except Exception:
+            pass
+        actions.append(f"removed {vectors} orphan vector(s)")
+
+    return actions
+
+
 def hard_reset_library(name: str, embedding_model: str) -> Library:
     """Delete library artifacts, vector index, and create a fresh library."""
     safe_name = sanitize_library_name(name)
+    library_path = get_library_folder_path(safe_name)
+    models_to_clear = {embedding_model}
 
     try:
         temp_lib = Library().load_library(safe_name)
-        active_model = get_active_library_embedding(temp_lib) or embedding_model
-        try:
-            temp_lib.delete_installed_embedding(active_model, VECTOR_DB)
-        except Exception:
-            pass
+        active_model = get_active_library_embedding(temp_lib)
+        if active_model:
+            models_to_clear.add(active_model)
+        for model in models_to_clear:
+            try:
+                temp_lib.delete_installed_embedding(model, VECTOR_DB)
+            except Exception:
+                pass
+            delete_vector_table(safe_name, model)
         temp_lib.delete_library(confirm_delete=True)
     except Exception:
         pass
 
-    delete_vector_table(safe_name, embedding_model)
+    if library_path.exists():
+        shutil.rmtree(library_path, ignore_errors=True)
+    for model in models_to_clear:
+        delete_vector_table(safe_name, model)
     return Library().create_new_library(safe_name)
 
 
@@ -1058,9 +1116,24 @@ def get_library_block_count(safe_lib: str) -> int:
 
 
 def prepare_embeddings(lib: Library, embedding_model: str) -> None:
-    """Clear stale embedding flags when the vector index is missing or empty."""
-    if get_vector_row_count(lib.library_name, embedding_model) > 0:
+    """Align embedding metadata with the current text index before building vectors."""
+    blocks = get_library_block_count(lib.library_name)
+    vectors = get_vector_row_count(lib.library_name, embedding_model)
+
+    if blocks == 0:
+        delete_vector_table(lib.library_name, embedding_model)
+        try:
+            lib.delete_installed_embedding(embedding_model, VECTOR_DB)
+        except Exception:
+            pass
         return
+
+    ready, _ = is_embedding_ready(lib, embedding_model)
+    if ready:
+        return
+
+    if vectors > 0:
+        delete_vector_table(lib.library_name, embedding_model)
     try:
         lib.delete_installed_embedding(embedding_model, VECTOR_DB)
     except Exception:
@@ -1069,6 +1142,7 @@ def prepare_embeddings(lib: Library, embedding_model: str) -> None:
 
 def sync_library(lib: Library, folder_path: Path, embedding_model: str) -> dict:
     """Ingest all files recursively, then build embeddings."""
+    repair_library_index_state(lib, embedding_model)
     ingest_stats = ingest_all_files(lib, folder_path)
     prepare_embeddings(lib, embedding_model)
     lib.install_new_embedding(
@@ -1178,6 +1252,22 @@ def migrate_all_legacy_vectors() -> list[str]:
 
 def is_embedding_ready(lib: Library, embedding_model: str) -> tuple[bool, str]:
     """Return whether the library has a usable semantic index for our model/db."""
+    blocks = get_library_block_count(lib.library_name)
+    vector_rows = get_vector_row_count(lib.library_name, embedding_model)
+
+    if blocks == 0:
+        if vector_rows > 0:
+            return False, (
+                f"Text index is empty but {vector_rows} stale vectors remain. "
+                "Use **Re-index (full rebuild)** in the sidebar."
+            )
+        if count_library_uploads(lib) > 0:
+            return False, (
+                "Files were copied but never parsed into the text index. "
+                "Use **Re-index (full rebuild)** in the sidebar."
+            )
+        return False, "No text blocks indexed yet. Use **Re-index (full rebuild)** in the sidebar."
+
     record = lib.get_embedding_status()
     if not record:
         return False, "No embedding record found."
