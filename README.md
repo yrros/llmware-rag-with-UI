@@ -7,8 +7,8 @@ The app indexes markdown (and other supported) files from folder on your **local
 Each subfolder under your corpus root becomes its own **library** (e.g. `Personal Projects`, `Book Notes`, `Development`). You can select the embedding model for each of these folders to get the right level of precision.
 This approach means you can search those top-level folders quickly.
 
-This solution was built after trying other RAG solutions including Obsidain with copilot (slow to index and no GPU use), LLM Anyware was also tried but found it could not harness the GPUS and multi core CPUs of a modern Mac.
-The system used for this was a M3 Pro with 36GB of RAM.
+**This solution was built after trying other RAG solutions including Obsidain with copilot (slow to index and no GPU use), LLM Anyware was also tried but found it could not harness the GPUS and multi core CPUs of a modern Mac.
+The system used for this was a M3 Pro with 36GB of RAM.**
 ---
 
 ## What it does
