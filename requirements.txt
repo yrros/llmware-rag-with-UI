@@ -2,6 +2,12 @@ llmware>=0.4.6
 streamlit>=1.58
 lancedb>=0.33
 torch>=2.12
+torchvision>=0.21
 transformers>=4.40
+pyarrow>=15
+numpy>=1.26
+pillow>=10
+safetensors>=0.4
+tokenizers>=0.15
 pydub>=0.25
 audioop-lts>=0.2.2; python_version >= "3.13"

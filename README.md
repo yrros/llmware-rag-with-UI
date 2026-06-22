@@ -48,10 +48,10 @@ Apple Notes export (markdown folders)
 
 ## Prerequisites
 
-- **Python 3.10+** (3.13 tested)
+- **Python 3.10+** (3.13 tested; 3.14 works with app patches)
 - **Apple Silicon Mac** (M-series) — configured for `mac_metal` / MPS; CUDA used automatically on NVIDIA machines
-- **Virtual environment** with dependencies installed (`llmware`, `streamlit`, `lancedb`, `torch`, etc.)
-- **Ollama** (optional) — for generative answers; install and pull a model, e.g. `ollama pull llama3.2:3b`
+- **Virtual environment** with dependencies installed — see [Setup](#setup) (`pip install -r requirements.txt`)
+- **Ollama** (optional) — for generative answers; on Mac, [install via Homebrew](#2-install-ollama-on-mac-optional) (recommended)
 - **Exported notes** — markdown files organised in folders (see [Corpus layout](#corpus-layout)). Export from Apple Notes using the [Falcon Notes Exporter](https://falcon.star-lord.me/exporter).
 
 ---
@@ -64,18 +64,41 @@ Apple Notes export (markdown folders)
 cd /path/to/rag_llmware
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+python3 -m pip install --upgrade pip
+pip install --requirement requirements.txt --upgrade-strategy eager
 ```
 
-Or manually:
+`pip install` resolves and installs **all transitive dependencies** automatically (for example `numpy`, `pillow`, `safetensors`, and `tokenizers` alongside `torch` / `torchvision` / `transformers`). Do **not** use `--no-deps`.
+
+Or install the top-level packages manually (pip still pulls their dependencies):
 
 ```bash
-pip install llmware streamlit lancedb torch transformers pydub
+pip install llmware streamlit lancedb torch torchvision transformers pyarrow pydub
+```
+
+On **Python 3.13+**, also install:
+
+```bash
+pip install audioop-lts
 ```
 
 Use the same `venv` for every run. The app expects `lancedb` to be available in the active environment.
 
-### 2. Point the app at your note export
+### 2. Install Ollama on Mac (optional)
+
+For **Answer with LLM**, install [Ollama](https://ollama.com/). On a Mac, the easiest route is [Homebrew](https://brew.sh) — the standard package manager for macOS (installs Ollama and its dependencies in one step).
+
+If you do not have Homebrew yet, install it from [https://brew.sh](https://brew.sh), then run:
+
+```bash
+brew install ollama
+brew services start ollama
+ollama pull llama3.2:3b
+```
+
+`start_app.sh` will also try to start Ollama if it is not already running.
+
+### 3. Point the app at your note export
 
 **In the app:** use **Notes location** at the top of the left sidebar. Enter the path to your export folder or click **Browse…** to pick it. The path is saved to `./llmware_data/app_settings.json`.
 
@@ -99,7 +122,7 @@ Set the corpus root to `/your/export/iCloud` (or whichever folder contains your 
 | **Multi-Corpus** | Organised export with one subfolder per collection (default) |
 | **Single-Corpus** | Smaller or flat exports — one searchable index for every file under the root |
 
-### 3. (Optional) Desktop launcher
+### 4. (Optional) Desktop launcher
 
 ```bash
 ./setup_launcher.sh
