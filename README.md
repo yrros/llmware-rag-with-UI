@@ -9,7 +9,6 @@ This approach means you can search those top-level folders quickly.
 
 This solution was built after trying other RAG solutions including Obsidain with copilot (slow to index and no GPU use), LLM Anyware was also tried but found it could not harness the GPUS and multi core CPUs of a modern Mac.
 The system used for this was a M3 Pro with 36GB of RAM.
----
 
 ## What it does
 
