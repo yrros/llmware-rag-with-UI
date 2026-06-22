@@ -124,10 +124,10 @@ Set the corpus root to `/your/export/iCloud` (or whichever folder contains your 
 ### 4. (Optional) Desktop launcher
 
 ```bash
-./setup_launcher.sh
+./Installer.sh
 ```
 
-Creates `~/Desktop/Launch_Rag_App.command`, which activates `venv` and starts Streamlit from the project directory.
+Creates `~/Desktop/LLM-RAG.app`, which opens Terminal, activates `venv`, and starts Streamlit from the project directory.
 
 ---
 
@@ -149,9 +149,9 @@ python3 ensure_ollama_ready.py   # optional; start_app.sh runs this automaticall
 python3 -m streamlit run UI-semantic-search.py
 ```
 
-`start_app.sh` (and the Desktop launcher from `setup_launcher.sh`) starts **Ollama if it is not already running**, then warms the **Answer with LLM** model configured in your corpus settings (most common `ollama_model` across libraries, usually `llama3.2:3b`). Embedding models are **not** pre-loaded at startup.
+`start_app.sh` (and the Desktop launcher from `Installer.sh`) starts **Ollama if it is not already running**, then warms the **Answer with LLM** model configured in your corpus settings (most common `ollama_model` across libraries, usually `llama3.2:3b`). Embedding models are **not** pre-loaded at startup.
 
-Re-run `./setup_launcher.sh` once if you already have an older Desktop launcher.
+Re-run `./Installer.sh` once if you already have an older Desktop launcher.
 
 Streamlit opens in your browser (typically `http://localhost:8501`).
 
@@ -307,7 +307,7 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 | `UI-semantic-search.py` | Main Streamlit application |
 | `start_app.sh` | Start/warm Ollama, then launch Streamlit |
 | `ensure_ollama_ready.py` | Starts Ollama if needed and warms the configured LLM |
-| `setup_launcher.sh` | Creates a Desktop launcher with the same startup steps |
+| `Installer.sh` | Creates the Desktop `LLM-RAG.app` launcher with the same startup steps |
 | `.gitignore` | Excludes `llmware_data/`, venvs, `__pycache__` |
 
 ---

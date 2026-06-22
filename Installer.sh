@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Build a Desktop app launcher with the project logo as its icon.
+# Installer: build the Desktop LLM-RAG.app launcher with the project logo.
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGO_PNG="$PROJECT_DIR/LLM-RAG_logo.png"
 ASSETS_DIR="$PROJECT_DIR/assets"
@@ -110,6 +110,6 @@ if [[ -e "$LEGACY_LAUNCHER" ]]; then
 fi
 
 touch "$APP_PATH"
-echo "Setup complete. Desktop launcher: $APP_PATH"
+echo "Install complete. Desktop launcher: $APP_PATH"
 echo "Icon source: $LOGO_PNG"
 echo "Generated icon: $ICNS_PATH"
