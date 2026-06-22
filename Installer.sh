@@ -1,17 +1,25 @@
 #!/bin/bash
 set -euo pipefail
 
-# Installer: build the Desktop LLM-RAG.app launcher with the project logo.
+# Installer: Python env + Desktop LLM-Notes.app launcher with the project logo.
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGO_PNG="$PROJECT_DIR/LLM-RAG_logo.png"
 ASSETS_DIR="$PROJECT_DIR/assets"
 ICNS_PATH="$ASSETS_DIR/AppIcon.icns"
-APP_NAME="LLM-RAG.app"
+APP_NAME="LLM-Notes.app"
 APP_PATH="$HOME/Desktop/$APP_NAME"
-LEGACY_LAUNCHER="$HOME/Desktop/Launch_Rag_App.command"
+LEGACY_APP_PATHS=(
+    "$HOME/Desktop/LLM-RAG.app"
+    "$HOME/Desktop/Launch_Rag_App.command"
+)
 
 if [[ ! -f "$LOGO_PNG" ]]; then
     echo "Error: logo not found at $LOGO_PNG"
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 is required. Install Python 3.10+ and try again."
     exit 1
 fi
 
@@ -19,6 +27,24 @@ if ! command -v sips >/dev/null 2>&1 || ! command -v iconutil >/dev/null 2>&1; t
     echo "Error: macOS tools 'sips' and 'iconutil' are required."
     exit 1
 fi
+
+if [[ ! -f "$PROJECT_DIR/requirements.txt" ]]; then
+    echo "Error: requirements.txt not found in $PROJECT_DIR"
+    exit 1
+fi
+
+install_python_env() {
+    if [[ ! -d "$PROJECT_DIR/venv" ]]; then
+        echo "Creating Python virtual environment…"
+        python3 -m venv "$PROJECT_DIR/venv"
+    fi
+
+    # shellcheck disable=SC1091
+    source "$PROJECT_DIR/venv/bin/activate"
+    python3 -m pip install --upgrade pip
+    echo "Installing dependencies (first run may take several minutes)…"
+    pip install --requirement "$PROJECT_DIR/requirements.txt" --upgrade-strategy eager
+}
 
 build_icns_from_png() {
     local src_png="$1"
@@ -45,6 +71,8 @@ build_icns_from_png() {
     rm -rf "$work_dir"
 }
 
+install_python_env
+
 echo "Building app icon from LLM-RAG_logo.png…"
 build_icns_from_png "$LOGO_PNG" "$ICNS_PATH"
 
@@ -63,11 +91,11 @@ cat > "$APP_PATH/Contents/Info.plist" <<EOF
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.llmware.rag-workspace</string>
+    <string>com.llmware.llm-notes</string>
     <key>CFBundleName</key>
-    <string>LLM-RAG</string>
+    <string>LLM-Notes</string>
     <key>CFBundleDisplayName</key>
-    <string>LLM-RAG</string>
+    <string>LLM-Notes</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -86,7 +114,7 @@ cat > "$APP_PATH/Contents/MacOS/start.command" <<EOF
 #!/bin/bash
 PROJECT_DIR="$PROJECT_DIR"
 cd "\$PROJECT_DIR" || {
-    osascript -e 'display alert "LLM-RAG" message "Project folder not found."'
+    osascript -e 'display alert "LLM-Notes" message "Project folder not found at: $PROJECT_DIR"'
     exit 1
 }
 exec bash "\$PROJECT_DIR/start_app.sh"
@@ -104,12 +132,17 @@ chmod +x "$APP_PATH/Contents/MacOS/launcher"
 # Clear quarantine so macOS allows the app to run when launched from Desktop.
 xattr -cr "$APP_PATH" 2>/dev/null || true
 
-if [[ -e "$LEGACY_LAUNCHER" ]]; then
-    rm -f "$LEGACY_LAUNCHER"
-    echo "Removed legacy launcher: $LEGACY_LAUNCHER"
-fi
+for legacy_path in "${LEGACY_APP_PATHS[@]}"; do
+    if [[ -e "$legacy_path" ]]; then
+        rm -rf "$legacy_path"
+        echo "Removed legacy launcher: $legacy_path"
+    fi
+done
 
 touch "$APP_PATH"
-echo "Install complete. Desktop launcher: $APP_PATH"
-echo "Icon source: $LOGO_PNG"
-echo "Generated icon: $ICNS_PATH"
+echo ""
+echo "Install complete."
+echo "  Project:  $PROJECT_DIR"
+echo "  Desktop:  $APP_PATH"
+echo ""
+echo "Double-click LLM-Notes on your Desktop to start the app."

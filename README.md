@@ -57,10 +57,27 @@ Apple Notes export (markdown folders)
 
 ## Setup
 
-### 1. Clone and create a virtual environment
+### Quick install (zip download)
+
+1. Unzip the download (e.g. to `~/Downloads/llmware-rag-with-UI-main`).
+2. Open Terminal, `cd` into that folder, and run:
 
 ```bash
-cd /path/to/rag_llmware
+cd ~/Downloads/llmware-rag-with-UI-main   # adjust path if different
+chmod +x Installer.sh
+./Installer.sh
+```
+
+`Installer.sh` creates a Python `venv`, installs dependencies from `requirements.txt`, and places **`LLM-Notes.app`** on your Desktop. Double-click that icon to start the app.
+
+Keep the unzipped project folder where it is — the Desktop app remembers that path. If you move the folder later, run `./Installer.sh` again from the new location.
+
+### 1. Clone and create a virtual environment
+
+For a git clone (or if you prefer manual setup instead of `Installer.sh`):
+
+```bash
+cd /path/to/llmware-rag-with-UI
 python3 -m venv venv
 source venv/bin/activate
 python3 -m pip install --upgrade pip
@@ -123,11 +140,13 @@ Set the corpus root to `/your/export/iCloud` (or whichever folder contains your 
 
 ### 4. (Optional) Desktop launcher
 
+If you did not use the [quick install](#quick-install-zip-download) above:
+
 ```bash
 ./Installer.sh
 ```
 
-Creates `~/Desktop/LLM-RAG.app`, which opens Terminal, activates `venv`, and starts Streamlit from the project directory.
+Creates `~/Desktop/LLM-Notes.app`, which opens Terminal, activates `venv`, and starts Streamlit from the project directory.
 
 ---
 
@@ -151,7 +170,7 @@ python3 -m streamlit run UI-semantic-search.py
 
 `start_app.sh` (and the Desktop launcher from `Installer.sh`) starts **Ollama if it is not already running**, then warms the **Answer with LLM** model configured in your corpus settings (most common `ollama_model` across libraries, usually `llama3.2:3b`). Embedding models are **not** pre-loaded at startup.
 
-Re-run `./Installer.sh` once if you already have an older Desktop launcher.
+Re-run `./Installer.sh` if you move the project folder or need to refresh the Desktop launcher.
 
 Streamlit opens in your browser (typically `http://localhost:8501`).
 
@@ -307,7 +326,7 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 | `UI-semantic-search.py` | Main Streamlit application |
 | `start_app.sh` | Start/warm Ollama, then launch Streamlit |
 | `ensure_ollama_ready.py` | Starts Ollama if needed and warms the configured LLM |
-| `Installer.sh` | Creates the Desktop `LLM-RAG.app` launcher with the same startup steps |
+| `Installer.sh` | Creates `venv`, installs dependencies, and builds Desktop `LLM-Notes.app` |
 | `.gitignore` | Excludes `llmware_data/`, venvs, `__pycache__` |
 
 ---

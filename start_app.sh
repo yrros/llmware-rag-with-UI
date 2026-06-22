@@ -10,6 +10,7 @@ elif [ -d "./.venv" ]; then
     source ./.venv/bin/activate
 else
     echo "Virtual environment not found in $PROJECT_DIR"
+    echo "Run ./Installer.sh from the project folder first (it creates venv and installs dependencies)."
     exit 1
 fi
 
