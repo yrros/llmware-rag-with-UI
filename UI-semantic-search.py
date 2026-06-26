@@ -72,6 +72,10 @@ EXCLUDED_MODEL_KEYWORDS = (
     "prompt-injection",
 )
 LOCAL_EMBEDDING_FAMILIES = {"HFEmbeddingModel", "LLMWareSemanticModel"}
+# Optional pip packages required by specific embedding models (not installed by default).
+EMBEDDING_MODEL_EXTRA_DEPS: dict[str, tuple[str, ...]] = {
+    "nomic-text-v1": ("einops",),
+}
 
 OLLAMA_HOST = "localhost"
 OLLAMA_PORT = 11434
@@ -93,6 +97,7 @@ DEFAULT_APP_SETTINGS = {
     "use_gpu_for_embeddings": False,
     "hide_corpora_enabled": False,
     "corpus_mode": "multi",
+    "last_selected_library": None,
 }
 
 CORPUS_MODE_MULTI = "multi"
@@ -351,6 +356,37 @@ def persist_corpus_mode() -> None:
 def sync_corpus_mode_from_settings() -> None:
     if "corpus_mode_toggle" not in st.session_state:
         st.session_state["corpus_mode_toggle"] = load_app_settings().get("corpus_mode", CORPUS_MODE_MULTI)
+
+
+def load_last_selected_library() -> str | None:
+    saved = load_app_settings().get("last_selected_library")
+    return str(saved).strip() if saved else None
+
+
+def persist_selected_library() -> None:
+    selected = st.session_state.get("selected_library")
+    if selected:
+        save_app_settings({"last_selected_library": selected})
+
+
+def build_library_select_options(all_libraries: list[str]) -> list[str]:
+    """Libraries shown in the selector, keeping the last-used corpus even if hidden."""
+    visible = filter_libraries_for_display(all_libraries)
+    if not visible:
+        visible = list(all_libraries)
+
+    saved = load_last_selected_library()
+    if saved and saved in all_libraries and saved not in visible:
+        visible = [saved] + [lib for lib in visible if lib != saved]
+    return visible
+
+
+def sync_selected_library_from_settings(visible_libraries: list[str]) -> None:
+    if "selected_library" in st.session_state:
+        return
+    saved = load_last_selected_library()
+    if saved and saved in visible_libraries:
+        st.session_state["selected_library"] = saved
 
 
 def resolve_library_registry_name(selected_lib: str) -> str:
@@ -625,6 +661,137 @@ def get_embedding_batch_size(embedding_model: str) -> int:
     if "large" in embedding_model.lower():
         return 32
     return 100
+
+
+def get_embedding_extra_deps(embedding_model: str) -> tuple[str, ...]:
+    """Return optional pip packages needed for a given embedding model."""
+    return EMBEDDING_MODEL_EXTRA_DEPS.get(embedding_model, ())
+
+
+def missing_python_packages(packages: tuple[str, ...] | list[str]) -> list[str]:
+    """Return import names from *packages* that are not available in the current interpreter."""
+    import importlib.util
+
+    missing: list[str] = []
+    for package in packages:
+        if not importlib.util.find_spec(package):
+            missing.append(package)
+    return missing
+
+
+def parse_pip_packages_from_error(exc: BaseException) -> list[str]:
+    """Extract pip package names suggested by transformers / HF model load errors."""
+    message = str(exc)
+    packages: list[str] = []
+    for match in re.finditer(r"pip install\s+`?([a-zA-Z0-9_.-]+)`?", message, flags=re.IGNORECASE):
+        pkg = match.group(1)
+        if pkg not in packages:
+            packages.append(pkg)
+    if packages:
+        return packages
+
+    lowered = message.lower()
+    if "no module named" in lowered:
+        module_match = re.search(r"no module named ['\"]([^'\"]+)['\"]", message, flags=re.IGNORECASE)
+        if module_match:
+            root = module_match.group(1).split(".")[0]
+            if root and root not in packages:
+                packages.append(root)
+    return packages
+
+
+def resolve_pip_install_context() -> tuple[str, list[str]]:
+    """Return (installer_label, shell command lines) for dependency install instructions."""
+    venv_dir = PROJECT_DIR / "venv"
+    in_venv = sys.prefix != sys.base_prefix
+
+    lines = [f"cd {PROJECT_DIR}"]
+    if venv_dir.is_dir():
+        lines.append(f"source {venv_dir}/bin/activate")
+        return "pip (project venv)", lines
+    if in_venv:
+        return "pip (active venv)", lines
+    return "pip (system Python)", lines
+
+
+def format_embedding_dependency_install_command(
+    packages: list[str],
+    embedding_model: str | None = None,
+) -> str:
+    """Build copy-paste shell commands to install missing embedding dependencies."""
+    if not packages:
+        return ""
+
+    _installer, lines = resolve_pip_install_context()
+    pkg_list = " ".join(packages)
+    lines.append(f"pip install {pkg_list}")
+    return "\n".join(lines)
+
+
+def embedding_dependency_relaunch_hint() -> str:
+    """Plain-text hint shown after the install commands."""
+    return (
+        f"After installing, relaunch the app using the LLM-Notes Desktop shortcut, "
+        f"or from Terminal run: cd {PROJECT_DIR} && ./start_app.sh"
+    )
+
+
+class EmbeddingDependencyError(RuntimeError):
+    """Raised when an embedding model needs optional packages that are not installed."""
+
+    def __init__(self, embedding_model: str, packages: list[str]):
+        self.embedding_model = embedding_model
+        self.packages = packages
+        super().__init__(embedding_model)
+
+
+def render_embedding_dependency_install_help(
+    packages: list[str],
+    embedding_model: str,
+    *,
+    sidebar: bool = False,
+    intro: str | None = None,
+) -> None:
+    """Show install commands in a copy-paste-friendly code block."""
+    write = st.sidebar if sidebar else st
+    pkg_text = ", ".join(f"`{pkg}`" for pkg in packages)
+    if intro is None:
+        intro = (
+            f"`{embedding_model}` needs extra package(s): {pkg_text}. "
+            "Copy and run in Terminal:"
+        )
+    write.warning(intro)
+    write.code(format_embedding_dependency_install_command(packages, embedding_model), language="bash")
+    write.caption(embedding_dependency_relaunch_hint())
+
+
+def get_missing_embedding_dependencies(embedding_model: str) -> list[str]:
+    """Return pip packages missing for *embedding_model* (known extras only)."""
+    return missing_python_packages(get_embedding_extra_deps(embedding_model))
+
+
+def ensure_embedding_dependencies(embedding_model: str) -> None:
+    """Raise EmbeddingDependencyError when model extras are not installed."""
+    missing = get_missing_embedding_dependencies(embedding_model)
+    if missing:
+        raise EmbeddingDependencyError(embedding_model, missing)
+
+
+def handle_embedding_run_error(exc: BaseException, embedding_model: str, *, sidebar: bool = False) -> None:
+    """Show actionable install help for dependency failures."""
+    if isinstance(exc, EmbeddingDependencyError):
+        render_embedding_dependency_install_help(
+            exc.packages, exc.embedding_model, sidebar=sidebar
+        )
+        return
+
+    missing = parse_pip_packages_from_error(exc)
+    if missing:
+        render_embedding_dependency_install_help(missing, embedding_model, sidebar=sidebar)
+        return
+
+    write = st.sidebar if sidebar else st
+    write.error(str(exc))
 
 
 def lancedb_table_names(db) -> list[str]:
@@ -1664,16 +1831,25 @@ if is_single_corpus_mode():
     selected_lib = SINGLE_CORPUS_DISPLAY_NAME
     st.sidebar.markdown(f"**Library:** {SINGLE_CORPUS_DISPLAY_NAME}")
 else:
-    visible_libraries = filter_libraries_for_display(all_libraries)
+    visible_libraries = build_library_select_options(all_libraries)
     if not visible_libraries:
         st.sidebar.warning("All corpora are hidden. Turn off hiding in Advanced or unhide a corpus.")
         visible_libraries = all_libraries
 
-    selected_lib = st.sidebar.selectbox("Select Library", visible_libraries)
+    sync_selected_library_from_settings(visible_libraries)
+    selected_lib = st.sidebar.selectbox(
+        "Select Library",
+        visible_libraries,
+        key="selected_library",
+        on_change=persist_selected_library,
+    )
     if is_hide_corpora_enabled():
         hidden_count = len(all_libraries) - len(filter_libraries_for_display(all_libraries))
         if hidden_count:
             st.sidebar.caption(f"{hidden_count} corpus/corpora hidden from this list.")
+
+    if selected_lib != load_last_selected_library():
+        save_app_settings({"last_selected_library": selected_lib})
 
 safe_lib = resolve_library_registry_name(selected_lib)
 library_content_path = resolve_library_content_path(corpus_root_path, selected_lib)
@@ -1736,6 +1912,9 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
         key=f"embedding_model_{safe_lib}",
     )
     st.info(get_embedding_model_summary(selected_embedding_model))
+    extra_deps_missing = get_missing_embedding_dependencies(selected_embedding_model)
+    if extra_deps_missing:
+        render_embedding_dependency_install_help(extra_deps_missing, selected_embedding_model)
 
     distance_threshold = st.slider(
         "Relevance cutoff (distance)",
@@ -1808,6 +1987,7 @@ rebuild_disabled = not first_index and model_change_pending and not reembed_ack
 
 if st.sidebar.button("⚡ Rescan (incremental)", disabled=sync_disabled, key=f"sync_{safe_lib}"):
     try:
+        ensure_embedding_dependencies(pending_model)
         ensure_corpus_root_persisted(corpus_root_path)
         set_embedding_acceleration(get_use_gpu_for_embeddings())
 
@@ -1829,10 +2009,11 @@ if st.sidebar.button("⚡ Rescan (incremental)", disabled=sync_disabled, key=f"s
         )
         st.rerun()
     except Exception as exc:
-        st.sidebar.error(f"Rescan failed: {exc}")
+        handle_embedding_run_error(exc, pending_model, sidebar=True)
 
 if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, key=f"rebuild_{safe_lib}"):
     try:
+        ensure_embedding_dependencies(pending_model)
         ensure_corpus_root_persisted(corpus_root_path)
         set_embedding_acceleration(get_use_gpu_for_embeddings())
 
@@ -1854,7 +2035,7 @@ if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, 
         )
         st.rerun()
     except Exception as exc:
-        st.sidebar.error(f"Re-index failed: {exc}")
+        handle_embedding_run_error(exc, pending_model, sidebar=True)
 
 render_sidebar_job_summary(selected_lib, safe_lib)
 
