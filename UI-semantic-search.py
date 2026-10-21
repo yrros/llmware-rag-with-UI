@@ -1,6 +1,8 @@
 import re
 import json
+import gc
 import shutil
+import sqlite3
 import sys
 import time
 import threading
@@ -75,6 +77,15 @@ LOCAL_EMBEDDING_FAMILIES = {"HFEmbeddingModel", "LLMWareSemanticModel"}
 # Optional pip packages required by specific embedding models (not installed by default).
 EMBEDDING_MODEL_EXTRA_DEPS: dict[str, tuple[str, ...]] = {
     "nomic-text-v1": ("einops",),
+}
+# Extra system install steps shown after pip install for optional ingest/parser dependencies.
+OPTIONAL_DEPENDENCY_EXTRA_LINES: dict[str, list[str]] = {
+    "pytesseract": ["brew install tesseract  # system OCR engine (Mac); needed after pip install"],
+}
+# Map LLMWare dependency names to pip package names.
+PIP_PACKAGE_ALIASES: dict[str, str] = {
+    "sentence_transformer": "sentence-transformers",
+    "sentence_transformers": "sentence-transformers",
 }
 
 OLLAMA_HOST = "localhost"
@@ -199,6 +210,10 @@ def apply_llmware_fts_query_fix() -> None:
         return
 
     def _prep_query(self, query):
+        if re.search(r"\s+AND\s+", query, flags=re.IGNORECASE):
+            return query
+        if re.search(r"\s+OR\s+", query, flags=re.IGNORECASE):
+            return query
         sqlite_strings = {"AND": " AND ", "OR": " OR "}
         exact_match = query.startswith('"') and query.endswith('"')
         q_clean = re.sub(r"[^\w\s]", "", query)
@@ -228,8 +243,60 @@ def apply_llmware_fts_query_fix() -> None:
 
 apply_llmware_fts_query_fix()
 
+
+def apply_llmware_ocr_error_fix() -> None:
+    """Skip note images that crash Tesseract instead of aborting the whole corpus scan."""
+    from llmware.parsers import ImageParser
+
+    if getattr(ImageParser, "_ocr_error_patched", False):
+        return
+
+    _original_process_ocr = ImageParser.process_ocr
+
+    def process_ocr_resilient(self, dir_fp, fn, preserve_spacing=False):
+        try:
+            return _original_process_ocr(self, dir_fp, fn, preserve_spacing=preserve_spacing)
+        except Exception as exc:
+            exc_name = type(exc).__name__
+            if exc_name in {"TesseractError", "TesseractNotFoundError"}:
+                return []
+            raise
+
+    ImageParser.process_ocr = process_ocr_resilient
+    ImageParser._ocr_error_patched = True
+
+
+apply_llmware_ocr_error_fix()
+
+
+def raise_open_file_limit() -> None:
+    """Raise the soft open-file limit so large full-corpus ingests do not hit EMFILE."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(hard, 65_536)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
+        pass
+
+
+raise_open_file_limit()
+
 _EMBEDDING_USE_GPU = False
 _EMBEDDING_PATCH_INSTALLED = False
+_LANCEDB_CONN = None
+
+
+def get_lancedb_connection():
+    """Reuse one LanceDB connection — avoids leaking file handles on repeated polls."""
+    global _LANCEDB_CONN
+    if _LANCEDB_CONN is None:
+        import lancedb
+
+        _LANCEDB_CONN = lancedb.connect(str(LANCEDB_PATH))
+    return _LANCEDB_CONN
 
 
 def migrate_legacy_app_data_if_needed() -> list[str]:
@@ -679,24 +746,54 @@ def missing_python_packages(packages: tuple[str, ...] | list[str]) -> list[str]:
     return missing
 
 
+def normalize_pip_package_name(raw: str) -> str:
+    """Convert LLMWare dependency names to pip-installable package names."""
+    pkg = re.split(r"[<>=!]", raw, maxsplit=1)[0].strip()
+    return PIP_PACKAGE_ALIASES.get(pkg, pkg)
+
+
 def parse_pip_packages_from_error(exc: BaseException) -> list[str]:
-    """Extract pip package names suggested by transformers / HF model load errors."""
-    message = str(exc)
+    """Extract pip package names from LLMWare / transformers install errors."""
     packages: list[str] = []
+
+    try:
+        from llmware.configs import DependencyNotInstalledException
+
+        if isinstance(exc, DependencyNotInstalledException):
+            match = re.search(r"'([^']+)' needs to be installed", str(exc))
+            if match:
+                pkg = normalize_pip_package_name(match.group(1))
+                if pkg:
+                    return [pkg]
+    except ImportError:
+        pass
+
+    message = str(exc)
     for match in re.finditer(r"pip install\s+`?([a-zA-Z0-9_.-]+)`?", message, flags=re.IGNORECASE):
-        pkg = match.group(1)
-        if pkg not in packages:
+        pkg = normalize_pip_package_name(match.group(1))
+        if pkg and pkg not in packages:
             packages.append(pkg)
     if packages:
+        return packages
+
+    needs_install = re.search(
+        r"'([^']+)'\s+needs to be installed",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if needs_install:
+        pkg = normalize_pip_package_name(needs_install.group(1))
+        if pkg:
+            packages.append(pkg)
         return packages
 
     lowered = message.lower()
     if "no module named" in lowered:
         module_match = re.search(r"no module named ['\"]([^'\"]+)['\"]", message, flags=re.IGNORECASE)
         if module_match:
-            root = module_match.group(1).split(".")[0]
-            if root and root not in packages:
-                packages.append(root)
+            pkg = normalize_pip_package_name(module_match.group(1).split(".")[0])
+            if pkg and pkg not in packages:
+                packages.append(pkg)
     return packages
 
 
@@ -714,21 +811,27 @@ def resolve_pip_install_context() -> tuple[str, list[str]]:
     return "pip (system Python)", lines
 
 
-def format_embedding_dependency_install_command(
-    packages: list[str],
-    embedding_model: str | None = None,
-) -> str:
-    """Build copy-paste shell commands to install missing embedding dependencies."""
+def format_dependency_install_command(packages: list[str]) -> str:
+    """Build copy-paste shell commands to install missing optional dependencies."""
     if not packages:
         return ""
 
     _installer, lines = resolve_pip_install_context()
-    pkg_list = " ".join(packages)
-    lines.append(f"pip install {pkg_list}")
+    lines.append(f"pip install {' '.join(packages)}")
+    for pkg in packages:
+        for extra in OPTIONAL_DEPENDENCY_EXTRA_LINES.get(pkg, []):
+            lines.append(extra)
     return "\n".join(lines)
 
 
-def embedding_dependency_relaunch_hint() -> str:
+def format_embedding_dependency_install_command(
+    packages: list[str],
+    embedding_model: str | None = None,
+) -> str:
+    return format_dependency_install_command(packages)
+
+
+def dependency_relaunch_hint() -> str:
     """Plain-text hint shown after the install commands."""
     return (
         f"After installing, relaunch the app using the LLM-Notes Desktop shortcut, "
@@ -736,13 +839,41 @@ def embedding_dependency_relaunch_hint() -> str:
     )
 
 
-class EmbeddingDependencyError(RuntimeError):
+def embedding_dependency_relaunch_hint() -> str:
+    return dependency_relaunch_hint()
+
+
+class DependencyInstallError(RuntimeError):
+    """Raised when a scan needs optional packages that are not installed."""
+
+    def __init__(self, packages: list[str], context: str = ""):
+        self.packages = packages
+        self.context = context
+        super().__init__(context or ", ".join(packages))
+
+
+class EmbeddingDependencyError(DependencyInstallError):
     """Raised when an embedding model needs optional packages that are not installed."""
 
     def __init__(self, embedding_model: str, packages: list[str]):
         self.embedding_model = embedding_model
-        self.packages = packages
-        super().__init__(embedding_model)
+        super().__init__(packages, embedding_model)
+
+
+def render_dependency_install_help(
+    packages: list[str],
+    *,
+    sidebar: bool = False,
+    intro: str | None = None,
+) -> None:
+    """Show install commands in a copy-paste-friendly code block."""
+    write = st.sidebar if sidebar else st
+    pkg_text = ", ".join(f"`{pkg}`" for pkg in packages)
+    if intro is None:
+        intro = f"Missing package(s): {pkg_text}. Copy and run in Terminal:"
+    write.warning(intro)
+    write.code(format_dependency_install_command(packages), language="bash")
+    write.caption(dependency_relaunch_hint())
 
 
 def render_embedding_dependency_install_help(
@@ -752,17 +883,13 @@ def render_embedding_dependency_install_help(
     sidebar: bool = False,
     intro: str | None = None,
 ) -> None:
-    """Show install commands in a copy-paste-friendly code block."""
-    write = st.sidebar if sidebar else st
-    pkg_text = ", ".join(f"`{pkg}`" for pkg in packages)
     if intro is None:
         intro = (
-            f"`{embedding_model}` needs extra package(s): {pkg_text}. "
+            f"`{embedding_model}` needs extra package(s): "
+            f"{', '.join(f'`{p}`' for p in packages)}. "
             "Copy and run in Terminal:"
         )
-    write.warning(intro)
-    write.code(format_embedding_dependency_install_command(packages, embedding_model), language="bash")
-    write.caption(embedding_dependency_relaunch_hint())
+    render_dependency_install_help(packages, sidebar=sidebar, intro=intro)
 
 
 def get_missing_embedding_dependencies(embedding_model: str) -> list[str]:
@@ -777,21 +904,78 @@ def ensure_embedding_dependencies(embedding_model: str) -> None:
         raise EmbeddingDependencyError(embedding_model, missing)
 
 
-def handle_embedding_run_error(exc: BaseException, embedding_model: str, *, sidebar: bool = False) -> None:
-    """Show actionable install help for dependency failures."""
+def format_exception_for_user(exc: BaseException) -> str:
+    """Turn low-level parser/DB exceptions into readable scan errors."""
+    try:
+        from pytesseract.pytesseract import TesseractError
+
+        if isinstance(exc, TesseractError):
+            return (
+                "Tesseract OCR failed on a note image (corrupt or unsupported format). "
+                "The app now skips bad images automatically — try **Rescan** again."
+            )
+    except ImportError:
+        pass
+
+    if isinstance(exc, sqlite3.Error):
+        message = str(exc).lower()
+        if "unable to open database file" in message:
+            return (
+                "SQLite could not open the index database — usually **too many open files** "
+                "during a large full-corpus scan. Quit and relaunch the app (Desktop shortcut "
+                "or `./start_app.sh`), then run **Re-index** again. "
+                "If it repeats, close other apps and run in Terminal first: `ulimit -n 65536` "
+                "then `./start_app.sh`."
+            )
+        return f"Database error during ingest: {exc}"
+
+    message = str(exc).strip()
+    if message.startswith("(") and "Error during processing" in message:
+        return (
+            "Tesseract OCR failed on a note image (corrupt or unsupported format). "
+            "The app now skips bad images automatically — try **Rescan** again."
+        )
+    return message
+
+
+def handle_scan_run_error(
+    exc: BaseException,
+    embedding_model: str | None = None,
+    *,
+    sidebar: bool = False,
+) -> None:
+    """Show actionable install help for dependency failures during ingest or embedding."""
     if isinstance(exc, EmbeddingDependencyError):
         render_embedding_dependency_install_help(
             exc.packages, exc.embedding_model, sidebar=sidebar
         )
         return
+    if isinstance(exc, DependencyInstallError):
+        render_dependency_install_help(exc.packages, sidebar=sidebar)
+        return
 
     missing = parse_pip_packages_from_error(exc)
     if missing:
-        render_embedding_dependency_install_help(missing, embedding_model, sidebar=sidebar)
+        pkg_text = ", ".join(f"`{pkg}`" for pkg in missing)
+        if embedding_model and any(pkg in get_embedding_extra_deps(embedding_model) for pkg in missing):
+            render_embedding_dependency_install_help(missing, embedding_model, sidebar=sidebar)
+        else:
+            render_dependency_install_help(
+                missing,
+                sidebar=sidebar,
+                intro=(
+                    f"Ingesting notes needs package(s): {pkg_text}. "
+                    "Copy and run in Terminal, then rescan:"
+                ),
+            )
         return
 
     write = st.sidebar if sidebar else st
-    write.error(str(exc))
+    write.error(format_exception_for_user(exc))
+
+
+def handle_embedding_run_error(exc: BaseException, embedding_model: str, *, sidebar: bool = False) -> None:
+    handle_scan_run_error(exc, embedding_model, sidebar=sidebar)
 
 
 def lancedb_table_names(db) -> list[str]:
@@ -996,8 +1180,10 @@ def render_sidebar_job_summary(selected_lib: str, safe_lib: str) -> None:
     st.caption(" · ".join(meta_parts))
 
 
-def resolve_source_path(file_source: str, library_folder: Path) -> Path | None:
-    """Map a llmware file_source value to a local markdown file path."""
+def resolve_source_path(
+    file_source: str, library_folder: Path, extra_dirs: tuple[Path, ...] = ()
+) -> Path | None:
+    """Map a llmware file_source value to a local file path."""
     if not file_source:
         return None
 
@@ -1021,17 +1207,107 @@ def resolve_source_path(file_source: str, library_folder: Path) -> Path | None:
     if len(matches) == 1:
         return matches[0].resolve()
 
+    # Fall back to the copy llmware keeps in the library uploads folder.
+    for directory in extra_dirs:
+        candidate = directory / filename
+        if candidate.is_file():
+            return candidate.resolve()
+
     return None
 
 
-def render_source_file_link(file_source: str, library_folder: Path) -> None:
-    """Render a clickable link to the source markdown file when it can be found."""
-    path = resolve_source_path(file_source, library_folder)
-    if path and path.exists():
-        st.markdown(f"[Open note: `{path.name}`]({path.as_uri()})")
-        st.caption(str(path))
-    elif file_source:
-        st.caption(f"Source: `{file_source}`")
+TEXT_PREVIEW_EXTENSIONS = {".md", ".txt", ".csv", ".json"}
+DOCUMENT_PREVIEW_MAX_CHARS = 200_000
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_document_text_from_index(safe_lib: str, file_source: str) -> str:
+    """Rebuild a document's text from its indexed blocks (works for PDF/DOCX/PPTX too)."""
+    db_path = SQLiteConfig.get_uri_string()
+    table = safe_lib.replace('"', '""')
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                f'SELECT text_block FROM "{table}" WHERE file_source = ? '
+                "ORDER BY doc_ID, block_ID",
+                (file_source,),
+            ).fetchall()
+    except sqlite3.Error:
+        return ""
+    return "\n\n".join(row[0] for row in rows if row[0])
+
+
+def get_library_uploads_dirs(lib: Library | None) -> tuple[Path, ...]:
+    """Folders where llmware keeps copies of ingested files."""
+    if lib is None:
+        return ()
+    try:
+        return (Path(lib.file_copy_path),)
+    except Exception:
+        return ()
+
+
+def render_source_document(
+    file_source: str,
+    hits: list[dict],
+    library_folder: Path,
+    safe_lib: str,
+    extra_dirs: tuple[Path, ...] = (),
+) -> None:
+    """Show matched passages and the full embedded document inside the current container."""
+    path = resolve_source_path(file_source, library_folder, extra_dirs)
+    st.caption(str(path) if path else f"Source: `{file_source}`")
+
+    passages_tab, document_tab = st.tabs(["Matched passages", "Full document"])
+
+    with passages_tab:
+        for hit in hits:
+            distance = hit.get("distance")
+            if distance is not None:
+                st.caption(f"Result #{hit['_rank']} · distance {distance:.3f}")
+            else:
+                st.caption(f"Result #{hit['_rank']}")
+            st.markdown(f"> {str(hit.get('text', '')).strip()}".replace("\n", "\n> "))
+
+    with document_tab:
+        text = ""
+        from_index = False
+        if path and path.suffix.lower() in TEXT_PREVIEW_EXTENSIONS:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+        if not text:
+            text = load_document_text_from_index(safe_lib, Path(file_source).name)
+            from_index = bool(text)
+
+        if not text:
+            st.info("Document contents are not available.")
+        else:
+            if from_index:
+                st.caption("Text reconstructed from the indexed blocks.")
+            truncated = len(text) > DOCUMENT_PREVIEW_MAX_CHARS
+            preview = text[:DOCUMENT_PREVIEW_MAX_CHARS]
+            with st.container(height=500):
+                if path and path.suffix.lower() == ".md":
+                    st.markdown(preview)
+                elif path and path.suffix.lower() == ".json":
+                    st.code(preview, language="json")
+                else:
+                    st.text(preview)
+            if truncated:
+                st.caption(f"Preview truncated to {DOCUMENT_PREVIEW_MAX_CHARS:,} characters.")
+
+        if path and path.is_file():
+            try:
+                st.download_button(
+                    f"Download {path.name}",
+                    data=path.read_bytes(),
+                    file_name=path.name,
+                    key=f"download::{file_source}",
+                )
+            except OSError:
+                pass
 
 
 def get_pending_index_settings(safe_lib: str, corpus_config: dict) -> tuple[str, float, bool]:
@@ -1111,11 +1387,46 @@ def render_debug_panel(
             st.write("Embedding index: not detected")
 
 
+def get_fresh_library_card(safe_lib: str) -> dict | None:
+    """Read the latest library card from SQLite (avoids stale in-memory copies)."""
+    try:
+        card = LibraryCatalog().get_library_card(safe_lib)
+        return card if isinstance(card, dict) else None
+    except Exception:
+        return None
+
+
+def get_library_block_count(safe_lib: str) -> int:
+    """Return the number of text blocks currently stored for a library."""
+    card = get_fresh_library_card(safe_lib)
+    return int(card.get("blocks", 0)) if card else 0
+
+
 def get_active_library_embedding(lib: Library) -> str | None:
-    for emb in lib.get_embedding_status() or []:
-        if emb.get("embedding_status") == "yes" and emb.get("embedding_db") == VECTOR_DB:
-            return emb.get("embedding_model")
+    card = get_fresh_library_card(lib.library_name)
+    if not card:
+        return None
+    for emb in card.get("embedding", []) or []:
+        if emb.get("embedding_status") != "yes" or emb.get("embedding_db") != VECTOR_DB:
+            continue
+        model = emb.get("embedding_model")
+        if model and model not in {"none", ""}:
+            return model
     return None
+
+
+def describe_unbuilt_embedding(blocks: int, vector_rows: int, embedding_model: str) -> str:
+    """Explain when ingest finished but vectors were never built."""
+    if vector_rows > 0:
+        return (
+            f"Text index has {blocks} blocks but `{embedding_model}` was never embedded "
+            f"({vector_rows} stale vectors from an earlier run remain). "
+            "Use **Re-index (full rebuild)** in the sidebar."
+        )
+    return (
+        f"Text index has {blocks} blocks but `{embedding_model}` vectors are not built yet. "
+        "Use **Re-index (full rebuild)** in the sidebar."
+    )
 
 
 def get_libraries() -> list[str]:
@@ -1192,6 +1503,16 @@ def repair_library_index_state(lib: Library, embedding_model: str) -> list[str]:
             pass
         actions.append(f"removed {vectors} orphan vector(s)")
 
+    if blocks > 0 and get_active_library_embedding(lib) is None and vectors > 0:
+        delete_vector_table(lib.library_name, embedding_model)
+        try:
+            lib.delete_installed_embedding(embedding_model, VECTOR_DB)
+        except Exception:
+            pass
+        actions.append(
+            f"removed {vectors} stale vector(s) left after an incomplete embedding run"
+        )
+
     return actions
 
 
@@ -1240,13 +1561,23 @@ def delete_vector_table(safe_lib: str, embedding_model: str) -> None:
         pass
 
 
+def should_skip_ingest_path(path: Path) -> bool:
+    """Skip macOS metadata folders/files that break PDF/OCR ingest."""
+    return any(part == "__MACOSX" or part.startswith("._") for part in path.parts)
+
+
 def get_ingest_directories(folder_path: Path) -> list[Path]:
     """Return every directory under folder_path that contains ingestible files."""
     directories = {folder_path.resolve()}
     for path in folder_path.rglob("*"):
+        if should_skip_ingest_path(path):
+            continue
         if path.is_file() and path.suffix.lower() in INGEST_EXTENSIONS:
             directories.add(path.parent.resolve())
-    return sorted(directories, key=lambda p: len(p.parts))
+    return sorted(
+        (d for d in directories if not should_skip_ingest_path(d)),
+        key=lambda p: len(p.parts),
+    )
 
 
 def ingest_all_files(lib: Library, folder_path: Path) -> dict:
@@ -1256,30 +1587,37 @@ def ingest_all_files(lib: Library, folder_path: Path) -> dict:
         "blocks_added": 0,
         "dirs_scanned": 0,
         "rejected_files": [],
+        "skipped_dirs": 0,
     }
+    # Full-corpus scans are mostly markdown; skip standalone image OCR to reduce open files.
+    add_files_kwargs = {}
+    if load_app_settings().get("corpus_mode") == CORPUS_MODE_SINGLE:
+        add_files_kwargs = {"get_images": False, "verbose_level": 0}
 
-    for directory in get_ingest_directories(folder_path):
-        result = lib.add_files(str(directory))
+    directories = get_ingest_directories(folder_path)
+    for index, directory in enumerate(directories):
+        try:
+            result = lib.add_files(str(directory), **add_files_kwargs)
+        except Exception as exc:
+            totals["skipped_dirs"] += 1
+            totals.setdefault("ingest_warnings", []).append(
+                f"`{directory.name}`: {format_exception_for_user(exc)}"
+            )
+            gc.collect()
+            continue
         totals["dirs_scanned"] += 1
         if not result:
+            gc.collect()
             continue
         totals["docs_added"] += result.get("docs_added", 0) or 0
         totals["blocks_added"] += result.get("blocks_added", 0) or 0
         rejected = result.get("rejected_files") or []
         if isinstance(rejected, list):
             totals["rejected_files"].extend(rejected)
+        if index % 25 == 24:
+            gc.collect()
 
     return totals
-
-
-def get_library_block_count(safe_lib: str) -> int:
-    """Return the number of text blocks currently stored for a library."""
-    try:
-        lib = Library().load_library(safe_lib)
-        card = lib.get_library_card()
-        return int(card.get("blocks", 0)) if card else 0
-    except Exception:
-        return 0
 
 
 def prepare_embeddings(lib: Library, embedding_model: str) -> None:
@@ -1344,12 +1682,10 @@ def get_collection_name(safe_lib: str, embedding_model: str) -> str:
 def get_vector_row_count(safe_lib: str, embedding_model: str) -> int:
     """Return the number of vectors stored for a library, or 0 if missing."""
     try:
-        import lancedb
-
-        db = lancedb.connect(str(LANCEDB_PATH))
         name = get_collection_name(safe_lib, embedding_model)
-        if name not in lancedb_table_names(db):
+        if not (LANCEDB_PATH / f"{name}.lance").is_dir():
             return 0
+        db = get_lancedb_connection()
         return db.open_table(name).count_rows()
     except Exception:
         return 0
@@ -1419,8 +1755,10 @@ def migrate_all_legacy_vectors() -> list[str]:
 
 def is_embedding_ready(lib: Library, embedding_model: str) -> tuple[bool, str]:
     """Return whether the library has a usable semantic index for our model/db."""
-    blocks = get_library_block_count(lib.library_name)
-    vector_rows = get_vector_row_count(lib.library_name, embedding_model)
+    safe_lib = lib.library_name
+    card = get_fresh_library_card(safe_lib)
+    blocks = int(card.get("blocks", 0)) if card else 0
+    vector_rows = get_vector_row_count(safe_lib, embedding_model)
 
     if blocks == 0:
         if vector_rows > 0:
@@ -1435,25 +1773,29 @@ def is_embedding_ready(lib: Library, embedding_model: str) -> tuple[bool, str]:
             )
         return False, "No text blocks indexed yet. Use **Re-index (full rebuild)** in the sidebar."
 
-    record = lib.get_embedding_status()
+    record = card.get("embedding", []) if card else []
     if not record:
-        return False, "No embedding record found."
+        return False, describe_unbuilt_embedding(blocks, vector_rows, embedding_model)
 
     for emb in record:
-        if emb.get("embedding_model") != embedding_model:
+        model = emb.get("embedding_model")
+        if model in {None, "", "none"}:
+            continue
+        if model != embedding_model:
             continue
         if emb.get("embedding_db") != VECTOR_DB:
             continue
         if emb.get("embedding_status") != "yes":
-            return False, f"Embedding status is '{emb.get('embedding_status')}'."
+            return False, (
+                f"Embedding for `{embedding_model}` did not complete "
+                f"(status: {emb.get('embedding_status')}). "
+                "Use **Re-index (full rebuild)** in the sidebar."
+            )
 
         expected = emb.get("embedded_blocks", 0)
-        vector_rows = get_vector_row_count(lib.library_name, embedding_model)
+        vector_rows = get_vector_row_count(safe_lib, embedding_model)
         if vector_rows == 0:
-            return False, (
-                f"Vector index is empty for `{embedding_model}` "
-                f"(library card shows {expected} blocks). Run **Rebuild**."
-            )
+            return False, describe_unbuilt_embedding(blocks, vector_rows, embedding_model)
         if vector_rows < expected:
             return True, f"{vector_rows}/{expected} vectors indexed ({embedding_model})"
         return True, f"{vector_rows} blocks indexed ({embedding_model})"
@@ -1462,7 +1804,7 @@ def is_embedding_ready(lib: Library, embedding_model: str) -> tuple[bool, str]:
     if active and active != embedding_model:
         return False, f"Index uses `{active}`. Rebuild to switch to `{embedding_model}`."
 
-    return False, f"No `{embedding_model}` / {VECTOR_DB} embedding found."
+    return False, describe_unbuilt_embedding(blocks, vector_rows, embedding_model)
 
 
 def format_embedding_status(lib: Library, embedding_model: str) -> str:
@@ -1687,9 +2029,21 @@ def normalize_text_search_query(query: str) -> str | None:
     return " ".join(tokens) if tokens else None
 
 
-def safe_text_query(q: Query, query: str, result_count: int = 20) -> list:
+def build_prefilter_text_query(query: str) -> str | None:
+    """Build a keyword pre-filter requiring every token (AND). Supports `2025 Christmas` or `2025 + Christmas`."""
+    cleaned = re.sub(r"[^\w\s]", " ", query or "")
+    tokens = [tok for tok in cleaned.split() if tok]
+    if not tokens:
+        return None
+    return " AND ".join(tokens)
+
+
+def safe_text_query(q: Query, query: str, result_count: int = 20, *, match_all: bool = False) -> list:
     """Run a text pre-filter/fallback query, skipping empty or punctuation-only input."""
-    normalized = normalize_text_search_query(query)
+    if match_all:
+        normalized = build_prefilter_text_query(query)
+    else:
+        normalized = normalize_text_search_query(query)
     if not normalized:
         return []
     results = q.text_query(normalized, result_count=result_count)
@@ -1712,8 +2066,8 @@ def perform_search(
     )
 
     filter_context = (
-        safe_text_query(q, topic_query, result_count=1000)
-        if normalize_text_search_query(topic_query)
+        safe_text_query(q, topic_query, result_count=1000, match_all=True)
+        if build_prefilter_text_query(topic_query)
         else None
     )
     filtered_ids = {res.get("doc_ID") for res in filter_context} if filter_context else None
@@ -1862,8 +2216,13 @@ model_labels = {model["id"]: model["label"] for model in model_catalog}
 # Status display
 try:
     _status_lib = Library().load_library(safe_lib)
-    st.sidebar.success(f"**Status:** Loaded")
     active_model = get_active_library_embedding(_status_lib)
+    status_model = get_pending_index_settings(safe_lib, corpus_config)[0]
+    emb_ready, emb_message = is_embedding_ready(_status_lib, status_model)
+    if emb_ready:
+        st.sidebar.success(f"**Status:** Ready — {emb_message}")
+    else:
+        st.sidebar.warning(f"**Status:** Not ready — {emb_message}")
 except Exception:
     _status_lib = None
     active_model = None
@@ -2041,8 +2400,8 @@ render_sidebar_job_summary(selected_lib, safe_lib)
 
 # Reload saved config for search (may have just been updated in session)
 corpus_config = get_corpus_config(safe_lib)
-selected_embedding_model = corpus_config["embedding_model"]
-distance_threshold = float(corpus_config["distance_threshold"])
+selected_embedding_model, distance_threshold, _ = get_pending_index_settings(safe_lib, corpus_config)
+distance_threshold = float(distance_threshold)
 library_folder = library_content_path
 
 
@@ -2056,7 +2415,19 @@ st.caption(
     f"{get_embedding_model_summary(selected_embedding_model)}"
 )
 
-topic_query = st.text_input("Pre-filter keyword (optional):")
+topic_query = st.text_input(
+    "Pre-filter keyword (optional):",
+    help=(
+        "Narrows semantic search to notes that contain **all** of these keywords (text match). "
+        "Leave blank to search the whole corpus.\n\n"
+        "Examples:\n"
+        "• `2025 Christmas` or `2025 + Christmas` — notes containing both **2025** and **Christmas**\n"
+        "• `holiday budget` — notes with both words\n"
+        "• `2025` — notes mentioning 2025 only\n\n"
+        "Your main question below still drives meaning-based ranking; "
+        "this box only limits which notes are considered."
+    ),
+)
 prompt_text = st.text_area("What would you like to ask?", height=100)
 
 search_col, llm_col, limit_col = st.columns([1.2, 2.2, 1.2])
@@ -2139,6 +2510,7 @@ if search_clicked and prompt_text:
         if not emb_ready:
             st.error(f"Semantic index not ready: {emb_message}")
         else:
+            uploads_dirs = get_library_uploads_dirs(search_lib)
             with st.spinner("Searching…"):
                 try:
                     final_results, used_text_fallback = perform_search(
@@ -2175,14 +2547,16 @@ if search_clicked and prompt_text:
                                         path = resolve_source_path(
                                             str(result.get("file_source", "")),
                                             library_folder,
+                                            uploads_dirs,
                                         )
                                         if path and str(path) not in seen_paths:
                                             seen_paths.add(str(path))
                                             cited_paths.append(path)
                                     if cited_paths:
-                                        st.caption("Sources used:")
-                                        for path in cited_paths:
-                                            st.markdown(f"- [`{path.name}`]({path.as_uri()})")
+                                        st.caption(
+                                            "Sources used (expand below to read them): "
+                                            + ", ".join(f"`{path.name}`" for path in cited_paths)
+                                        )
 
                                     processing_time = llm_usage.get("processing_time")
                                     if processing_time is not None:
@@ -2195,15 +2569,30 @@ if search_clicked and prompt_text:
                                     st.error(f"LLM answer failed: {llm_exc}")
 
                         st.subheader("Sources")
+                        # Group hits by document, keeping the order of each document's best hit.
+                        hits_by_source: dict[str, list[dict]] = {}
                         for i, res in enumerate(final_results, 1):
-                            distance = res.get("distance")
                             file_source = str(res.get("file_source", "Unknown source"))
-                            label = f"#{i} — {Path(file_source).name}"
-                            if distance is not None:
-                                label += f" (distance: {distance:.3f})"
+                            hits_by_source.setdefault(file_source, []).append({**res, "_rank": i})
+
+                        for file_source, hits in hits_by_source.items():
+                            best = min(
+                                (h["distance"] for h in hits if h.get("distance") is not None),
+                                default=None,
+                            )
+                            label = f"#{hits[0]['_rank']} — {Path(file_source).name}"
+                            if len(hits) > 1:
+                                label += f" · {len(hits)} matches"
+                            if best is not None:
+                                label += f" (distance: {best:.3f})"
                             with st.expander(label):
-                                render_source_file_link(file_source, library_folder)
-                                st.write(res.get("text", ""))
+                                render_source_document(
+                                    file_source,
+                                    hits,
+                                    library_folder,
+                                    safe_lib,
+                                    uploads_dirs,
+                                )
 
                         if use_llm_answer:
                             save_corpus_config(

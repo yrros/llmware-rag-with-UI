@@ -165,7 +165,7 @@ Or manually:
 cd /path/to/rag_llmware
 source venv/bin/activate
 python3 ensure_ollama_ready.py   # optional; start_app.sh runs this automatically
-python3 -m streamlit run UI-semantic-search.py
+python3 -m streamlit run UI-semantic-search.py --server.address localhost
 ```
 
 `start_app.sh` (and the Desktop launcher from `Installer.sh`) starts **Ollama if it is not already running**, then warms the **Answer with LLM** model configured in your corpus settings (most common `ollama_model` across libraries, usually `llama3.2:3b`). Embedding models are **not** pre-loaded at startup.
@@ -173,6 +173,8 @@ python3 -m streamlit run UI-semantic-search.py
 Re-run `./Installer.sh` if you move the project folder or need to refresh the Desktop launcher.
 
 Streamlit opens in your browser (typically `http://localhost:8501`).
+
+> **Security:** the app has no authentication and can display and download the full contents of your indexed documents. `start_app.sh` binds Streamlit to `localhost` so it is only reachable from your own machine. Do not expose it on a shared network or the internet.
 
 ---
 
@@ -218,7 +220,10 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
 3. Enter your question in **What would you like to ask?**
 4. Click **Search**.
 
-Results appear as expandable **Sources** with links to the original markdown files when paths can be resolved.
+Results appear under **Sources** as one dropdown per document (documents with several matches are grouped). Each dropdown has two tabs:
+
+- **Matched passages** — the retrieved chunks with their rank and distance.
+- **Full document** — the whole file embedded in the page (markdown is rendered; PDF/DOCX/PPTX text is rebuilt from the indexed blocks), plus a download button for the original.
 
 ### Answer with LLM
 

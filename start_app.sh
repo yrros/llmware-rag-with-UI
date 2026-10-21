@@ -4,6 +4,9 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
+# Large full-corpus ingests open many files (SQLite, LanceDB, PDFs). Raise the limit on macOS.
+ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
+
 if [ -d "./venv" ]; then
     source ./venv/bin/activate
 elif [ -d "./.venv" ]; then
@@ -29,4 +32,5 @@ echo "Ensuring Ollama is running for Answer with LLM..."
 python3 ensure_ollama_ready.py || echo "Warning: Ollama warm-up failed; continuing anyway."
 
 echo "Starting RAG Workspace Manager..."
-exec streamlit run UI-semantic-search.py
+# Bind to localhost only — the app has no login and can show full documents.
+exec streamlit run UI-semantic-search.py --server.address localhost
