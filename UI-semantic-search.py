@@ -100,6 +100,9 @@ SUGGESTED_OLLAMA_MODELS = [
     "gemma2:2b",
 ]
 LLM_CONTEXT_MAX_CHARS = 12000
+# Follow-up conversations resend the notes plus history, so give Ollama a larger window.
+FOLLOW_UP_NUM_CTX = 8192
+LAST_SEARCH_KEY = "last_search"
 CORPUS_SETTINGS_PATH = APP_DATA_DIR / "corpus_settings.json"
 JOB_STATUS_PATH = APP_DATA_DIR / "job_status.json"
 APP_SETTINGS_PATH = APP_DATA_DIR / "app_settings.json"
@@ -677,6 +680,10 @@ def persist_gpu_for_embeddings_setting() -> None:
 
 
 set_embedding_acceleration(load_app_settings().get("use_gpu_for_embeddings", False))
+
+
+def persist_exact_text_only_setting() -> None:
+    save_app_settings({"exact_text_only": bool(st.session_state.get("exact_text_only", False))})
 
 # ---------------------------------------------------------------------------
 # HELPERS
@@ -1308,6 +1315,179 @@ def render_source_document(
                 )
             except OSError:
                 pass
+
+
+def follow_up_with_ollama(
+    search_state: dict,
+    question: str,
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+) -> dict:
+    """Answer a follow-up using the search's notes plus the conversation so far.
+
+    Returns the new user turn; `prompt` holds the full text sent when it differs from `content`.
+    """
+    messages: list[dict] = []
+    if search_state.get("answer"):
+        messages.append({
+            "role": "user",
+            "content": build_llm_prompt(search_state["question"], search_state["results"], max_tokens, temperature),
+        })
+        messages.append({"role": "assistant", "content": search_state["answer"]})
+    messages.extend(
+        {"role": turn["role"], "content": turn.get("prompt", turn["content"])}
+        for turn in search_state["discussion"]
+    )
+
+    user_turn = {"role": "user", "content": question}
+    if not messages:
+        # No answer yet — this turn carries the notes as context.
+        user_turn["prompt"] = build_llm_prompt(question, search_state["results"], max_tokens, temperature)
+    messages.append({"role": "user", "content": user_turn.get("prompt", question)})
+
+    reply, _usage = chat_with_ollama(
+        messages,
+        model_name,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        num_ctx=FOLLOW_UP_NUM_CTX,
+    )
+    return {"user": user_turn, "assistant": {"role": "assistant", "content": reply}}
+
+
+def render_follow_up_discussion(
+    search_state: dict,
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+) -> None:
+    """Chat panel for follow-up questions about the notes from the last search."""
+    st.subheader("Discussion")
+    st.caption(f"Follow-ups are answered from the notes in this search using `{model_name}`.")
+
+    discussion = search_state["discussion"]
+    with st.container(height=520, border=True):
+        if not discussion:
+            st.caption("No follow-up questions yet.")
+        for turn in discussion:
+            with st.chat_message(turn["role"]):
+                st.markdown(turn["content"])
+
+    with st.form("follow_up_form", clear_on_submit=True):
+        follow_up = st.text_area(
+            "Ask a follow-up",
+            height=90,
+            placeholder="e.g. Who owns each of those requirements?",
+        )
+        submitted = st.form_submit_button("Send", type="primary", use_container_width=True)
+
+    if discussion and st.button("Clear discussion", use_container_width=True):
+        discussion.clear()
+        st.rerun()
+
+    if submitted and follow_up.strip():
+        with st.spinner(f"Asking `{model_name}`…"):
+            try:
+                turns = follow_up_with_ollama(
+                    search_state, follow_up.strip(), model_name, max_tokens, temperature
+                )
+            except Exception as exc:
+                st.error(f"Follow-up failed: {exc}")
+                return
+        discussion.extend([turns["user"], turns["assistant"]])
+        st.rerun()
+
+
+def render_search_results(
+    search_state: dict,
+    library_folder: Path,
+    safe_lib: str,
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+) -> None:
+    """Render the stored results of the last search, with the follow-up discussion alongside."""
+    results = search_state["results"]
+    if not results:
+        if search_state["exact_text_only"]:
+            st.warning(f"No notes contain `{search_state['topic_query']}`.")
+        else:
+            st.warning("No matches found." + search_state["nearest_hint"])
+        return
+
+    if search_state["used_text_fallback"]:
+        st.info(
+            "Vector search had no matches — showing text search results instead."
+            + search_state["nearest_hint"]
+        )
+
+    uploads_dirs = search_state["uploads_dirs"]
+    main_col, chat_col = st.columns([3, 2], gap="large")
+
+    with main_col:
+        if search_state["answer"]:
+            st.subheader("Answer")
+            st.markdown(search_state["answer"])
+
+            cited_paths: list[Path] = []
+            seen_paths: set[str] = set()
+            for result in results:
+                path = resolve_source_path(
+                    str(result.get("file_source", "")),
+                    library_folder,
+                    uploads_dirs,
+                )
+                if path and str(path) not in seen_paths:
+                    seen_paths.add(str(path))
+                    cited_paths.append(path)
+            if cited_paths:
+                st.caption(
+                    "Sources used (expand below to read them): "
+                    + ", ".join(f"`{path.name}`" for path in cited_paths)
+                )
+
+            usage = search_state["usage"] or {}
+            processing_time = usage.get("processing_time")
+            if processing_time is not None:
+                st.caption(
+                    f"Model: `{search_state['model']}` · "
+                    f"{usage.get('total', '?')} tokens · "
+                    f"{processing_time:.1f}s"
+                )
+        elif search_state["answer_error"]:
+            st.error(f"LLM answer failed: {search_state['answer_error']}")
+        elif not search_state["question"]:
+            st.info("No question was asked — use the discussion panel to ask about these notes.")
+
+        st.subheader("Sources")
+        # Group hits by document, keeping the order of each document's best hit.
+        hits_by_source: dict[str, list[dict]] = {}
+        for i, res in enumerate(results, 1):
+            file_source = str(res.get("file_source", "Unknown source"))
+            hits_by_source.setdefault(file_source, []).append({**res, "_rank": i})
+
+        for file_source, hits in hits_by_source.items():
+            best = min(
+                (h["distance"] for h in hits if h.get("distance") is not None),
+                default=None,
+            )
+            label = f"#{hits[0]['_rank']} — {Path(file_source).name}"
+            if len(hits) > 1:
+                label += f" · {len(hits)} passages"
+            if best is not None:
+                label += f" (distance: {best:.3f})"
+            with st.expander(label):
+                render_source_document(
+                    file_source,
+                    hits,
+                    library_folder,
+                    safe_lib,
+                    uploads_dirs,
+                )
+
+    with chat_col:
+        render_follow_up_discussion(search_state, model_name, max_tokens, temperature)
 
 
 def get_pending_index_settings(safe_lib: str, corpus_config: dict) -> tuple[str, float, bool]:
@@ -1942,17 +2122,8 @@ def build_context_from_results(results: list, max_chars: int = LLM_CONTEXT_MAX_C
     return "\n".join(parts)
 
 
-def answer_with_ollama(
-    question: str,
-    results: list,
-    model_name: str,
-    host: str = OLLAMA_HOST,
-    port: int = OLLAMA_PORT,
-    max_tokens: int = 512,
-    temperature: float = 0.3,
-) -> tuple[str, dict]:
-    """Generate a natural-language answer from search results using a local Ollama model."""
-    import requests
+def build_llm_prompt(question: str, results: list, max_tokens: int = 512, temperature: float = 0.3) -> str:
+    """Build the question-plus-notes prompt sent as the first turn of an LLM conversation."""
     from llmware.prompts import PromptCatalog
 
     context = build_context_from_results(results)
@@ -1966,17 +2137,55 @@ def answer_with_ollama(
         context=context,
         inference_dict={"temperature": temperature, "max_tokens": max_tokens},
     )
-    full_prompt = prompt_dict["core_prompt"]
+    return prompt_dict["core_prompt"]
+
+
+def answer_with_ollama(
+    question: str,
+    results: list,
+    model_name: str,
+    host: str = OLLAMA_HOST,
+    port: int = OLLAMA_PORT,
+    max_tokens: int = 512,
+    temperature: float = 0.3,
+) -> tuple[str, dict]:
+    """Generate a natural-language answer from search results using a local Ollama model."""
+    full_prompt = build_llm_prompt(question, results, max_tokens, temperature)
+    return chat_with_ollama(
+        [{"role": "user", "content": full_prompt}],
+        model_name,
+        host=host,
+        port=port,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+
+def chat_with_ollama(
+    messages: list[dict],
+    model_name: str,
+    host: str = OLLAMA_HOST,
+    port: int = OLLAMA_PORT,
+    max_tokens: int = 512,
+    temperature: float = 0.3,
+    num_ctx: int | None = None,
+) -> tuple[str, dict]:
+    """Send a chat conversation to a local Ollama model and return (reply, usage)."""
+    import requests
+
+    options = {
+        "temperature": temperature,
+        "num_predict": max_tokens,
+    }
+    if num_ctx:
+        options["num_ctx"] = num_ctx
 
     url = f"http://{host}:{port}/api/chat"
     payload = {
         "model": model_name,
-        "messages": [{"role": "user", "content": full_prompt}],
+        "messages": messages,
         "stream": False,
-        "options": {
-            "temperature": temperature,
-            "num_predict": max_tokens,
-        },
+        "options": options,
     }
 
     try:
@@ -2057,8 +2266,12 @@ def perform_search(
     embedding_model: str,
     result_limit: int,
     distance_threshold: float,
-) -> tuple[list, bool]:
-    """Run the hybrid search pipeline and return result blocks."""
+) -> tuple[list, bool, float | None]:
+    """Run the hybrid search pipeline.
+
+    Returns (result blocks, whether text fallback was used, closest vector distance
+    when every vector match was beyond the threshold).
+    """
     q = Query(
         search_lib,
         embedding_model_name=embedding_model,
@@ -2080,7 +2293,12 @@ def perform_search(
     )
 
     used_text_fallback = False
+    nearest_distance = None
     if not broad_results:
+        # Re-run without a cutoff to report how close the best vector match was.
+        nearest = q.semantic_query(prompt_text, result_count=1, embedding_distance_threshold=1e9)
+        if nearest and nearest[0].get("distance") is not None:
+            nearest_distance = float(nearest[0]["distance"])
         broad_results = safe_text_query(q, prompt_text, result_count=semantic_count)
         used_text_fallback = bool(broad_results)
 
@@ -2089,7 +2307,51 @@ def perform_search(
     else:
         final_results = broad_results
 
-    return final_results[:result_limit], used_text_fallback
+    return final_results[:result_limit], used_text_fallback, nearest_distance
+
+
+def describe_nearest_vector_match(nearest_distance: float | None, distance_threshold: float) -> str:
+    """Explain how far the closest vector match was from the distance threshold."""
+    if nearest_distance is None:
+        return ""
+    return (
+        f" Closest vector match was **{nearest_distance:.3f}** "
+        f"(threshold {distance_threshold:.2f}). Raising the distance threshold in "
+        f"Advanced settings to about **{nearest_distance + 0.01:.2f}** would include it."
+    )
+
+
+def exact_text_search(safe_lib: str, literal: str, max_documents: int) -> list[dict]:
+    """Find notes whose text or file name contains `literal` (case-insensitive), skipping vectors.
+
+    Returns every block of up to `max_documents` matching notes, in document order.
+    """
+    needle = literal.strip().lower()
+    if not needle:
+        return []
+    table = safe_lib.replace('"', '""')
+    with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+        sources = [
+            row[0]
+            for row in conn.execute(
+                f'SELECT file_source FROM "{table}" '
+                "WHERE instr(lower(text_block), ?) > 0 OR instr(lower(file_source), ?) > 0 "
+                "GROUP BY file_source ORDER BY MIN(doc_ID) LIMIT ?",
+                (needle, needle, max_documents),
+            )
+        ]
+        if not sources:
+            return []
+        placeholders = ", ".join("?" for _ in sources)
+        rows = conn.execute(
+            f'SELECT doc_ID, block_ID, file_source, text_block FROM "{table}" '
+            f"WHERE file_source IN ({placeholders}) ORDER BY doc_ID, block_ID",
+            sources,
+        ).fetchall()
+    return [
+        {"doc_ID": doc_id, "block_ID": block_id, "file_source": source, "text": text or ""}
+        for doc_id, block_id, source, text in rows
+    ]
 
 
 _migrated_tables = migrate_all_legacy_vectors()
@@ -2415,19 +2677,35 @@ st.caption(
     f"{get_embedding_model_summary(selected_embedding_model)}"
 )
 
-topic_query = st.text_input(
-    "Pre-filter keyword (optional):",
-    help=(
-        "Narrows semantic search to notes that contain **all** of these keywords (text match). "
-        "Leave blank to search the whole corpus.\n\n"
-        "Examples:\n"
-        "• `2025 Christmas` or `2025 + Christmas` — notes containing both **2025** and **Christmas**\n"
-        "• `holiday budget` — notes with both words\n"
-        "• `2025` — notes mentioning 2025 only\n\n"
-        "Your main question below still drives meaning-based ranking; "
-        "this box only limits which notes are considered."
-    ),
-)
+filter_col, exact_col = st.columns([4, 1.4], vertical_alignment="bottom")
+with exact_col:
+    exact_text_only = st.checkbox(
+        "Exact text only",
+        value=bool(load_app_settings().get("exact_text_only", False)),
+        key="exact_text_only",
+        on_change=persist_exact_text_only_setting,
+        help=(
+            "Skips vector search and returns notes whose text or file name contains the "
+            "filter **exactly as typed** (case-insensitive), e.g. `2026-10-01`.\n\n"
+            "Much faster than semantic search. **Max results** limits the number of notes, "
+            "and each matching note is returned in full. The question box is optional — "
+            "it is only used for the LLM answer."
+        ),
+    )
+with filter_col:
+    topic_query = st.text_input(
+        "Pre-filter keyword (optional):",
+        help=(
+            "Narrows semantic search to notes that contain **all** of these keywords (text match). "
+            "Leave blank to search the whole corpus.\n\n"
+            "Examples:\n"
+            "• `2025 Christmas` or `2025 + Christmas` — notes containing both **2025** and **Christmas**\n"
+            "• `holiday budget` — notes with both words\n"
+            "• `2025` — notes mentioning 2025 only\n\n"
+            "Your main question below still drives meaning-based ranking; "
+            "this box only limits which notes are considered."
+        ),
+    )
 prompt_text = st.text_area("What would you like to ask?", height=100)
 
 search_col, llm_col, limit_col = st.columns([1.2, 2.2, 1.2])
@@ -2494,7 +2772,13 @@ else:
     llm_max_tokens = int(corpus_config["llm_max_tokens"])
     llm_temperature = float(corpus_config["llm_temperature"])
 
-if search_clicked and prompt_text:
+if search_clicked:
+    # A new search replaces the previous results and discussion.
+    st.session_state.pop(LAST_SEARCH_KEY, None)
+
+if search_clicked and exact_text_only and not topic_query.strip():
+    st.warning("Enter text in the filter field to use **Exact text only**.")
+elif search_clicked and (prompt_text or exact_text_only):
     try:
         search_lib = Library().load_library(safe_lib)
     except Exception:
@@ -2503,105 +2787,82 @@ if search_clicked and prompt_text:
     if not search_lib:
         st.error("Library not found. Use **Rescan** or **Re-index** in the left panel first.")
     else:
-        emb_ready, emb_message = is_embedding_ready(search_lib, selected_embedding_model)
-        if not emb_ready:
-            if migrate_legacy_vectors(safe_lib, selected_embedding_model):
+        uploads_dirs = get_library_uploads_dirs(search_lib)
+        final_results = None
+        used_text_fallback = False
+        nearest_distance = None
+        try:
+            if exact_text_only:
+                with st.spinner("Searching for exact text…"):
+                    final_results = exact_text_search(safe_lib, topic_query, result_limit)
+            else:
                 emb_ready, emb_message = is_embedding_ready(search_lib, selected_embedding_model)
-        if not emb_ready:
-            st.error(f"Semantic index not ready: {emb_message}")
-        else:
-            uploads_dirs = get_library_uploads_dirs(search_lib)
-            with st.spinner("Searching…"):
-                try:
-                    final_results, used_text_fallback = perform_search(
-                        search_lib,
-                        prompt_text,
-                        topic_query,
-                        selected_embedding_model,
-                        result_limit,
-                        distance_threshold,
+                if not emb_ready:
+                    if migrate_legacy_vectors(safe_lib, selected_embedding_model):
+                        emb_ready, emb_message = is_embedding_ready(search_lib, selected_embedding_model)
+                if not emb_ready:
+                    st.error(f"Semantic index not ready: {emb_message}")
+                else:
+                    with st.spinner("Searching…"):
+                        final_results, used_text_fallback, nearest_distance = perform_search(
+                            search_lib,
+                            prompt_text,
+                            topic_query,
+                            selected_embedding_model,
+                            result_limit,
+                            distance_threshold,
+                        )
+
+            if final_results is not None:
+                search_state = {
+                    "library": safe_lib,
+                    "results": final_results,
+                    "question": prompt_text,
+                    "exact_text_only": exact_text_only,
+                    "topic_query": topic_query.strip(),
+                    "used_text_fallback": used_text_fallback,
+                    "nearest_hint": describe_nearest_vector_match(nearest_distance, distance_threshold),
+                    "uploads_dirs": uploads_dirs,
+                    "model": selected_ollama_model,
+                    "answer": None,
+                    "usage": None,
+                    "answer_error": None,
+                    "discussion": [],
+                }
+                if final_results and use_llm_answer and prompt_text:
+                    with st.spinner(f"Generating answer with `{selected_ollama_model}`…"):
+                        try:
+                            search_state["answer"], search_state["usage"] = answer_with_ollama(
+                                question=prompt_text,
+                                results=final_results,
+                                model_name=selected_ollama_model,
+                                max_tokens=llm_max_tokens,
+                                temperature=llm_temperature,
+                            )
+                        except Exception as llm_exc:
+                            search_state["answer_error"] = str(llm_exc)
+                st.session_state[LAST_SEARCH_KEY] = search_state
+
+                if final_results and use_llm_answer:
+                    save_corpus_config(
+                        safe_lib,
+                        {
+                            "ollama_model": selected_ollama_model,
+                            "llm_max_tokens": llm_max_tokens,
+                            "llm_temperature": llm_temperature,
+                        },
                     )
+        except Exception as exc:
+            st.error(f"Search failed: {exc}")
 
-                    if not final_results:
-                        st.warning("No matches found.")
-                    else:
-                        if used_text_fallback:
-                            st.info("Vector search had no matches — showing text search results instead.")
-
-                        if use_llm_answer:
-                            with st.spinner(f"Generating answer with `{selected_ollama_model}`…"):
-                                try:
-                                    llm_answer, llm_usage = answer_with_ollama(
-                                        question=prompt_text,
-                                        results=final_results,
-                                        model_name=selected_ollama_model,
-                                        max_tokens=llm_max_tokens,
-                                        temperature=llm_temperature,
-                                    )
-                                    st.subheader("Answer")
-                                    st.markdown(llm_answer)
-
-                                    cited_paths: list[Path] = []
-                                    seen_paths: set[str] = set()
-                                    for result in final_results:
-                                        path = resolve_source_path(
-                                            str(result.get("file_source", "")),
-                                            library_folder,
-                                            uploads_dirs,
-                                        )
-                                        if path and str(path) not in seen_paths:
-                                            seen_paths.add(str(path))
-                                            cited_paths.append(path)
-                                    if cited_paths:
-                                        st.caption(
-                                            "Sources used (expand below to read them): "
-                                            + ", ".join(f"`{path.name}`" for path in cited_paths)
-                                        )
-
-                                    processing_time = llm_usage.get("processing_time")
-                                    if processing_time is not None:
-                                        st.caption(
-                                            f"Model: `{selected_ollama_model}` · "
-                                            f"{llm_usage.get('total', '?')} tokens · "
-                                            f"{processing_time:.1f}s"
-                                        )
-                                except Exception as llm_exc:
-                                    st.error(f"LLM answer failed: {llm_exc}")
-
-                        st.subheader("Sources")
-                        # Group hits by document, keeping the order of each document's best hit.
-                        hits_by_source: dict[str, list[dict]] = {}
-                        for i, res in enumerate(final_results, 1):
-                            file_source = str(res.get("file_source", "Unknown source"))
-                            hits_by_source.setdefault(file_source, []).append({**res, "_rank": i})
-
-                        for file_source, hits in hits_by_source.items():
-                            best = min(
-                                (h["distance"] for h in hits if h.get("distance") is not None),
-                                default=None,
-                            )
-                            label = f"#{hits[0]['_rank']} — {Path(file_source).name}"
-                            if len(hits) > 1:
-                                label += f" · {len(hits)} matches"
-                            if best is not None:
-                                label += f" (distance: {best:.3f})"
-                            with st.expander(label):
-                                render_source_document(
-                                    file_source,
-                                    hits,
-                                    library_folder,
-                                    safe_lib,
-                                    uploads_dirs,
-                                )
-
-                        if use_llm_answer:
-                            save_corpus_config(
-                                safe_lib,
-                                {
-                                    "ollama_model": selected_ollama_model,
-                                    "llm_max_tokens": llm_max_tokens,
-                                    "llm_temperature": llm_temperature,
-                                },
-                            )
-                except Exception as exc:
-                    st.error(f"Search failed: {exc}")
+# Results are kept in session state so they survive reruns (follow-ups, downloads, expanders).
+last_search = st.session_state.get(LAST_SEARCH_KEY)
+if last_search and last_search["library"] == safe_lib:
+    render_search_results(
+        last_search,
+        library_folder,
+        safe_lib,
+        selected_ollama_model,
+        llm_max_tokens,
+        llm_temperature,
+    )
