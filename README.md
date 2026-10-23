@@ -14,7 +14,7 @@ The system used for this was a M3 Pro with 36GB of RAM.
 
 1. **Ingest** — Scans a corpus folder recursively (including subfolders) and loads files into an LLMWare library.
 2. **Embed** — Builds a semantic vector index using a configurable local embedding model.
-3. **Search** — Runs hybrid retrieval: semantic vector search with optional keyword pre-filtering and text-search fallback.
+3. **Search** — Runs hybrid retrieval: semantic vector search with an optional boolean note filter (AND / OR / NOT) and text-search fallback, or a literal filter-only search across one or all libraries.
 4. **Answer (optional)** — Sends top search results to Ollama to synthesise an answer grounded in your notes.
 
 
@@ -216,9 +216,18 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
 ### Search
 
 1. Choose your library.
-2. Optionally set a **Pre-filter keyword** to narrow to notes containing specific text.
+2. Optionally add filter terms as capsules (type a term, press Enter):
+   - **Must include (AND)** — every term must appear in the note.
+   - **Any of (OR)** — at least one term must appear.
+   - **Exclude (NOT)** — notes with any of these terms are dropped.
+
+   Terms match literally and case-insensitively anywhere in the note or its file name (`2026-10` matches `2026-10-19`). With a question, semantic search ranks passages only within the matching notes. Filters are saved between sessions.
 3. Enter your question in **What would you like to ask?**
 4. Click **Search**.
+
+The search area is split into a **Filter** box (left) and an **Ask** box (right). **🔎 Filter search only** (in the Filter box's *Advanced search settings*) lists the matching notes under the Filter box without vector search or an LLM answer, keeping your question for later; a full **Search** shows the answer, sources and discussion full-width below both boxes.
+
+**Exact text only** skips vector search and returns the matching notes in full (the question is optional and only used for the LLM answer). Add **Search all libraries** to run that literal search across every visible library: a *Matches by library* panel shows note counts per library, with a **Use library** button to switch to one for a semantic search. No embeddings are used, so nothing needs re-indexing.
 
 Results appear under **Sources** as one dropdown per document (documents with several matches are grouped). Each dropdown has two tabs:
 
@@ -229,7 +238,9 @@ Results appear under **Sources** as one dropdown per document (documents with se
 
 - **Answer with LLM** is enabled by default.
 - Configure **Ollama model**, **Max tokens** (slider), and **Temperature** below the search bar.
+- **Distance cutoff** sits beside them (same setting as *Relevance cutoff* in the left panel, saved per corpus). After a semantic search, a bar under it shows where passages were found — green is within the cutoff, amber is where to raise it — with a **Set cutoff to …** button to include the closest match.
 - Search runs first; Ollama summarises the retrieved chunks—it does not replace retrieval.
+- **Corpus prompt** (left panel, under the library selector) — describe the role you wrote this corpus in (e.g. business owner, parent, salesperson). Tick **Apply corpus prompt** to send it to the LLM ahead of the notes for answers and follow-ups. Saved per corpus.
 
 Requires Ollama running locally (`localhost:11434`).
 
@@ -284,6 +295,8 @@ On first run, the app may copy data from the legacy location `~/llmware_data/` i
 - `embedding_model` — e.g. `mini-lm-sbert`, `gte-large`
 - `distance_threshold` — semantic distance cutoff (default `0.55`)
 - `ollama_model`, `llm_max_tokens`, `llm_temperature` — LLM answer preferences
+- `follow_up_model` — Ollama model used in the Discussion panel (defaults to the answer model)
+- `corpus_prompt`, `corpus_prompt_enabled` — your role as author of this corpus, sent to the LLM ahead of the notes when enabled
 
 ### Global (`app_settings.json`)
 

@@ -1,3 +1,4 @@
+import math
 import re
 import json
 import gc
@@ -9,6 +10,7 @@ import threading
 import datetime
 from functools import lru_cache
 import streamlit as st
+import streamlit.components.v1 as components
 from pathlib import Path
 from llmware.library import Library, LibraryCatalog
 from llmware.retrieval import Query
@@ -127,6 +129,8 @@ DEFAULT_CORPUS_CONFIG = {
     "llm_max_tokens": 512,
     "llm_temperature": 0.3,
     "hidden": False,
+    "corpus_prompt": "",
+    "corpus_prompt_enabled": False,
 }
 
 # Hardware acceleration
@@ -685,6 +689,100 @@ set_embedding_acceleration(load_app_settings().get("use_gpu_for_embeddings", Fal
 def persist_exact_text_only_setting() -> None:
     save_app_settings({"exact_text_only": bool(st.session_state.get("exact_text_only", False))})
 
+
+DISTANCE_SLIDER_MIN = 0.30
+DISTANCE_SLIDER_MAX = 1.20
+DISTANCE_SLIDER_STEP = 0.05
+
+
+def cutoff_to_include(distance: float) -> float:
+    """Smallest slider value that includes `distance` (llmware keeps matches strictly below the cutoff)."""
+    steps = math.floor(distance / DISTANCE_SLIDER_STEP + 1e-9) + 1
+    return round(steps * DISTANCE_SLIDER_STEP, 2)
+
+
+def set_distance_cutoff(safe_lib: str, value: float) -> None:
+    """Keep both cutoff sliders in step and save the value for this corpus."""
+    value = round(min(max(float(value), DISTANCE_SLIDER_MIN), DISTANCE_SLIDER_MAX), 2)
+    st.session_state[f"distance_threshold_{safe_lib}"] = value
+    st.session_state[f"search_distance_threshold_{safe_lib}"] = value
+    save_corpus_config(safe_lib, {"distance_threshold": value})
+
+
+def sync_cutoff_from_sidebar(safe_lib: str) -> None:
+    # The sidebar slider is saved with "Save corpus settings"; only mirror it here.
+    st.session_state[f"search_distance_threshold_{safe_lib}"] = st.session_state[f"distance_threshold_{safe_lib}"]
+
+
+def sync_cutoff_from_search(safe_lib: str) -> None:
+    set_distance_cutoff(safe_lib, st.session_state[f"search_distance_threshold_{safe_lib}"])
+
+
+def render_distance_map(threshold: float, distances: list[float]) -> None:
+    """Coloured bar under the cutoff slider: green = included, amber = raise the cutoff into this band."""
+    span = DISTANCE_SLIDER_MAX - DISTANCE_SLIDER_MIN
+
+    def pct(value: float) -> float:
+        return min(max((value - DISTANCE_SLIDER_MIN) / span, 0.0), 1.0) * 100
+
+    nearest = min(distances)
+    farthest = max(distances)
+    segments = [f'<div style="position:absolute;left:0;width:{pct(threshold):.1f}%;height:100%;'
+                f'background:rgba(33,195,84,.55)"></div>']
+    if farthest >= threshold:
+        start = max(threshold, nearest)
+        segments.append(
+            f'<div style="position:absolute;left:{pct(threshold):.1f}%;'
+            f'width:{pct(start) - pct(threshold):.1f}%;height:100%;background:rgba(255,164,33,.35)"></div>'
+            f'<div style="position:absolute;left:{pct(start):.1f}%;'
+            f'width:{max(pct(farthest) - pct(start), 1.0):.1f}%;height:100%;background:rgba(255,164,33,.85)"></div>'
+        )
+    ticks = "".join(
+        f'<div style="position:absolute;left:{pct(d):.1f}%;top:-3px;width:2px;height:14px;'
+        f'background:{"#1a7f37" if d < threshold else "#d1242f"}"></div>'
+        for d in distances
+    )
+    st.markdown(
+        '<div style="position:relative;height:8px;margin:-0.6rem 0.5rem 0.2rem;border-radius:4px;'
+        f'background:rgba(128,128,128,.22)">{"".join(segments)}{ticks}</div>',
+        unsafe_allow_html=True,
+    )
+
+    if nearest >= threshold:
+        target = cutoff_to_include(nearest)
+        if target <= DISTANCE_SLIDER_MAX:
+            st.caption(
+                f"Closest match **{nearest:.3f}** is above the cutoff. "
+                f"Raise to **{target:.2f}** (amber band) to include it."
+            )
+        else:
+            st.caption(f"Closest match **{nearest:.3f}** is beyond the slider range.")
+    elif farthest >= threshold:
+        st.caption(f"Raise to **{min(cutoff_to_include(farthest), DISTANCE_SLIDER_MAX):.2f}** to include all {len(distances)} passages.")
+    else:
+        st.caption(f"All {len(distances)} passages are within the cutoff ({nearest:.3f}–{farthest:.3f}).")
+
+
+def persist_search_all_libraries_setting() -> None:
+    save_app_settings({"search_all_libraries": bool(st.session_state.get("search_all_libraries", False))})
+
+
+def get_search_filter_from_widgets() -> dict:
+    return {
+        field: clean_filter_terms(st.session_state.get(f"filter_{field}", []))
+        for field in SEARCH_FILTER_FIELDS
+    }
+
+
+def persist_search_filter() -> None:
+    save_app_settings({"search_filter": get_search_filter_from_widgets()})
+
+
+def switch_to_library(library: str) -> None:
+    """Button callback: make `library` the selected library (runs before widgets are created)."""
+    st.session_state["selected_library"] = library
+    save_app_settings({"last_selected_library": library})
+
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
@@ -1050,6 +1148,50 @@ def save_corpus_config(safe_lib: str, updates: dict) -> dict:
     return config
 
 
+def get_active_corpus_prompt(corpus_config: dict) -> str:
+    """Corpus prompt to send to the LLM, or "" when it is empty or not applied."""
+    if not corpus_config.get("corpus_prompt_enabled"):
+        return ""
+    return str(corpus_config.get("corpus_prompt", "")).strip()
+
+
+def persist_corpus_prompt(safe_lib: str) -> None:
+    save_corpus_config(
+        safe_lib,
+        {
+            "corpus_prompt": str(st.session_state.get(f"corpus_prompt_{safe_lib}", "")),
+            "corpus_prompt_enabled": bool(st.session_state.get(f"corpus_prompt_enabled_{safe_lib}", False)),
+        },
+    )
+
+
+def render_corpus_prompt_controls(safe_lib: str, corpus_config: dict) -> None:
+    """Sidebar editor for the per-corpus author-role prompt."""
+    applied = bool(get_active_corpus_prompt(corpus_config))
+    with st.sidebar.expander("Corpus prompt" + (" · applied" if applied else ""), expanded=False):
+        st.checkbox(
+            "Apply corpus prompt",
+            value=bool(corpus_config.get("corpus_prompt_enabled", False)),
+            key=f"corpus_prompt_enabled_{safe_lib}",
+            on_change=persist_corpus_prompt,
+            args=(safe_lib,),
+            help=(
+                "When ticked, this text is sent to the LLM ahead of the notes for every answer "
+                "and follow-up in this corpus. Saved per corpus."
+            ),
+        )
+        st.text_area(
+            "Your role as the author",
+            value=str(corpus_config.get("corpus_prompt", "")),
+            key=f"corpus_prompt_{safe_lib}",
+            on_change=persist_corpus_prompt,
+            args=(safe_lib,),
+            height=120,
+            placeholder="e.g. I wrote these notes as the owner of a small consultancy, tracking clients and proposals.",
+            help="Describe who you were when writing these notes. Press Cmd+Enter or click away to save.",
+        )
+
+
 def is_hide_corpora_enabled() -> bool:
     return bool(
         st.session_state.get(
@@ -1277,44 +1419,49 @@ def render_source_document(
             st.markdown(f"> {str(hit.get('text', '')).strip()}".replace("\n", "\n> "))
 
     with document_tab:
-        text = ""
-        from_index = False
-        if path and path.suffix.lower() in TEXT_PREVIEW_EXTENSIONS:
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                text = ""
-        if not text:
-            text = load_document_text_from_index(safe_lib, Path(file_source).name)
-            from_index = bool(text)
+        render_full_document(file_source, path, safe_lib)
 
-        if not text:
-            st.info("Document contents are not available.")
-        else:
-            if from_index:
-                st.caption("Text reconstructed from the indexed blocks.")
-            truncated = len(text) > DOCUMENT_PREVIEW_MAX_CHARS
-            preview = text[:DOCUMENT_PREVIEW_MAX_CHARS]
-            with st.container(height=500):
-                if path and path.suffix.lower() == ".md":
-                    st.markdown(preview)
-                elif path and path.suffix.lower() == ".json":
-                    st.code(preview, language="json")
-                else:
-                    st.text(preview)
-            if truncated:
-                st.caption(f"Preview truncated to {DOCUMENT_PREVIEW_MAX_CHARS:,} characters.")
 
-        if path and path.is_file():
-            try:
-                st.download_button(
-                    f"Download {path.name}",
-                    data=path.read_bytes(),
-                    file_name=path.name,
-                    key=f"download::{file_source}",
-                )
-            except OSError:
-                pass
+def render_full_document(file_source: str, path: Path | None, safe_lib: str) -> None:
+    """Full note text (from disk, or rebuilt from the index) plus a download button."""
+    text = ""
+    from_index = False
+    if path and path.suffix.lower() in TEXT_PREVIEW_EXTENSIONS:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+    if not text:
+        text = load_document_text_from_index(safe_lib, Path(file_source).name)
+        from_index = bool(text)
+
+    if not text:
+        st.info("Document contents are not available.")
+    else:
+        if from_index:
+            st.caption("Text reconstructed from the indexed blocks.")
+        truncated = len(text) > DOCUMENT_PREVIEW_MAX_CHARS
+        preview = text[:DOCUMENT_PREVIEW_MAX_CHARS]
+        with st.container(height=500):
+            if path and path.suffix.lower() == ".md":
+                st.markdown(preview)
+            elif path and path.suffix.lower() == ".json":
+                st.code(preview, language="json")
+            else:
+                st.text(preview)
+        if truncated:
+            st.caption(f"Preview truncated to {DOCUMENT_PREVIEW_MAX_CHARS:,} characters.")
+
+    if path and path.is_file():
+        try:
+            st.download_button(
+                f"Download {path.name}",
+                data=path.read_bytes(),
+                file_name=path.name,
+                key=f"download::{safe_lib}::{file_source}",
+            )
+        except OSError:
+            pass
 
 
 def follow_up_with_ollama(
@@ -1323,6 +1470,7 @@ def follow_up_with_ollama(
     model_name: str,
     max_tokens: int,
     temperature: float,
+    corpus_prompt: str = "",
 ) -> dict:
     """Answer a follow-up using the search's notes plus the conversation so far.
 
@@ -1332,7 +1480,9 @@ def follow_up_with_ollama(
     if search_state.get("answer"):
         messages.append({
             "role": "user",
-            "content": build_llm_prompt(search_state["question"], search_state["results"], max_tokens, temperature),
+            "content": build_llm_prompt(
+                search_state["question"], search_state["results"], max_tokens, temperature, corpus_prompt
+            ),
         })
         messages.append({"role": "assistant", "content": search_state["answer"]})
     messages.extend(
@@ -1343,7 +1493,9 @@ def follow_up_with_ollama(
     user_turn = {"role": "user", "content": question}
     if not messages:
         # No answer yet — this turn carries the notes as context.
-        user_turn["prompt"] = build_llm_prompt(question, search_state["results"], max_tokens, temperature)
+        user_turn["prompt"] = build_llm_prompt(
+            question, search_state["results"], max_tokens, temperature, corpus_prompt
+        )
     messages.append({"role": "user", "content": user_turn.get("prompt", question)})
 
     reply, _usage = chat_with_ollama(
@@ -1356,25 +1508,146 @@ def follow_up_with_ollama(
     return {"user": user_turn, "assistant": {"role": "assistant", "content": reply}}
 
 
+def persist_follow_up_model(safe_lib: str) -> None:
+    save_corpus_config(safe_lib, {"follow_up_model": st.session_state.get(f"follow_up_model_{safe_lib}")})
+
+
+def render_copy_button(text: str, label: str = "Copy") -> None:
+    """Small button that copies `text` to the clipboard (component iframes may write to it)."""
+    payload = json.dumps(text).replace("</", "<\\/")
+    components.html(
+        f"""
+<button id="copy" style="font:12px -apple-system,BlinkMacSystemFont,sans-serif;color:#888;
+  background:transparent;border:1px solid rgba(136,136,136,.45);border-radius:6px;
+  padding:2px 10px;cursor:pointer">📋 {label}</button>
+<script>
+const text = {payload};
+const button = document.getElementById("copy");
+button.addEventListener("click", async () => {{
+  try {{
+    await navigator.clipboard.writeText(text);
+  }} catch (err) {{
+    const area = document.createElement("textarea");
+    area.value = text;
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }}
+  button.textContent = "✓ Copied";
+  setTimeout(() => (button.textContent = "📋 {label}"), 1500);
+}});
+</script>
+""",
+        height=32,
+    )
+
+
+def install_filter_commit_on_blur() -> None:
+    """Turn text typed in a filter field into a capsule when focus leaves it.
+
+    Streamlit's multiselect discards typed-but-uncommitted text on blur. A capture-phase
+    focusout listener on the page sends Enter first, so the term is added instead of lost.
+    """
+    components.html(
+        """
+<script>
+const page = window.parent;
+if (!page.__filterCommitOnBlur) {
+  page.__filterCommitOnBlur = true;
+  page.document.addEventListener("focusout", (event) => {
+    const input = event.target;
+    if (!(input instanceof page.HTMLInputElement) || !input.value.trim()) return;
+    if (!input.closest('[data-testid="stMultiSelect"]')) return;
+    const enter = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
+    input.dispatchEvent(new page.KeyboardEvent("keydown", enter));
+  }, true);
+}
+</script>
+""",
+        height=0,
+    )
+
+
 def render_follow_up_discussion(
     search_state: dict,
     model_name: str,
     max_tokens: int,
     temperature: float,
+    corpus_prompt: str = "",
+    model_options: list[str] | None = None,
+    safe_lib: str = "",
 ) -> None:
     """Chat panel for follow-up questions about the notes from the last search."""
     st.subheader("Discussion")
-    st.caption(f"Follow-ups are answered from the notes in this search using `{model_name}`.")
 
+    # Follow-ups can use a different (e.g. larger) model than the main answer.
+    options = list(model_options or [model_name])
+    saved_model = get_corpus_config(safe_lib).get("follow_up_model") or model_name
+    if saved_model not in options:
+        saved_model = model_name if model_name in options else options[0]
+    model_name = st.selectbox(
+        "Follow-up model",
+        options=options,
+        index=options.index(saved_model),
+        key=f"follow_up_model_{safe_lib}",
+        on_change=persist_follow_up_model,
+        args=(safe_lib,),
+        help=(
+            "Ollama model used for follow-up questions. It can differ from the main answer model, "
+            "e.g. a larger model for deeper discussion. Saved per corpus."
+        ),
+    )
+    caption = f"Follow-ups are answered from the notes in this search using `{model_name}`"
+    st.caption(caption + (" with the corpus prompt." if corpus_prompt.strip() else "."))
+
+    view_col, popout_col = st.columns(2)
+    with view_col:
+        expanded = st.toggle(
+            "Expand",
+            key="discussion_expanded",
+            help="Grow the panel to fit the whole conversation instead of scrolling.",
+        )
+    with popout_col:
+        if st.button("⤢ Pop out", use_container_width=True, help="Open the discussion in a large window."):
+            show_discussion_dialog(search_state, model_name, max_tokens, temperature, corpus_prompt)
+
+    render_discussion_body(
+        search_state,
+        model_name,
+        max_tokens,
+        temperature,
+        corpus_prompt,
+        key_prefix="panel",
+        height="content" if expanded else 520,
+    )
+
+
+def render_discussion_body(
+    search_state: dict,
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+    corpus_prompt: str,
+    *,
+    key_prefix: str,
+    height: int | str,
+    in_dialog: bool = False,
+) -> None:
+    """Transcript, follow-up box and clear button, shared by the side panel and the pop-out."""
     discussion = search_state["discussion"]
-    with st.container(height=520, border=True):
+    with st.container(height=height, border=True, autoscroll=True):
         if not discussion:
             st.caption("No follow-up questions yet.")
         for turn in discussion:
             with st.chat_message(turn["role"]):
                 st.markdown(turn["content"])
+                if turn.get("model"):
+                    st.caption(f"`{turn['model']}`")
+                if turn["role"] == "assistant":
+                    render_copy_button(turn["content"])
 
-    with st.form("follow_up_form", clear_on_submit=True):
+    with st.form(f"{key_prefix}_follow_up_form", clear_on_submit=True):
         follow_up = st.text_area(
             "Ask a follow-up",
             height=90,
@@ -1382,21 +1655,100 @@ def render_follow_up_discussion(
         )
         submitted = st.form_submit_button("Send", type="primary", use_container_width=True)
 
-    if discussion and st.button("Clear discussion", use_container_width=True):
+    # Inside the pop-out, rerun only the dialog so it stays open.
+    rerun_scope = "fragment" if in_dialog else "app"
+
+    if discussion and st.button("Clear discussion", key=f"{key_prefix}_clear", use_container_width=True):
         discussion.clear()
-        st.rerun()
+        st.rerun(scope=rerun_scope)
 
     if submitted and follow_up.strip():
         with st.spinner(f"Asking `{model_name}`…"):
             try:
                 turns = follow_up_with_ollama(
-                    search_state, follow_up.strip(), model_name, max_tokens, temperature
+                    search_state, follow_up.strip(), model_name, max_tokens, temperature, corpus_prompt
                 )
             except Exception as exc:
                 st.error(f"Follow-up failed: {exc}")
                 return
+        turns["assistant"]["model"] = model_name
         discussion.extend([turns["user"], turns["assistant"]])
-        st.rerun()
+        st.rerun(scope=rerun_scope)
+
+
+@st.dialog("Discussion", width="large", on_dismiss="rerun")
+def show_discussion_dialog(
+    search_state: dict,
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+    corpus_prompt: str,
+) -> None:
+    """Pop-out window for long conversations; closing it refreshes the side panel."""
+    st.caption(f"Using `{model_name}`" + (" with the corpus prompt." if corpus_prompt.strip() else "."))
+    render_discussion_body(
+        search_state,
+        model_name,
+        max_tokens,
+        temperature,
+        corpus_prompt,
+        key_prefix="dialog",
+        height=600,
+        in_dialog=True,
+    )
+
+
+def render_library_counts(search_state: dict) -> None:
+    """Per-library match counts for all-library searches, with buttons to switch library."""
+    library_counts = search_state.get("library_counts") or []
+    results = search_state["results"]
+    if library_counts:
+        shown_notes = len({(r.get("_library"), r.get("file_source")) for r in results})
+        total_notes = sum(count for _library, count in library_counts)
+        with st.expander(
+            f"Matches by library — {total_notes} note(s) in {len(library_counts)} library(ies)",
+            expanded=True,
+        ):
+            if shown_notes < total_notes:
+                st.caption(f"Showing {shown_notes} of {total_notes} notes — raise **Max results** to see more.")
+            for library, count in library_counts:
+                name_col, button_col = st.columns([3, 1], vertical_alignment="center")
+                name_col.markdown(f"**{library}** — {count} note(s)")
+                button_col.button(
+                    "Use library",
+                    key=f"use_library_{library}",
+                    on_click=switch_to_library,
+                    args=(library,),
+                    disabled=library == st.session_state.get("selected_library"),
+                    use_container_width=True,
+                    help="Switch to this library, e.g. to run a semantic search inside it.",
+                )
+
+
+def render_filter_results(search_state: dict, library_folder: Path, safe_lib: str) -> None:
+    """Compact list of notes from a Filter search only run, one expandable row per note."""
+    results = search_state["results"]
+    if not results:
+        st.warning(search_state["notice"] or "No notes match the filter.")
+        return
+
+    render_library_counts(search_state)
+
+    notes: dict[tuple[str, str], list[dict]] = {}
+    for result in results:
+        notes.setdefault((result.get("_library", ""), str(result.get("file_source", ""))), []).append(result)
+    st.markdown(f"**{len(notes)} matching note(s)**")
+    st.caption("Your question was not sent to the LLM — click **Search** to run the full workflow.")
+
+    for (library, file_source), blocks in notes.items():
+        label = Path(file_source).name + (f"  ·  {library}" if library else "")
+        with st.expander(label):
+            note_folder = blocks[0].get("_library_folder", library_folder)
+            note_lib = blocks[0].get("_safe_lib", safe_lib)
+            note_uploads = blocks[0].get("_uploads_dirs", search_state["uploads_dirs"])
+            path = resolve_source_path(file_source, note_folder, note_uploads)
+            st.caption(str(path) if path else f"Source: `{file_source}`")
+            render_full_document(file_source, path, note_lib)
 
 
 def render_search_results(
@@ -1406,37 +1758,44 @@ def render_search_results(
     model_name: str,
     max_tokens: int,
     temperature: float,
+    corpus_prompt: str = "",
+    model_options: list[str] | None = None,
 ) -> None:
     """Render the stored results of the last search, with the follow-up discussion alongside."""
     results = search_state["results"]
     if not results:
-        if search_state["exact_text_only"]:
-            st.warning(f"No notes contain `{search_state['topic_query']}`.")
-        else:
-            st.warning("No matches found." + search_state["nearest_hint"])
+        st.warning(search_state["notice"] or "No matches found.")
         return
 
-    if search_state["used_text_fallback"]:
-        st.info(
-            "Vector search had no matches — showing text search results instead."
-            + search_state["nearest_hint"]
+    if search_state["notice"]:
+        st.info(search_state["notice"])
+
+    render_library_counts(search_state)
+
+    def hit_location(hit: dict) -> tuple[Path, str, tuple[Path, ...]]:
+        """Folder, index name and uploads dirs for a hit (all-library hits carry their own)."""
+        return (
+            hit.get("_library_folder", library_folder),
+            hit.get("_safe_lib", safe_lib),
+            hit.get("_uploads_dirs", search_state["uploads_dirs"]),
         )
 
-    uploads_dirs = search_state["uploads_dirs"]
     main_col, chat_col = st.columns([3, 2], gap="large")
 
     with main_col:
         if search_state["answer"]:
             st.subheader("Answer")
             st.markdown(search_state["answer"])
+            render_copy_button(search_state["answer"], "Copy answer")
 
             cited_paths: list[Path] = []
             seen_paths: set[str] = set()
             for result in results:
+                result_folder, _result_lib, result_uploads = hit_location(result)
                 path = resolve_source_path(
                     str(result.get("file_source", "")),
-                    library_folder,
-                    uploads_dirs,
+                    result_folder,
+                    result_uploads,
                 )
                 if path and str(path) not in seen_paths:
                     seen_paths.add(str(path))
@@ -1454,6 +1813,7 @@ def render_search_results(
                     f"Model: `{search_state['model']}` · "
                     f"{usage.get('total', '?')} tokens · "
                     f"{processing_time:.1f}s"
+                    + (" · corpus prompt applied" if search_state.get("corpus_prompt_applied") else "")
                 )
         elif search_state["answer_error"]:
             st.error(f"LLM answer failed: {search_state['answer_error']}")
@@ -1462,32 +1822,43 @@ def render_search_results(
 
         st.subheader("Sources")
         # Group hits by document, keeping the order of each document's best hit.
-        hits_by_source: dict[str, list[dict]] = {}
+        hits_by_source: dict[tuple[str, str], list[dict]] = {}
         for i, res in enumerate(results, 1):
             file_source = str(res.get("file_source", "Unknown source"))
-            hits_by_source.setdefault(file_source, []).append({**res, "_rank": i})
+            hits_by_source.setdefault((res.get("_library", ""), file_source), []).append({**res, "_rank": i})
 
-        for file_source, hits in hits_by_source.items():
+        for (library, file_source), hits in hits_by_source.items():
             best = min(
                 (h["distance"] for h in hits if h.get("distance") is not None),
                 default=None,
             )
             label = f"#{hits[0]['_rank']} — {Path(file_source).name}"
+            if library:
+                label = f"[{library}] " + label
             if len(hits) > 1:
                 label += f" · {len(hits)} passages"
             if best is not None:
                 label += f" (distance: {best:.3f})"
+            hit_folder, hit_lib, hit_uploads = hit_location(hits[0])
             with st.expander(label):
                 render_source_document(
                     file_source,
                     hits,
-                    library_folder,
-                    safe_lib,
-                    uploads_dirs,
+                    hit_folder,
+                    hit_lib,
+                    hit_uploads,
                 )
 
     with chat_col:
-        render_follow_up_discussion(search_state, model_name, max_tokens, temperature)
+        render_follow_up_discussion(
+            search_state,
+            model_name,
+            max_tokens,
+            temperature,
+            corpus_prompt,
+            model_options,
+            safe_lib,
+        )
 
 
 def get_pending_index_settings(safe_lib: str, corpus_config: dict) -> tuple[str, float, bool]:
@@ -2122,8 +2493,17 @@ def build_context_from_results(results: list, max_chars: int = LLM_CONTEXT_MAX_C
     return "\n".join(parts)
 
 
-def build_llm_prompt(question: str, results: list, max_tokens: int = 512, temperature: float = 0.3) -> str:
-    """Build the question-plus-notes prompt sent as the first turn of an LLM conversation."""
+def build_llm_prompt(
+    question: str,
+    results: list,
+    max_tokens: int = 512,
+    temperature: float = 0.3,
+    corpus_prompt: str = "",
+) -> str:
+    """Build the question-plus-notes prompt sent as the first turn of an LLM conversation.
+
+    `corpus_prompt` describes the author's role for this corpus and is placed before the notes.
+    """
     from llmware.prompts import PromptCatalog
 
     context = build_context_from_results(results)
@@ -2137,7 +2517,15 @@ def build_llm_prompt(question: str, results: list, max_tokens: int = 512, temper
         context=context,
         inference_dict={"temperature": temperature, "max_tokens": max_tokens},
     )
-    return prompt_dict["core_prompt"]
+    core_prompt = prompt_dict["core_prompt"]
+    if corpus_prompt.strip():
+        core_prompt = (
+            "Context about the author of these notes:\n"
+            f"{corpus_prompt.strip()}\n"
+            "Use this to interpret the notes and frame your answer.\n\n"
+            + core_prompt
+        )
+    return core_prompt
 
 
 def answer_with_ollama(
@@ -2148,9 +2536,10 @@ def answer_with_ollama(
     port: int = OLLAMA_PORT,
     max_tokens: int = 512,
     temperature: float = 0.3,
+    corpus_prompt: str = "",
 ) -> tuple[str, dict]:
     """Generate a natural-language answer from search results using a local Ollama model."""
-    full_prompt = build_llm_prompt(question, results, max_tokens, temperature)
+    full_prompt = build_llm_prompt(question, results, max_tokens, temperature, corpus_prompt)
     return chat_with_ollama(
         [{"role": "user", "content": full_prompt}],
         model_name,
@@ -2211,7 +2600,13 @@ def chat_with_ollama(
         raise RuntimeError(f"Ollama error for model `{model_name}`: {data['error']}")
 
     message = data.get("message") or {}
-    answer = str(message.get("content", "")).strip()
+    # Reasoning models (e.g. Qwen3) may inline their thinking; keep only the answer.
+    answer = re.sub(r"<think>.*?</think>", "", str(message.get("content", "")), flags=re.DOTALL).strip()
+    if not answer and message.get("thinking"):
+        raise RuntimeError(
+            f"Ollama model `{model_name}` used its whole token budget thinking and gave no answer. "
+            "Raise **Max tokens** and try again."
+        )
     if not answer:
         raise RuntimeError(
             f"Ollama model `{model_name}` returned an empty answer. "
@@ -2238,111 +2633,97 @@ def normalize_text_search_query(query: str) -> str | None:
     return " ".join(tokens) if tokens else None
 
 
-def build_prefilter_text_query(query: str) -> str | None:
-    """Build a keyword pre-filter requiring every token (AND). Supports `2025 Christmas` or `2025 + Christmas`."""
-    cleaned = re.sub(r"[^\w\s]", " ", query or "")
-    tokens = [tok for tok in cleaned.split() if tok]
-    if not tokens:
-        return None
-    return " AND ".join(tokens)
-
-
-def safe_text_query(q: Query, query: str, result_count: int = 20, *, match_all: bool = False) -> list:
-    """Run a text pre-filter/fallback query, skipping empty or punctuation-only input."""
-    if match_all:
-        normalized = build_prefilter_text_query(query)
-    else:
-        normalized = normalize_text_search_query(query)
+def safe_text_query(q: Query, query: str, result_count: int = 20) -> list:
+    """Run a keyword fallback query, skipping empty or punctuation-only input."""
+    normalized = normalize_text_search_query(query)
     if not normalized:
         return []
     results = q.text_query(normalized, result_count=result_count)
     return results or []
 
 
-def perform_search(
-    search_lib: Library,
-    prompt_text: str,
-    topic_query: str,
-    embedding_model: str,
-    result_limit: int,
-    distance_threshold: float,
-) -> tuple[list, bool, float | None]:
-    """Run the hybrid search pipeline.
+SEARCH_FILTER_FIELDS = ("all", "any", "none")
+ALL_LIBRARIES_KEY = "__all_libraries__"
 
-    Returns (result blocks, whether text fallback was used, closest vector distance
-    when every vector match was beyond the threshold).
-    """
-    q = Query(
-        search_lib,
-        embedding_model_name=embedding_model,
-        vector_db=VECTOR_DB,
+
+def clean_filter_terms(terms) -> list[str]:
+    """Strip blanks and case-insensitive duplicates, keeping the order terms were added."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for term in terms or []:
+        text = str(term).strip()
+        if text and text.lower() not in seen:
+            seen.add(text.lower())
+            cleaned.append(text)
+    return cleaned
+
+
+def is_filter_active(search_filter: dict) -> bool:
+    return any(search_filter.get(field) for field in SEARCH_FILTER_FIELDS)
+
+
+def has_positive_filter_terms(search_filter: dict) -> bool:
+    return bool(search_filter.get("all") or search_filter.get("any"))
+
+
+def describe_search_filter(search_filter: dict) -> str:
+    """Readable form of the filter, e.g. `2026-10` AND `Acme` AND (`PoC` OR `pilot`) AND NOT `draft`."""
+    parts = [f"`{term}`" for term in search_filter.get("all", [])]
+    any_terms = search_filter.get("any", [])
+    if len(any_terms) == 1:
+        parts.append(f"`{any_terms[0]}`")
+    elif any_terms:
+        parts.append("(" + " OR ".join(f"`{term}`" for term in any_terms) + ")")
+    parts.extend(f"NOT `{term}`" for term in search_filter.get("none", []))
+    return " AND ".join(parts)
+
+
+def build_note_filter_sql(search_filter: dict) -> tuple[str, list]:
+    """HAVING clause matching whole notes (any block or the file name), case-insensitively."""
+    term_in_note = (
+        "MAX(instr(lower(coalesce(text_block, '')), ?) > 0 "
+        "OR instr(lower(coalesce(file_source, '')), ?) > 0)"
     )
-
-    filter_context = (
-        safe_text_query(q, topic_query, result_count=1000, match_all=True)
-        if build_prefilter_text_query(topic_query)
-        else None
-    )
-    filtered_ids = {res.get("doc_ID") for res in filter_context} if filter_context else None
-
-    semantic_count = min(result_limit * 3, 100) if filtered_ids else result_limit
-    broad_results = q.semantic_query(
-        prompt_text,
-        result_count=semantic_count,
-        embedding_distance_threshold=distance_threshold,
-    )
-
-    used_text_fallback = False
-    nearest_distance = None
-    if not broad_results:
-        # Re-run without a cutoff to report how close the best vector match was.
-        nearest = q.semantic_query(prompt_text, result_count=1, embedding_distance_threshold=1e9)
-        if nearest and nearest[0].get("distance") is not None:
-            nearest_distance = float(nearest[0]["distance"])
-        broad_results = safe_text_query(q, prompt_text, result_count=semantic_count)
-        used_text_fallback = bool(broad_results)
-
-    if filtered_ids:
-        final_results = [res for res in broad_results if res.get("doc_ID") in filtered_ids]
-    else:
-        final_results = broad_results
-
-    return final_results[:result_limit], used_text_fallback, nearest_distance
+    clauses: list[str] = []
+    params: list = []
+    for term in search_filter.get("all", []):
+        clauses.append(f"{term_in_note} = 1")
+        params += [term.lower(), term.lower()]
+    any_terms = search_filter.get("any", [])
+    if any_terms:
+        clauses.append("(" + " OR ".join(f"{term_in_note} = 1" for _ in any_terms) + ")")
+        for term in any_terms:
+            params += [term.lower(), term.lower()]
+    for term in search_filter.get("none", []):
+        clauses.append(f"{term_in_note} = 0")
+        params += [term.lower(), term.lower()]
+    return " AND ".join(clauses), params
 
 
-def describe_nearest_vector_match(nearest_distance: float | None, distance_threshold: float) -> str:
-    """Explain how far the closest vector match was from the distance threshold."""
-    if nearest_distance is None:
-        return ""
-    return (
-        f" Closest vector match was **{nearest_distance:.3f}** "
-        f"(threshold {distance_threshold:.2f}). Raising the distance threshold in "
-        f"Advanced settings to about **{nearest_distance + 0.01:.2f}** would include it."
-    )
-
-
-def exact_text_search(safe_lib: str, literal: str, max_documents: int) -> list[dict]:
-    """Find notes whose text or file name contains `literal` (case-insensitive), skipping vectors.
-
-    Returns every block of up to `max_documents` matching notes, in document order.
-    """
-    needle = literal.strip().lower()
-    if not needle:
+def find_matching_sources(safe_lib: str, search_filter: dict, limit: int | None = None) -> list[str]:
+    """File sources of notes matching the filter, in index order. Empty if the library has no index."""
+    having, params = build_note_filter_sql(search_filter)
+    if not having:
         return []
     table = safe_lib.replace('"', '""')
+    sql = f'SELECT file_source FROM "{table}" GROUP BY file_source HAVING {having} ORDER BY MIN(doc_ID)'
+    if limit:
+        sql += " LIMIT ?"
+        params = params + [limit]
+    try:
+        with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+            return [row[0] for row in conn.execute(sql, params)]
+    except sqlite3.Error:
+        return []
+
+
+def load_note_blocks(safe_lib: str, sources: list[str]) -> list[dict]:
+    """Every block of the given notes, in document order."""
+    if not sources:
+        return []
+    table = safe_lib.replace('"', '""')
+    placeholders = ", ".join("?" for _ in sources)
     with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
-        sources = [
-            row[0]
-            for row in conn.execute(
-                f'SELECT file_source FROM "{table}" '
-                "WHERE instr(lower(text_block), ?) > 0 OR instr(lower(file_source), ?) > 0 "
-                "GROUP BY file_source ORDER BY MIN(doc_ID) LIMIT ?",
-                (needle, needle, max_documents),
-            )
-        ]
-        if not sources:
-            return []
-        placeholders = ", ".join("?" for _ in sources)
         rows = conn.execute(
             f'SELECT doc_ID, block_ID, file_source, text_block FROM "{table}" '
             f"WHERE file_source IN ({placeholders}) ORDER BY doc_ID, block_ID",
@@ -2352,6 +2733,193 @@ def exact_text_search(safe_lib: str, literal: str, max_documents: int) -> list[d
         {"doc_ID": doc_id, "block_ID": block_id, "file_source": source, "text": text or ""}
         for doc_id, block_id, source, text in rows
     ]
+
+
+def exact_text_search(safe_lib: str, search_filter: dict, max_documents: int) -> list[dict]:
+    """Notes matching the filter terms literally, skipping vectors.
+
+    Returns every block of up to `max_documents` matching notes, in document order.
+    """
+    return load_note_blocks(safe_lib, find_matching_sources(safe_lib, search_filter, max_documents))
+
+
+def exact_text_search_all_libraries(
+    libraries: list[str],
+    search_filter: dict,
+    max_documents: int,
+    corpus_root: Path,
+) -> tuple[list[dict], list[tuple[str, int]]]:
+    """Literal filter search across libraries; no embeddings are used.
+
+    Returns (blocks of up to `max_documents` notes, [(library, matching note count)]),
+    taking notes from the libraries with the most matches first.
+    """
+    counts: list[tuple[str, str, int]] = []
+    for library in libraries:
+        lib_key = resolve_library_registry_name(library)
+        matches = len(find_matching_sources(lib_key, search_filter))
+        if matches:
+            counts.append((library, lib_key, matches))
+    counts.sort(key=lambda item: -item[2])
+
+    results: list[dict] = []
+    remaining = max_documents
+    for library, lib_key, _matches in counts:
+        if remaining <= 0:
+            break
+        blocks = exact_text_search(lib_key, search_filter, remaining)
+        try:
+            uploads_dirs = get_library_uploads_dirs(Library().load_library(lib_key))
+        except Exception:
+            uploads_dirs = ()
+        library_folder = resolve_library_content_path(corpus_root, library)
+        for block in blocks:
+            block.update(
+                _library=library,
+                _safe_lib=lib_key,
+                _library_folder=library_folder,
+                _uploads_dirs=uploads_dirs,
+            )
+        results.extend(blocks)
+        remaining -= len({block["file_source"] for block in blocks})
+
+    return results, [(library, matches) for library, _lib_key, matches in counts]
+
+
+def filtered_semantic_search(
+    q: Query,
+    safe_lib: str,
+    embedding_model: str,
+    prompt_text: str,
+    search_filter: dict,
+    result_limit: int,
+    distance_threshold: float,
+) -> tuple[list, str]:
+    """Vector search restricted to the blocks of notes that match the filter."""
+    import numpy as np
+
+    having, params = build_note_filter_sql(search_filter)
+    table = safe_lib.replace('"', '""')
+    with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+        rowids = [
+            int(row[0])
+            for row in conn.execute(
+                f'SELECT rowid FROM "{table}" WHERE file_source IN '
+                f'(SELECT file_source FROM "{table}" GROUP BY file_source HAVING {having})',
+                params,
+            )
+        ]
+    if not rowids:
+        return [], f"No notes match the filter {describe_search_filter(search_filter)}."
+
+    q.load_embedding_model()
+    query_vector = np.asarray(q.embedding_model.embedding(prompt_text), dtype=float).reshape(-1)
+    vector_table = get_lancedb_connection().open_table(get_collection_name(safe_lib, embedding_model))
+    # LanceDB ids are the SQLite rowids of the blocks, stored as strings.
+    id_list = ", ".join(f"'{rowid}'" for rowid in rowids)
+    hits = (
+        vector_table.search(query_vector.tolist())
+        .where(f"id IN ({id_list})", prefilter=True)
+        .select(["id"])
+        .limit(result_limit)
+        .to_list()
+    )
+    if not hits:
+        return [], "The matching notes have no embeddings yet — run **Rescan** in the left panel."
+
+    distances = {int(hit["id"]): float(hit["_distance"]) for hit in hits}
+    placeholders = ", ".join("?" for _ in distances)
+    with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+        rows = conn.execute(
+            f'SELECT rowid, doc_ID, block_ID, file_source, text_block FROM "{table}" '
+            f"WHERE rowid IN ({placeholders})",
+            list(distances),
+        ).fetchall()
+    results = sorted(
+        (
+            {
+                "doc_ID": doc_id,
+                "block_ID": block_id,
+                "file_source": source,
+                "text": text or "",
+                "distance": distances[rowid],
+            }
+            for rowid, doc_id, block_id, source, text in rows
+        ),
+        key=lambda result: result["distance"],
+    )
+
+    within = [result for result in results if result["distance"] < distance_threshold]
+    if within:
+        return within, ""
+    return results, (
+        f"None of the filtered passages were within the distance threshold ({distance_threshold:.2f}) "
+        "— showing the closest ones from the matching notes."
+    )
+
+
+def perform_search(
+    search_lib: Library,
+    prompt_text: str,
+    search_filter: dict,
+    embedding_model: str,
+    result_limit: int,
+    distance_threshold: float,
+) -> tuple[list, str, float | None]:
+    """Run the search pipeline.
+
+    Returns (result blocks, notice for the user, closest vector distance when no result carries one).
+    """
+    q = Query(
+        search_lib,
+        embedding_model_name=embedding_model,
+        vector_db=VECTOR_DB,
+    )
+
+    if is_filter_active(search_filter):
+        results, notice = filtered_semantic_search(
+            q,
+            search_lib.library_name,
+            embedding_model,
+            prompt_text,
+            search_filter,
+            result_limit,
+            distance_threshold,
+        )
+        return results, notice, None
+
+    results = q.semantic_query(
+        prompt_text,
+        result_count=result_limit,
+        embedding_distance_threshold=distance_threshold,
+    )
+    if results:
+        return results[:result_limit], "", None
+
+    # Re-run without a cutoff to report how close the best vector match was.
+    nearest_distance = None
+    nearest = q.semantic_query(prompt_text, result_count=1, embedding_distance_threshold=1e9)
+    if nearest and nearest[0].get("distance") is not None:
+        nearest_distance = float(nearest[0]["distance"])
+    nearest_hint = describe_nearest_vector_match(nearest_distance, distance_threshold)
+
+    results = safe_text_query(q, prompt_text, result_count=result_limit)
+    if results:
+        return results[:result_limit], (
+            "Vector search had no matches — showing text search results instead." + nearest_hint
+        ), nearest_distance
+    return [], "No matches found." + nearest_hint, nearest_distance
+
+
+def describe_nearest_vector_match(nearest_distance: float | None, distance_threshold: float) -> str:
+    """Explain how far the closest vector match was from the distance threshold."""
+    if nearest_distance is None:
+        return ""
+    return (
+        f" Closest vector match was **{nearest_distance:.3f}** "
+        f"(cutoff {distance_threshold:.2f}). Raise **Distance cutoff** to "
+        f"**{cutoff_to_include(nearest_distance):.2f}** to include it — see the amber band under the slider."
+    )
 
 
 _migrated_tables = migrate_all_legacy_vectors()
@@ -2470,6 +3038,8 @@ else:
 safe_lib = resolve_library_registry_name(selected_lib)
 library_content_path = resolve_library_content_path(corpus_root_path, selected_lib)
 corpus_config = get_corpus_config(safe_lib)
+render_corpus_prompt_controls(safe_lib, corpus_config)
+corpus_config = get_corpus_config(safe_lib)
 
 model_catalog = list(load_embedding_model_catalog())
 model_ids = [model["id"] for model in model_catalog]
@@ -2537,14 +3107,17 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
     if extra_deps_missing:
         render_embedding_dependency_install_help(extra_deps_missing, selected_embedding_model)
 
+    if f"distance_threshold_{safe_lib}" not in st.session_state:
+        st.session_state[f"distance_threshold_{safe_lib}"] = float(corpus_config["distance_threshold"])
     distance_threshold = st.slider(
         "Relevance cutoff (distance)",
-        min_value=0.30,
-        max_value=1.20,
-        value=float(corpus_config["distance_threshold"]),
-        step=0.05,
+        min_value=DISTANCE_SLIDER_MIN,
+        max_value=DISTANCE_SLIDER_MAX,
+        step=DISTANCE_SLIDER_STEP,
         help="Search tuning for this corpus. Lower = stricter matches.",
         key=f"distance_threshold_{safe_lib}",
+        on_change=sync_cutoff_from_sidebar,
+        args=(safe_lib,),
     )
 
     settings_changed = (
@@ -2677,52 +3250,91 @@ st.caption(
     f"{get_embedding_model_summary(selected_embedding_model)}"
 )
 
-filter_col, exact_col = st.columns([4, 1.4], vertical_alignment="bottom")
-with exact_col:
-    exact_text_only = st.checkbox(
-        "Exact text only",
-        value=bool(load_app_settings().get("exact_text_only", False)),
-        key="exact_text_only",
-        on_change=persist_exact_text_only_setting,
-        help=(
-            "Skips vector search and returns notes whose text or file name contains the "
-            "filter **exactly as typed** (case-insensitive), e.g. `2026-10-01`.\n\n"
-            "Much faster than semantic search. **Max results** limits the number of notes, "
-            "and each matching note is returned in full. The question box is optional — "
-            "it is only used for the LLM answer."
-        ),
-    )
-with filter_col:
-    topic_query = st.text_input(
-        "Pre-filter keyword (optional):",
-        help=(
-            "Narrows semantic search to notes that contain **all** of these keywords (text match). "
-            "Leave blank to search the whole corpus.\n\n"
-            "Examples:\n"
-            "• `2025 Christmas` or `2025 + Christmas` — notes containing both **2025** and **Christmas**\n"
-            "• `holiday budget` — notes with both words\n"
-            "• `2025` — notes mentioning 2025 only\n\n"
-            "Your main question below still drives meaning-based ranking; "
-            "this box only limits which notes are considered."
-        ),
-    )
-prompt_text = st.text_area("What would you like to ask?", height=100)
+filter_box_col, ask_box_col = st.columns(2, gap="medium")
 
-search_col, llm_col, limit_col = st.columns([1.2, 2.2, 1.2])
-with limit_col:
-    result_limit = st.number_input("Max results", min_value=1, max_value=50, value=15)
-with llm_col:
-    use_llm_answer = st.checkbox(
-        "Answer with LLM",
-        value=True,
-        help=(
-            "**Semantic search** finds relevant note chunks using embedding vectors. "
-            "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
-            "Search still runs first; the LLM does not replace retrieval."
-        ),
-    )
-with search_col:
-    search_clicked = st.button("🔍 Search", type="primary", use_container_width=True)
+with filter_box_col:
+    with st.container(border=True):
+        st.markdown("**Filter**")
+        _saved_filter = load_app_settings().get("search_filter") or {}
+        FILTER_WIDGETS = {
+            "all": (
+                "Must include (AND)",
+                "Notes must contain **every** one of these terms.",
+            ),
+            "any": (
+                "Any of (OR)",
+                "Notes must contain **at least one** of these terms.",
+            ),
+            "none": (
+                "Exclude (NOT)",
+                "Notes containing **any** of these terms are left out.",
+            ),
+        }
+        for field, (label, field_help) in FILTER_WIDGETS.items():
+            _key = f"filter_{field}"
+            if _key not in st.session_state:
+                st.session_state[_key] = clean_filter_terms(_saved_filter.get(field, []))
+            st.multiselect(
+                label,
+                options=st.session_state[_key],
+                key=_key,
+                accept_new_options=True,
+                on_change=persist_search_filter,
+                placeholder="Type a term, press Enter",
+                help=(
+                    f"{field_help}\n\n"
+                    "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
+                    "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
+                    "With a question, semantic search ranks passages **only within** the matching notes."
+                ),
+            )
+        install_filter_commit_on_blur()
+        search_filter = get_search_filter_from_widgets()
+        if is_filter_active(search_filter):
+            st.caption(f"Filter: {describe_search_filter(search_filter)}")
+
+        with st.container(border=True):
+            st.markdown("**Advanced search settings**")
+            exact_col, all_libs_col, filter_btn_col = st.columns([1, 1, 1.2], vertical_alignment="center")
+            with exact_col:
+                exact_text_only = st.checkbox(
+                    "Exact text only",
+                    value=bool(load_app_settings().get("exact_text_only", False)),
+                    key="exact_text_only",
+                    on_change=persist_exact_text_only_setting,
+                    help=(
+                        "Makes **Search** skip vector search and return the notes that match the filter, "
+                        "in full. Much faster than semantic search. The question is then only used for "
+                        "the LLM answer."
+                    ),
+                )
+            with all_libs_col:
+                search_all_libraries = st.checkbox(
+                    "Search all libraries",
+                    value=bool(load_app_settings().get("search_all_libraries", False)),
+                    key="search_all_libraries",
+                    on_change=persist_search_all_libraries_setting,
+                    disabled=is_single_corpus_mode(),
+                    help=(
+                        "For **Filter search only** and **Exact text only** searches: looks in every visible "
+                        "library and shows how many matching notes each one has, so you can switch to the "
+                        "right library for a semantic search. Uses literal text matching only — no "
+                        "embeddings are needed. Semantic searches always use the selected library."
+                    ),
+                )
+            with filter_btn_col:
+                filter_only_clicked = st.button(
+                    "🔎 Filter search only",
+                    help=(
+                        "Lists the notes that match the filter below this box, without vector search or "
+                        "an LLM answer. Your question is kept but not sent. **Max results** limits the "
+                        "number of notes."
+                    ),
+                    use_container_width=True,
+                )
+
+    # Filter-only results are listed here, under the Filter box.
+    filter_results_slot = st.container()
 
 ollama_ok, installed_ollama_models = discover_ollama_models()
 ollama_model_options = installed_ollama_models if ollama_ok and installed_ollama_models else SUGGESTED_OLLAMA_MODELS
@@ -2730,72 +3342,136 @@ default_ollama = corpus_config.get("ollama_model", DEFAULT_OLLAMA_MODEL)
 if default_ollama not in ollama_model_options:
     ollama_model_options = [default_ollama] + list(ollama_model_options)
 
-if use_llm_answer:
-    llm_cfg_col1, llm_cfg_col2, llm_cfg_col3 = st.columns([2, 1, 1])
-    with llm_cfg_col1:
-        selected_ollama_model = st.selectbox(
-            "Ollama model",
-            options=ollama_model_options,
-            index=ollama_model_options.index(default_ollama),
-            help="Generative model that writes the final answer.",
-        )
-    with llm_cfg_col2:
-        llm_max_tokens = st.slider(
-            "Max tokens",
-            min_value=128,
-            max_value=2048,
-            value=int(corpus_config["llm_max_tokens"]),
-            step=64,
-            help="Maximum length of the generated answer. Higher values allow longer responses but take more time.",
-        )
-    with llm_cfg_col3:
-        llm_temperature = st.slider(
-            "Temperature",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(corpus_config["llm_temperature"]),
-            step=0.05,
-            help="Controls creativity. Lower values (e.g. 0.2) stay closer to your notes; higher values are more varied.",
-        )
-    if not ollama_ok:
-        st.warning(
-            f"Ollama is not reachable at `{OLLAMA_HOST}:{OLLAMA_PORT}`. "
-            "Run `./start_app.sh` or `ollama serve`, then `ollama pull llama3.2:3b`."
-        )
-    elif selected_ollama_model not in installed_ollama_models:
-        st.warning(
-            f"Model `{selected_ollama_model}` is not installed locally. "
-            f"Run `ollama pull {selected_ollama_model}`."
-        )
-else:
-    selected_ollama_model = default_ollama
-    llm_max_tokens = int(corpus_config["llm_max_tokens"])
-    llm_temperature = float(corpus_config["llm_temperature"])
+with ask_box_col:
+    with st.container(border=True):
+        st.markdown("**Ask**")
+        prompt_text = st.text_area("What would you like to ask?", height=100)
 
-if search_clicked:
+        search_col, llm_col, limit_col = st.columns([1.2, 1.6, 1.2], vertical_alignment="bottom")
+        with limit_col:
+            result_limit = st.number_input("Max results", min_value=1, max_value=50, value=15)
+        with llm_col:
+            use_llm_answer = st.checkbox(
+                "Answer with LLM",
+                value=True,
+                help=(
+                    "**Semantic search** finds relevant note chunks using embedding vectors. "
+                    "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
+                    "Search still runs first; the LLM does not replace retrieval."
+                ),
+            )
+        with search_col:
+            search_clicked = st.button("🔍 Search", type="primary", use_container_width=True)
+
+        if use_llm_answer:
+            selected_ollama_model = st.selectbox(
+                "Ollama model",
+                options=ollama_model_options,
+                index=ollama_model_options.index(default_ollama),
+                help="Generative model that writes the final answer.",
+            )
+            tokens_col, temperature_col = st.columns(2)
+            with tokens_col:
+                llm_max_tokens = st.slider(
+                    "Max tokens",
+                    min_value=128,
+                    max_value=2048,
+                    value=int(corpus_config["llm_max_tokens"]),
+                    step=64,
+                    help="Maximum length of the generated answer. Higher values allow longer responses but take more time.",
+                )
+            with temperature_col:
+                llm_temperature = st.slider(
+                    "Temperature",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(corpus_config["llm_temperature"]),
+                    step=0.05,
+                    help="Controls creativity. Lower values (e.g. 0.2) stay closer to your notes; higher values are more varied.",
+                )
+            if not ollama_ok:
+                st.warning(
+                    f"Ollama is not reachable at `{OLLAMA_HOST}:{OLLAMA_PORT}`. "
+                    "Run `./start_app.sh` or `ollama serve`, then `ollama pull llama3.2:3b`."
+                )
+            elif selected_ollama_model not in installed_ollama_models:
+                st.warning(
+                    f"Model `{selected_ollama_model}` is not installed locally. "
+                    f"Run `ollama pull {selected_ollama_model}`."
+                )
+        else:
+            selected_ollama_model = default_ollama
+            llm_max_tokens = int(corpus_config["llm_max_tokens"])
+            llm_temperature = float(corpus_config["llm_temperature"])
+
+        _cutoff_key = f"search_distance_threshold_{safe_lib}"
+        if _cutoff_key not in st.session_state:
+            st.session_state[_cutoff_key] = float(distance_threshold)
+        st.slider(
+            "Distance cutoff",
+            min_value=DISTANCE_SLIDER_MIN,
+            max_value=DISTANCE_SLIDER_MAX,
+            step=DISTANCE_SLIDER_STEP,
+            key=_cutoff_key,
+            on_change=sync_cutoff_from_search,
+            args=(safe_lib,),
+            help=(
+                "Semantic matches must be closer than this distance. Lower = stricter, higher = more lax. "
+                "Same setting as **Relevance cutoff** in the left panel; changes here are saved for this corpus.\n\n"
+                "After a semantic search the bar below shows where passages were found: "
+                "**green** is within the cutoff, **amber** is where to raise it to include more."
+            ),
+        )
+        distance_threshold = float(st.session_state[_cutoff_key])
+        distance_map_slot = st.container()
+
+active_corpus_prompt = get_active_corpus_prompt(corpus_config)
+
+new_search = search_clicked or filter_only_clicked
+run_filter_only = filter_only_clicked or (search_clicked and exact_text_only)
+search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode()
+
+if new_search:
     # A new search replaces the previous results and discussion.
     st.session_state.pop(LAST_SEARCH_KEY, None)
 
-if search_clicked and exact_text_only and not topic_query.strip():
-    st.warning("Enter text in the filter field to use **Exact text only**.")
-elif search_clicked and (prompt_text or exact_text_only):
+if new_search and run_filter_only and not has_positive_filter_terms(search_filter):
+    st.warning("Add at least one **Must include** or **Any of** term to filter notes.")
+elif new_search and (prompt_text or run_filter_only):
+    final_results = None
+    notice = ""
+    nearest_distance = None
+    library_counts: list[tuple[str, int]] = []
+    uploads_dirs: tuple[Path, ...] = ()
+    state_library = safe_lib
     try:
-        search_lib = Library().load_library(safe_lib)
-    except Exception:
-        search_lib = None
+        if search_all_libraries:
+            state_library = ALL_LIBRARIES_KEY
+            with st.spinner("Searching all libraries for exact text…"):
+                final_results, library_counts = exact_text_search_all_libraries(
+                    filter_libraries_for_display(all_libraries),
+                    search_filter,
+                    result_limit,
+                    corpus_root_path,
+                )
+            if not final_results:
+                notice = f"No notes in any library match {describe_search_filter(search_filter)}."
+        else:
+            try:
+                search_lib = Library().load_library(safe_lib)
+            except Exception:
+                search_lib = None
 
-    if not search_lib:
-        st.error("Library not found. Use **Rescan** or **Re-index** in the left panel first.")
-    else:
-        uploads_dirs = get_library_uploads_dirs(search_lib)
-        final_results = None
-        used_text_fallback = False
-        nearest_distance = None
-        try:
-            if exact_text_only:
+            if not search_lib:
+                st.error("Library not found. Use **Rescan** or **Re-index** in the left panel first.")
+            elif run_filter_only:
+                uploads_dirs = get_library_uploads_dirs(search_lib)
                 with st.spinner("Searching for exact text…"):
-                    final_results = exact_text_search(safe_lib, topic_query, result_limit)
+                    final_results = exact_text_search(safe_lib, search_filter, result_limit)
+                if not final_results:
+                    notice = f"No notes match {describe_search_filter(search_filter)}."
             else:
+                uploads_dirs = get_library_uploads_dirs(search_lib)
                 emb_ready, emb_message = is_embedding_ready(search_lib, selected_embedding_model)
                 if not emb_ready:
                     if migrate_legacy_vectors(safe_lib, selected_embedding_model):
@@ -2804,60 +3480,86 @@ elif search_clicked and (prompt_text or exact_text_only):
                     st.error(f"Semantic index not ready: {emb_message}")
                 else:
                     with st.spinner("Searching…"):
-                        final_results, used_text_fallback, nearest_distance = perform_search(
+                        final_results, notice, nearest_distance = perform_search(
                             search_lib,
                             prompt_text,
-                            topic_query,
+                            search_filter,
                             selected_embedding_model,
                             result_limit,
                             distance_threshold,
                         )
 
-            if final_results is not None:
-                search_state = {
-                    "library": safe_lib,
-                    "results": final_results,
-                    "question": prompt_text,
-                    "exact_text_only": exact_text_only,
-                    "topic_query": topic_query.strip(),
-                    "used_text_fallback": used_text_fallback,
-                    "nearest_hint": describe_nearest_vector_match(nearest_distance, distance_threshold),
-                    "uploads_dirs": uploads_dirs,
-                    "model": selected_ollama_model,
-                    "answer": None,
-                    "usage": None,
-                    "answer_error": None,
-                    "discussion": [],
-                }
-                if final_results and use_llm_answer and prompt_text:
-                    with st.spinner(f"Generating answer with `{selected_ollama_model}`…"):
-                        try:
-                            search_state["answer"], search_state["usage"] = answer_with_ollama(
-                                question=prompt_text,
-                                results=final_results,
-                                model_name=selected_ollama_model,
-                                max_tokens=llm_max_tokens,
-                                temperature=llm_temperature,
-                            )
-                        except Exception as llm_exc:
-                            search_state["answer_error"] = str(llm_exc)
-                st.session_state[LAST_SEARCH_KEY] = search_state
+        if final_results is not None:
+            # Corpus prompts describe one library's author role, so skip them across libraries.
+            search_corpus_prompt = "" if search_all_libraries else active_corpus_prompt
+            search_state = {
+                "filter_only": filter_only_clicked,
+                "library": state_library,
+                "results": final_results,
+                "question": "" if filter_only_clicked else prompt_text,
+                "notice": notice,
+                "distances": [
+                    float(result["distance"])
+                    for result in final_results
+                    if result.get("distance") is not None
+                ] or ([nearest_distance] if nearest_distance is not None else []),
+                "library_counts": library_counts,
+                "cutoff": distance_threshold,
+                "uploads_dirs": uploads_dirs,
+                "model": selected_ollama_model,
+                "answer": None,
+                "usage": None,
+                "answer_error": None,
+                "discussion": [],
+            }
+            if final_results and use_llm_answer and search_state["question"]:
+                with st.spinner(f"Generating answer with `{selected_ollama_model}`…"):
+                    try:
+                        search_state["answer"], search_state["usage"] = answer_with_ollama(
+                            question=prompt_text,
+                            results=final_results,
+                            model_name=selected_ollama_model,
+                            max_tokens=llm_max_tokens,
+                            temperature=llm_temperature,
+                            corpus_prompt=search_corpus_prompt,
+                        )
+                        search_state["corpus_prompt_applied"] = bool(search_corpus_prompt)
+                    except Exception as llm_exc:
+                        search_state["answer_error"] = str(llm_exc)
+            st.session_state[LAST_SEARCH_KEY] = search_state
 
-                if final_results and use_llm_answer:
-                    save_corpus_config(
-                        safe_lib,
-                        {
-                            "ollama_model": selected_ollama_model,
-                            "llm_max_tokens": llm_max_tokens,
-                            "llm_temperature": llm_temperature,
-                        },
-                    )
-        except Exception as exc:
-            st.error(f"Search failed: {exc}")
+            if final_results and use_llm_answer and not filter_only_clicked:
+                save_corpus_config(
+                    safe_lib,
+                    {
+                        "ollama_model": selected_ollama_model,
+                        "llm_max_tokens": llm_max_tokens,
+                        "llm_temperature": llm_temperature,
+                    },
+                )
+    except Exception as exc:
+        st.error(f"Search failed: {exc}")
 
 # Results are kept in session state so they survive reruns (follow-ups, downloads, expanders).
 last_search = st.session_state.get(LAST_SEARCH_KEY)
-if last_search and last_search["library"] == safe_lib:
+if last_search and last_search["library"] == safe_lib and last_search.get("distances"):
+    with distance_map_slot:
+        render_distance_map(distance_threshold, last_search["distances"])
+        target = cutoff_to_include(min(last_search["distances"]))
+        if min(last_search["distances"]) >= distance_threshold and target <= DISTANCE_SLIDER_MAX:
+            st.button(
+                f"Set cutoff to {target:.2f}",
+                key="apply_suggested_cutoff",
+                on_click=set_distance_cutoff,
+                args=(safe_lib, target),
+                use_container_width=True,
+            )
+        if abs(last_search.get("cutoff", distance_threshold) - distance_threshold) > 1e-6:
+            st.caption("Cutoff changed — **Search** again to apply it.")
+if last_search and last_search["library"] in (safe_lib, ALL_LIBRARIES_KEY) and last_search.get("filter_only"):
+    with filter_results_slot:
+        render_filter_results(last_search, library_folder, safe_lib)
+elif last_search and last_search["library"] in (safe_lib, ALL_LIBRARIES_KEY):
     render_search_results(
         last_search,
         library_folder,
@@ -2865,4 +3567,6 @@ if last_search and last_search["library"] == safe_lib:
         selected_ollama_model,
         llm_max_tokens,
         llm_temperature,
+        "" if last_search["library"] == ALL_LIBRARIES_KEY else active_corpus_prompt,
+        ollama_model_options,
     )
