@@ -104,6 +104,8 @@ SUGGESTED_OLLAMA_MODELS = [
 LLM_CONTEXT_MAX_CHARS = 12000
 # Follow-up conversations resend the notes plus history, so give Ollama a larger window.
 FOLLOW_UP_NUM_CTX = 8192
+DISCUSSION_HEIGHT = 520
+DISCUSSION_EXPANDED_HEIGHT = 1100
 LAST_SEARCH_KEY = "last_search"
 CORPUS_SETTINGS_PATH = APP_DATA_DIR / "corpus_settings.json"
 JOB_STATUS_PATH = APP_DATA_DIR / "job_status.json"
@@ -763,6 +765,10 @@ def render_distance_map(threshold: float, distances: list[float]) -> None:
         st.caption(f"All {len(distances)} passages are within the cutoff ({nearest:.3f}–{farthest:.3f}).")
 
 
+def persist_question() -> None:
+    save_app_settings({"last_question": str(st.session_state.get("question_text", ""))})
+
+
 def persist_search_all_libraries_setting() -> None:
     save_app_settings({"search_all_libraries": bool(st.session_state.get("search_all_libraries", False))})
 
@@ -775,7 +781,19 @@ def get_search_filter_from_widgets() -> dict:
 
 
 def persist_search_filter() -> None:
-    save_app_settings({"search_filter": get_search_filter_from_widgets()})
+    """Save the filter; once every field is empty there is no filtered set, so exclusions are reset."""
+    current = get_search_filter_from_widgets()
+    if not is_filter_active(current):
+        clear_excluded_notes()
+    save_app_settings({"search_filter": current})
+
+
+def clear_search_filter() -> None:
+    """Clear Filter button: empty every filter field and drop note exclusions."""
+    for field in SEARCH_FILTER_FIELDS:
+        st.session_state[f"filter_{field}"] = []
+    save_app_settings({"search_filter": {field: [] for field in SEARCH_FILTER_FIELDS}})
+    clear_excluded_notes()
 
 
 def switch_to_library(library: str) -> None:
@@ -1569,6 +1587,39 @@ if (!page.__filterCommitOnBlur) {
     )
 
 
+QUESTION_LABEL = "What would you like to ask?"
+
+
+def install_select_question_on_focus() -> None:
+    """Select the whole question when the box is clicked into, so typing replaces it."""
+    components.html(
+        f"""
+<script>
+const page = window.parent;
+if (!page.__selectQuestionOnFocus) {{
+  page.__selectQuestionOnFocus = true;
+  const label = {json.dumps(QUESTION_LABEL)};
+  const isQuestion = (el) => el instanceof page.HTMLTextAreaElement && el.getAttribute("aria-label") === label;
+  page.document.addEventListener("focusin", (event) => {{
+    if (!isQuestion(event.target)) return;
+    event.target.select();
+    // The click that focused the box would otherwise place the caret on mouseup.
+    event.target.__keepSelection = true;
+    setTimeout(() => (event.target.__keepSelection = false), 400);
+  }}, true);
+  page.document.addEventListener("mouseup", (event) => {{
+    if (isQuestion(event.target) && event.target.__keepSelection) {{
+      event.preventDefault();
+      event.target.__keepSelection = false;
+    }}
+  }}, true);
+}}
+</script>
+""",
+        height=0,
+    )
+
+
 def render_follow_up_discussion(
     search_state: dict,
     model_name: str,
@@ -1606,7 +1657,7 @@ def render_follow_up_discussion(
         expanded = st.toggle(
             "Expand",
             key="discussion_expanded",
-            help="Grow the panel to fit the whole conversation instead of scrolling.",
+            help="Make the discussion panel much taller. For very long conversations, use **Pop out**.",
         )
     with popout_col:
         if st.button("⤢ Pop out", use_container_width=True, help="Open the discussion in a large window."):
@@ -1619,7 +1670,8 @@ def render_follow_up_discussion(
         temperature,
         corpus_prompt,
         key_prefix="panel",
-        height="content" if expanded else 520,
+        # A content-sized panel can be shorter than the default box, so expanding uses a fixed taller height.
+        height=DISCUSSION_EXPANDED_HEIGHT if expanded else DISCUSSION_HEIGHT,
     )
 
 
@@ -1738,17 +1790,58 @@ def render_filter_results(search_state: dict, library_folder: Path, safe_lib: st
     for result in results:
         notes.setdefault((result.get("_library", ""), str(result.get("file_source", ""))), []).append(result)
     st.markdown(f"**{len(notes)} matching note(s)**")
-    st.caption("Your question was not sent to the LLM — click **Search** to run the full workflow.")
+    st.caption(
+        "Your question was not sent to the LLM. Tick **🚫** to exclude a note, or click **🎯** to keep "
+        "just that note (and any others you 🎯), then click **Search** to run the full workflow on the rest."
+    )
+    listed = [
+        (blocks[0].get("_safe_lib", safe_lib), file_source)
+        for (_library, file_source), blocks in notes.items()
+    ]
+    # Select-all box: ticked only when every listed note is excluded.
+    st.session_state["exclude_all_notes"] = all(
+        file_source in get_excluded_notes(lib_key) for lib_key, file_source in listed
+    )
+    check_col, target_col, help_col, label_col = st.columns([1, 1, 0.6, 9.4], vertical_alignment="center")
+    with check_col:
+        st.checkbox("🚫", key="exclude_all_notes", on_change=toggle_all_notes_excluded, args=(listed,))
+    target_col.markdown("🎯")
+    help_col.markdown("\u200b", help=NOTE_SELECTION_HELP)
+    label_col.caption("Exclude all")
+    st.markdown('<hr style="margin:0.1rem 0 0.6rem">', unsafe_allow_html=True)
 
     for (library, file_source), blocks in notes.items():
-        label = Path(file_source).name + (f"  ·  {library}" if library else "")
-        with st.expander(label):
-            note_folder = blocks[0].get("_library_folder", library_folder)
-            note_lib = blocks[0].get("_safe_lib", safe_lib)
-            note_uploads = blocks[0].get("_uploads_dirs", search_state["uploads_dirs"])
-            path = resolve_source_path(file_source, note_folder, note_uploads)
-            st.caption(str(path) if path else f"Source: `{file_source}`")
-            render_full_document(file_source, path, note_lib)
+        note_lib = blocks[0].get("_safe_lib", safe_lib)
+        excluded = file_source in get_excluded_notes(note_lib)
+        name = Path(file_source).name
+        label = (f"~~{name}~~ · excluded" if excluded else name) + (f"  ·  {library}" if library else "")
+        check_col, target_col, help_col, note_col = st.columns([1, 1, 0.6, 9.4])
+        with check_col:
+            checkbox_key = exclude_checkbox_key(note_lib, file_source)
+            if checkbox_key not in st.session_state:
+                st.session_state[checkbox_key] = excluded
+            st.checkbox(
+                "🚫",
+                key=checkbox_key,
+                on_change=toggle_excluded_note,
+                args=(note_lib, file_source),
+            )
+        with target_col:
+            st.button(
+                "🎯",
+                key=f"target::{note_lib}::{file_source}",
+                type="tertiary",
+                on_click=target_note,
+                args=(note_lib, file_source, listed),
+            )
+        help_col.markdown("\u200b", help=NOTE_SELECTION_HELP)
+        with note_col:
+            with st.expander(label):
+                note_folder = blocks[0].get("_library_folder", library_folder)
+                note_uploads = blocks[0].get("_uploads_dirs", search_state["uploads_dirs"])
+                path = resolve_source_path(file_source, note_folder, note_uploads)
+                st.caption(str(path) if path else f"Source: `{file_source}`")
+                render_full_document(file_source, path, note_lib)
 
 
 def render_search_results(
@@ -2697,7 +2790,95 @@ def build_note_filter_sql(search_filter: dict) -> tuple[str, list]:
     for term in search_filter.get("none", []):
         clauses.append(f"{term_in_note} = 0")
         params += [term.lower(), term.lower()]
+    excluded = search_filter.get("exclude_sources") or []
+    if excluded:
+        clauses.append(f"file_source NOT IN ({', '.join('?' for _ in excluded)})")
+        params += list(excluded)
     return " AND ".join(clauses), params
+
+
+EXCLUDED_NOTES_KEY = "excluded_notes"
+
+
+def excluded_notes_state() -> dict[str, list[str]]:
+    """{library key: [file_source]} of notes excluded from Search, loaded from settings once per session."""
+    if EXCLUDED_NOTES_KEY not in st.session_state:
+        saved = load_app_settings().get(EXCLUDED_NOTES_KEY) or {}
+        st.session_state[EXCLUDED_NOTES_KEY] = {lib: list(sources) for lib, sources in saved.items() if sources}
+    return st.session_state[EXCLUDED_NOTES_KEY]
+
+
+def get_excluded_notes(lib_key: str) -> list[str]:
+    """Notes the user ticked to exclude from Search in this library."""
+    return sorted(excluded_notes_state().get(lib_key, []))
+
+
+def count_excluded_notes() -> int:
+    return sum(len(sources) for sources in excluded_notes_state().values())
+
+
+def with_exclusions(search_filter: dict, lib_key: str) -> dict:
+    return {**search_filter, "exclude_sources": get_excluded_notes(lib_key)}
+
+
+def exclude_checkbox_key(lib_key: str, file_source: str) -> str:
+    return f"exclude::{lib_key}::{file_source}"
+
+
+TARGET_PICKS_KEY = "target_picks"
+NOTE_SELECTION_HELP = "Check the box to exclude, click the target to select."
+
+
+def persist_excluded_notes() -> None:
+    state = {lib: sources for lib, sources in excluded_notes_state().items() if sources}
+    save_app_settings({EXCLUDED_NOTES_KEY: state})
+
+
+def _set_note_excluded(lib_key: str, file_source: str, excluded: bool) -> None:
+    state = excluded_notes_state()
+    sources = set(state.get(lib_key, []))
+    if excluded:
+        sources.add(file_source)
+    else:
+        sources.discard(file_source)
+    state[lib_key] = sorted(sources)
+    st.session_state[exclude_checkbox_key(lib_key, file_source)] = excluded
+
+
+def toggle_excluded_note(lib_key: str, file_source: str) -> None:
+    _set_note_excluded(lib_key, file_source, bool(st.session_state.get(exclude_checkbox_key(lib_key, file_source))))
+    # A manual change ends any 🎯 run, so the next 🎯 starts afresh.
+    st.session_state.pop(TARGET_PICKS_KEY, None)
+    persist_excluded_notes()
+
+
+def target_note(lib_key: str, file_source: str, notes: list[tuple[str, str]]) -> None:
+    """🎯 shortcut: include this note and exclude every listed note not also picked with 🎯."""
+    picks = st.session_state.setdefault(TARGET_PICKS_KEY, set())
+    picks.add((lib_key, file_source))
+    for lib, source in notes:
+        _set_note_excluded(lib, source, (lib, source) not in picks)
+    persist_excluded_notes()
+
+
+def set_notes_excluded(notes: list[tuple[str, str]], excluded: bool) -> None:
+    """Tick or untick the exclude box for every listed (library key, file) note."""
+    for lib_key, file_source in notes:
+        _set_note_excluded(lib_key, file_source, excluded)
+    st.session_state.pop(TARGET_PICKS_KEY, None)
+    persist_excluded_notes()
+
+
+def toggle_all_notes_excluded(notes: list[tuple[str, str]]) -> None:
+    set_notes_excluded(notes, bool(st.session_state.get("exclude_all_notes")))
+
+
+def clear_excluded_notes() -> None:
+    st.session_state[EXCLUDED_NOTES_KEY] = {}
+    st.session_state.pop(TARGET_PICKS_KEY, None)
+    persist_excluded_notes()
+    for key in [key for key in st.session_state if str(key).startswith("exclude::")]:
+        del st.session_state[key]
 
 
 def find_matching_sources(safe_lib: str, search_filter: dict, limit: int | None = None) -> list[str]:
@@ -2748,16 +2929,19 @@ def exact_text_search_all_libraries(
     search_filter: dict,
     max_documents: int,
     corpus_root: Path,
+    apply_exclusions: bool = False,
 ) -> tuple[list[dict], list[tuple[str, int]]]:
     """Literal filter search across libraries; no embeddings are used.
 
     Returns (blocks of up to `max_documents` notes, [(library, matching note count)]),
-    taking notes from the libraries with the most matches first.
+    taking notes from the libraries with the most matches first. With `apply_exclusions`,
+    notes the user excluded are left out.
     """
     counts: list[tuple[str, str, int]] = []
     for library in libraries:
         lib_key = resolve_library_registry_name(library)
-        matches = len(find_matching_sources(lib_key, search_filter))
+        lib_filter = with_exclusions(search_filter, lib_key) if apply_exclusions else search_filter
+        matches = len(find_matching_sources(lib_key, lib_filter))
         if matches:
             counts.append((library, lib_key, matches))
     counts.sort(key=lambda item: -item[2])
@@ -2767,7 +2951,8 @@ def exact_text_search_all_libraries(
     for library, lib_key, _matches in counts:
         if remaining <= 0:
             break
-        blocks = exact_text_search(lib_key, search_filter, remaining)
+        lib_filter = with_exclusions(search_filter, lib_key) if apply_exclusions else search_filter
+        blocks = exact_text_search(lib_key, lib_filter, remaining)
         try:
             uploads_dirs = get_library_uploads_dirs(Library().load_library(lib_key))
         except Exception:
@@ -2888,11 +3073,16 @@ def perform_search(
         )
         return results, notice, None
 
-    results = q.semantic_query(
+    excluded = set(search_filter.get("exclude_sources") or [])
+
+    def drop_excluded(blocks: list) -> list:
+        return [block for block in blocks or [] if block.get("file_source") not in excluded]
+
+    results = drop_excluded(q.semantic_query(
         prompt_text,
-        result_count=result_limit,
+        result_count=result_limit + len(excluded) * 3,
         embedding_distance_threshold=distance_threshold,
-    )
+    ))
     if results:
         return results[:result_limit], "", None
 
@@ -2903,7 +3093,7 @@ def perform_search(
         nearest_distance = float(nearest[0]["distance"])
     nearest_hint = describe_nearest_vector_match(nearest_distance, distance_threshold)
 
-    results = safe_text_query(q, prompt_text, result_count=result_limit)
+    results = drop_excluded(safe_text_query(q, prompt_text, result_count=result_limit + len(excluded) * 3))
     if results:
         return results[:result_limit], (
             "Vector search had no matches — showing text search results instead." + nearest_hint
@@ -3254,7 +3444,14 @@ filter_box_col, ask_box_col = st.columns(2, gap="medium")
 
 with filter_box_col:
     with st.container(border=True):
-        st.markdown("**Filter**")
+        title_col, clear_filter_col = st.columns([3, 1.2], vertical_alignment="center")
+        title_col.markdown("**Filter**")
+        clear_filter_col.button(
+            "Clear Filter",
+            on_click=clear_search_filter,
+            use_container_width=True,
+            help="Remove all filter terms and note exclusions.",
+        )
         _saved_filter = load_app_settings().get("search_filter") or {}
         FILTER_WIDGETS = {
             "all": (
@@ -3292,6 +3489,10 @@ with filter_box_col:
         search_filter = get_search_filter_from_widgets()
         if is_filter_active(search_filter):
             st.caption(f"Filter: {describe_search_filter(search_filter)}")
+        if count_excluded_notes():
+            excluded_col, clear_col = st.columns([3, 1.4], vertical_alignment="center")
+            excluded_col.caption(f"🚫 {count_excluded_notes()} note(s) excluded from **Search**.")
+            clear_col.button("Clear exclusions", on_click=clear_excluded_notes, use_container_width=True)
 
         with st.container(border=True):
             st.markdown("**Advanced search settings**")
@@ -3345,7 +3546,16 @@ if default_ollama not in ollama_model_options:
 with ask_box_col:
     with st.container(border=True):
         st.markdown("**Ask**")
-        prompt_text = st.text_area("What would you like to ask?", height=100)
+        if "question_text" not in st.session_state:
+            st.session_state["question_text"] = str(load_app_settings().get("last_question", ""))
+        install_select_question_on_focus()
+        prompt_text = st.text_area(
+            QUESTION_LABEL,
+            height=100,
+            key="question_text",
+            on_change=persist_question,
+            help="Saved locally and restored when the page is reloaded.",
+        )
 
         search_col, llm_col, limit_col = st.columns([1.2, 1.6, 1.2], vertical_alignment="bottom")
         with limit_col:
@@ -3428,6 +3638,9 @@ with ask_box_col:
 active_corpus_prompt = get_active_corpus_prompt(corpus_config)
 
 new_search = search_clicked or filter_only_clicked
+if new_search:
+    # Also save on Search, in case the box was not left before clicking.
+    persist_question()
 run_filter_only = filter_only_clicked or (search_clicked and exact_text_only)
 search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode()
 
@@ -3453,6 +3666,7 @@ elif new_search and (prompt_text or run_filter_only):
                     search_filter,
                     result_limit,
                     corpus_root_path,
+                    apply_exclusions=not filter_only_clicked,
                 )
             if not final_results:
                 notice = f"No notes in any library match {describe_search_filter(search_filter)}."
@@ -3467,7 +3681,9 @@ elif new_search and (prompt_text or run_filter_only):
             elif run_filter_only:
                 uploads_dirs = get_library_uploads_dirs(search_lib)
                 with st.spinner("Searching for exact text…"):
-                    final_results = exact_text_search(safe_lib, search_filter, result_limit)
+                    # Filter search only lists excluded notes too, so they can be un-ticked.
+                    run_filter = search_filter if filter_only_clicked else with_exclusions(search_filter, safe_lib)
+                    final_results = exact_text_search(safe_lib, run_filter, result_limit)
                 if not final_results:
                     notice = f"No notes match {describe_search_filter(search_filter)}."
             else:
@@ -3483,7 +3699,7 @@ elif new_search and (prompt_text or run_filter_only):
                         final_results, notice, nearest_distance = perform_search(
                             search_lib,
                             prompt_text,
-                            search_filter,
+                            with_exclusions(search_filter, safe_lib),
                             selected_embedding_model,
                             result_limit,
                             distance_threshold,

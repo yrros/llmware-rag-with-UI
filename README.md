@@ -225,7 +225,7 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
 3. Enter your question in **What would you like to ask?**
 4. Click **Search**.
 
-The search area is split into a **Filter** box (left) and an **Ask** box (right). **🔎 Filter search only** (in the Filter box's *Advanced search settings*) lists the matching notes under the Filter box without vector search or an LLM answer, keeping your question for later; a full **Search** shows the answer, sources and discussion full-width below both boxes.
+The search area is split into a **Filter** box (left) and an **Ask** box (right). **🔎 Filter search only** (in the Filter box's *Advanced search settings*) lists the matching notes under the Filter box without vector search or an LLM answer, keeping your question for later. Tick **🚫** beside a listed note to exclude it from the next **Search** (semantic ranking and LLM answer); excluded notes stay in the filter list, crossed out, and **Clear exclusions** in the Filter box resets them for the session. A full **Search** shows the answer, sources and discussion full-width below both boxes.
 
 **Exact text only** skips vector search and returns the matching notes in full (the question is optional and only used for the LLM answer). Add **Search all libraries** to run that literal search across every visible library: a *Matches by library* panel shows note counts per library, with a **Use library** button to switch to one for a semantic search. No embeddings are used, so nothing needs re-indexing.
 
