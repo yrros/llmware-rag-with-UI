@@ -12,7 +12,7 @@ The system used for this was a M3 Pro with 36GB of RAM.
 
 ## What it does
 
-1. **Ingest** — Scans a corpus folder recursively (including subfolders) and loads files into an LLMWare library.
+1. **Ingest** — Scans a corpus folder recursively (including subfolders) and loads files into an LLMWare library. Rescans pick up new, edited and deleted notes, and can run automatically in the background.
 2. **Embed** — Builds a semantic vector index using a configurable local embedding model.
 3. **Search** — Runs hybrid retrieval: semantic vector search with an optional boolean note filter (AND / OR / NOT) and text-search fallback, or a literal filter-only search across one or all libraries.
 4. **Answer (optional)** — Sends top search results to Ollama to synthesise an answer grounded in your notes.
@@ -222,7 +222,9 @@ On first run — and after `./reset_rag.sh` — the app shows a three-step guide
 1. Set **Notes location** to your Apple Notes export folder (or use **Browse…**).
 2. Select a **library** (corpus) in the left sidebar.
 2. Open **Advanced — Indexing & Embeddings** if you want to change the embedding model or relevance cutoff.
-3. Click **Re-index (full rebuild)** for a new corpus, or **Rescan (incremental)** to add new/changed files.
+3. Click **Re-index (full rebuild)** for a new corpus, or **Rescan (incremental)** to pick up new, edited and deleted notes.
+
+The sidebar groups these under **This corpus**. Below them, **All corpora** has **⚡ Rescan all corpora**, which rescans every visible corpus in turn (see [Rescan vs Re-index](#rescan-vs-re-index)).
 
 Progress appears in the sidebar: a live progress bar during the scan, then a persistent summary (docs, blocks, vectors, model used).
 
@@ -241,6 +243,8 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
 4. Click **Search**.
 
 The search area is split into a **Filter** box (left) and an **Ask** box (right). **🔎 Filter search only** (in the Filter box's *Advanced search settings*) lists the matching notes under the Filter box without vector search or an LLM answer, keeping your question for later. Tick **🚫** beside a listed note to exclude it from the next **Search** (semantic ranking and LLM answer); excluded notes stay in the filter list, crossed out, and **Clear exclusions** in the Filter box resets them for the session. A full **Search** shows the answer, sources and discussion full-width below both boxes.
+
+Below those, a note shows when the text index was last rescanned (for this library, or every visible library when **Search all libraries** is ticked) and whether auto-rescan is on. **🔄 Rescan → Filter search** picks up new, edited and deleted notes first, then runs **Filter search only**. It is text only, so the filter sees the changes straight away; semantic search sees them after **⚡ Rescan**.
 
 **Exact text only** skips vector search and returns the matching notes in full (the question is optional and only used for the LLM answer). Add **Search all libraries** to run that literal search across every visible library: a *Matches by library* panel shows note counts per library, with a **Use library** button to switch to one for a semantic search. No embeddings are used, so nothing needs re-indexing.
 
@@ -286,16 +290,29 @@ Requires Ollama running locally (`localhost:11434`).
 | Setting | Scope | Notes |
 |---------|-------|-------|
 | Also use GPU for embeddings | Global | Uses CUDA when available, or the Apple Silicon GPU (MPS) on Mac. Falls back to CPU if a GPU op fails. |
+| Auto-rescan every 3 min (text only) | Global | While the Streamlit server runs (with or without a browser tab), rescans the selected corpus for new, edited and deleted notes and updates the text index, so filters and literal search find them. Embeddings are not built — semantic search sees the changes after **⚡ Rescan**. Starts on the first page load after the server starts. |
+| …in every corpus | Global | Auto-rescan every visible corpus instead of just the selected one. Hidden corpora are skipped. |
+| Manage corpus visibility | Global | Hides corpora from the library list **and** from every all-corpora scan and rebuild, including auto-rescan. A hidden corpus keeps its index as it was; select it to rescan it on its own. Only applies while **Enable corpus hiding** is ticked. |
 | Embedding engine | Per corpus | Changing model requires **Re-index** after acknowledging the warning. |
 | Relevance cutoff (distance) | Per corpus | Lower = stricter matches. Saved per corpus; no re-embed needed. |
 | Debug details | Per session | Paths, file counts, index health |
 
 ### Rescan vs Re-index
 
-| Action | When to use |
-|--------|-------------|
-| **Rescan (incremental)** | New or updated files; same embedding model |
-| **Re-index (full rebuild)** | First index, corrupted index, or embedding model change |
+| Action | Scope | When to use |
+|--------|-------|-------------|
+| **⚡ Rescan (incremental)** | This corpus | New, edited or deleted notes; same embedding model. Embeds only the new blocks. |
+| **🔨 Re-index (full rebuild)** | This corpus | First index, corrupted index, or embedding model change |
+| **⚡ Rescan all corpora** | All visible corpora | Same as Rescan, for every visible corpus in turn, each on its own embedding engine. Nothing is wiped. |
+| **🔨 Rebuild all corpora** (Advanced) | All visible corpora | Deletes and rebuilds every visible corpus on one embedding engine. |
+| **🔨 Rebuild all corpora — text only** (Advanced) | All visible corpora | As above, but text only: filters work straight away, and each corpus needs **⚡ Rescan** to rebuild its embeddings. Rarely needed. |
+| **Auto-rescan** / **🔄 Rescan → Filter search** | This corpus or all visible corpora | Text only, for literal search and filters. |
+
+Hidden corpora are skipped by every all-corpora action.
+
+**How changes are found.** When LLMWare indexes a note it copies the file into the library's `uploads/` folder. A note whose file is newer than that copy has been edited since: its old blocks and vectors are deleted and only that file is read again. Notes no longer on disk are removed from the index. Unchanged notes are never read, so a rescan with nothing to do takes well under a second. If a corpus folder is missing or empty, nothing is removed.
+
+**Notes with the same file name.** LLMWare identifies a library's files by file name alone. If two notes in one corpus share a name (same title and creation date in different subfolders), only one of them is indexed.
 
 ---
 
@@ -310,7 +327,8 @@ llmware_data/
 ├── model_repo/           # Downloaded embedding models
 ├── corpus_settings.json  # Per-corpus embedding model, cutoff, Ollama prefs
 ├── job_status.json       # Last scan summary per corpus
-├── app_settings.json     # Global settings (GPU toggle)
+├── app_settings.json     # Global settings (GPU toggle, auto-rescan, corpus root…)
+├── text_rescan_status.json  # When each corpus's text index was last rescanned
 └── prompt_library.json   # About me, task and global prompts
 ```
 
@@ -329,17 +347,22 @@ On first run, the app may copy data from the legacy location `~/llmware_data/` i
 - `ollama_model`, `llm_max_tokens`, `llm_temperature` — LLM answer preferences
 - `follow_up_model` — Ollama model used in the Discussion panel (defaults to the answer model)
 - `corpus_prompt`, `corpus_prompt_enabled` — your role as author of this corpus, sent to the LLM ahead of the notes when enabled
+- `hidden` — default `false`; while corpus hiding is enabled, leaves this corpus out of the library list, **Search all libraries** and every all-corpora scan and rebuild
 
 ### Global (`app_settings.json`)
 
 - `corpus_root_path` — top-level folder containing library subfolders
 - `corpus_mode` — `multi` (default) or `single`
 - `use_gpu_for_embeddings` — default `false`; CUDA only on supported hardware
+- `auto_rescan_enabled` — default `false`; text-only rescan every 3 minutes in the background
+- `auto_rescan_all_corpora` — default `false`; auto-rescan every visible corpus instead of just the selected one
+- `hide_corpora_enabled` — default `false`; hide corpora marked `hidden` in `corpus_settings.json` from the library list and all-corpora scans
 
 ### In-app constants (`UI-semantic-search.py`)
 
 - `DEFAULT_EMBEDDING_MODEL` — `mini-lm-sbert`
 - `OLLAMA_HOST` / `OLLAMA_PORT` — default `localhost:11434`
+- `AUTO_RESCAN_SECONDS` — auto-rescan interval, default `180`
 
 ---
 
@@ -361,6 +384,8 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 |---------|--------------|-----|
 | Wrong or missing corpus root | Path not set or folder moved | Set **Notes location** in the sidebar; use **Browse…** |
 | Search returns nothing | Index empty or stale LanceDB path | Run **Re-index**; check Debug details for vector count |
+| A new or edited note isn't found by the filter | Not rescanned yet, or its corpus is hidden | Click **🔄 Rescan → Filter search**, or turn on auto-rescan; unhide the corpus or select it and **⚡ Rescan** |
+| A new or edited note is found by the filter but not by semantic search | Auto-rescan is text only | Click **⚡ Rescan** (or **⚡ Rescan all corpora**) to embed it |
 | Only a few `.md` files indexed | Old LLMWare single-level scan | This app uses recursive ingest—run **Re-index** |
 | Ollama answer fails | Ollama not running or model not pulled | `ollama serve` and `ollama pull llama3.2:3b` |
 | MPS / GPU embedding error | PyTorch MPS op unsupported for a model | Untick **Also use GPU** and re-run the scan on CPU |

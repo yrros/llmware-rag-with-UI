@@ -33,6 +33,7 @@ LEGACY_APP_DATA_DIR = Path.home() / "llmware_data"
 LANCEDB_PATH = APP_DATA_DIR / "lancedb"
 LEGACY_LANCEDB_PATH = Path("/tmp/lancedb")
 EMBEDDING_POLL_SECONDS = 5
+AUTO_RESCAN_SECONDS = 180
 INGEST_EXTENSIONS = {".md", ".txt", ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".json"}
 
 RECOMMENDED_EMBEDDING_MODELS = [
@@ -112,6 +113,7 @@ CORPUS_SETTINGS_PATH = APP_DATA_DIR / "corpus_settings.json"
 JOB_STATUS_PATH = APP_DATA_DIR / "job_status.json"
 APP_SETTINGS_PATH = APP_DATA_DIR / "app_settings.json"
 PROMPT_LIBRARY_PATH = APP_DATA_DIR / "prompt_library.json"
+TEXT_RESCAN_STATUS_PATH = APP_DATA_DIR / "text_rescan_status.json"
 PROMPT_STACK_SIZE = 5
 
 DEFAULT_APP_SETTINGS = {
@@ -119,6 +121,8 @@ DEFAULT_APP_SETTINGS = {
     "hide_corpora_enabled": False,
     "corpus_mode": "multi",
     "last_selected_library": None,
+    "auto_rescan_enabled": False,
+    "auto_rescan_all_corpora": False,
 }
 
 CORPUS_MODE_MULTI = "multi"
@@ -2063,10 +2067,17 @@ def render_corpus_visibility_controls(all_libraries: list[str]) -> None:
             value=bool(load_app_settings().get("hide_corpora_enabled", False)),
             key="hide_corpora_enabled_global",
             on_change=persist_hide_corpora_enabled,
-            help="When enabled, corpora marked hidden below are removed from the library dropdown.",
+            help=(
+                "When enabled, corpora marked hidden below are removed from the library dropdown and "
+                "skipped by all-corpora scans and rebuilds."
+            ),
         )
         if is_hide_corpora_enabled():
-            st.caption("Hidden corpora stay indexed — they are only removed from the selector.")
+            st.caption(
+                "Hidden corpora are removed from the selector and skipped by every all-corpora scan "
+                "and rebuild (including auto-rescan). Their index is kept as it was; select one to "
+                "rescan it on its own."
+            )
             for lib_name in all_libraries:
                 safe_name = sanitize_library_name(lib_name)
                 st.checkbox(
@@ -3078,8 +3089,109 @@ def get_ingest_directories(folder_path: Path) -> list[Path]:
     )
 
 
+def list_ingest_files(folder_path: Path) -> dict[str, tuple[Path, float]]:
+    """Ingestible files under folder_path as {file name: (path, modified time)}.
+
+    LLMWare keys a library's files by bare file name, so when two notes in one corpus share a
+    name only the first in ingest order (shallowest folder first) is indexed.
+    """
+    paths = sorted(
+        (
+            path
+            for path in folder_path.rglob("*")
+            if path.suffix.lower() in INGEST_EXTENSIONS and not should_skip_ingest_path(path)
+        ),
+        key=lambda path: (len(path.parts), str(path)),
+    )
+    files: dict[str, tuple[Path, float]] = {}
+    for path in paths:
+        if path.name in files:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path.is_file():
+            files[path.name] = (path, stat.st_mtime)
+    return files
+
+
+def plan_text_rescan(lib: Library, folder_path: Path) -> dict[str, list]:
+    """Compare folder_path with the library: notes that are new, changed or removed.
+
+    LLMWare copies each file into the library's uploads folder when it indexes it, so the copy's
+    modified time is when the note was indexed. A note whose file is newer has been edited since.
+    Costs two stats per note; no file is read.
+    """
+    indexed: dict[str, float] = {}
+    uploads = Path(lib.file_copy_path)
+    if uploads.is_dir():
+        for copy in uploads.iterdir():
+            if copy.suffix.lower() in INGEST_EXTENSIONS and copy.is_file():
+                indexed[copy.name] = copy.stat().st_mtime
+
+    on_disk = list_ingest_files(folder_path)
+    new = [path for name, (path, _mtime) in on_disk.items() if name not in indexed]
+    changed = [path for name, (path, mtime) in on_disk.items() if name in indexed and mtime > indexed[name]]
+    # An empty or missing folder (unmounted drive, renamed root) must not wipe the index.
+    removed = [name for name in indexed if name not in on_disk] if on_disk else []
+    return {"new": new, "changed": changed, "removed": removed}
+
+
+def delete_block_vectors(safe_lib: str, rowids: list[int]) -> None:
+    """Drop the vectors of deleted blocks — SQLite can hand their row ids to new blocks."""
+    if not rowids:
+        return
+    card = get_fresh_library_card(safe_lib) or {}
+    models = {
+        emb.get("embedding_model")
+        for emb in card.get("embedding") or []
+        if emb.get("embedding_db") == VECTOR_DB and emb.get("embedding_model") not in {None, "", "none"}
+    }
+    for model in models:
+        name = get_collection_name(safe_lib, model)
+        if not (LANCEDB_PATH / f"{name}.lance").is_dir():
+            continue
+        table = get_lancedb_connection().open_table(name)
+        for start in range(0, len(rowids), 500):
+            ids = ", ".join(f"'{rowid}'" for rowid in rowids[start:start + 500])
+            table.delete(f"id IN ({ids})")
+
+
+def remove_indexed_notes(lib: Library, file_names: list[str]) -> None:
+    """Delete notes' blocks, vectors and uploads copies, so they can be re-ingested or dropped."""
+    if not file_names:
+        return
+    safe_lib = lib.library_name
+    table = safe_lib.replace('"', '""')
+    rowids: list[int] = []
+    with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+        for start in range(0, len(file_names), 500):
+            chunk = file_names[start:start + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            rowids += [
+                row[0]
+                for row in conn.execute(f'SELECT rowid FROM "{table}" WHERE file_source IN ({placeholders})', chunk)
+            ]
+            conn.execute(f'DELETE FROM "{table}" WHERE file_source IN ({placeholders})', chunk)
+        # add_files reports what it added from changes in these card counts.
+        blocks, documents = conn.execute(f'SELECT COUNT(*), COUNT(DISTINCT doc_ID) FROM "{table}"').fetchone()
+        conn.execute(
+            "UPDATE library SET blocks = ?, documents = ? WHERE library_name = ?", (blocks, documents, safe_lib)
+        )
+    delete_block_vectors(safe_lib, rowids)
+    uploads = Path(lib.file_copy_path)
+    for name in file_names:
+        (uploads / name).unlink(missing_ok=True)
+
+
 def ingest_all_files(lib: Library, folder_path: Path) -> dict:
-    """Ingest files from all subfolders — LLMWare only scans one directory level at a time."""
+    """Bring the text index in line with folder_path: add new notes, re-ingest edited ones and
+    drop removed ones. Embeddings are not touched; new blocks wait for the next embedding run.
+
+    LLMWare's add_files skips any file name it has seen, so on its own it never picks up edits,
+    and it only scans one directory level at a time.
+    """
     totals = {
         "docs_added": 0,
         "blocks_added": 0,
@@ -3092,7 +3204,15 @@ def ingest_all_files(lib: Library, folder_path: Path) -> dict:
     if load_app_settings().get("corpus_mode") == CORPUS_MODE_SINGLE:
         add_files_kwargs = {"get_images": False, "verbose_level": 0}
 
-    directories = get_ingest_directories(folder_path)
+    plan = plan_text_rescan(lib, folder_path)
+    totals.update(
+        notes_new=len(plan["new"]), notes_changed=len(plan["changed"]), notes_removed=len(plan["removed"])
+    )
+    remove_indexed_notes(lib, [path.name for path in plan["changed"]] + plan["removed"])
+
+    directories = sorted(
+        {path.parent for path in plan["new"] + plan["changed"]}, key=lambda d: (len(d.parts), str(d))
+    )
     for index, directory in enumerate(directories):
         try:
             result = lib.add_files(str(directory), **add_files_kwargs)
@@ -3147,6 +3267,7 @@ def sync_library(lib: Library, folder_path: Path, embedding_model: str) -> dict:
     """Ingest all files recursively, then build embeddings."""
     repair_library_index_state(lib, embedding_model)
     ingest_stats = ingest_all_files(lib, folder_path)
+    record_text_rescan({lib.library_name: ingest_stats}, "manual")
     prepare_embeddings(lib, embedding_model)
     lib.install_new_embedding(
         embedding_model,
@@ -3163,6 +3284,152 @@ def sync_library(lib: Library, folder_path: Path, embedding_model: str) -> dict:
             "switch to a smaller model (e.g. mini-lm-sbert) to confirm the pipeline."
         )
     return ingest_stats
+
+
+def load_text_rescan_status() -> dict:
+    try:
+        return json.loads(TEXT_RESCAN_STATUS_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def record_text_rescan(results: dict[str, dict], trigger: str, errors: list[str] | None = None) -> None:
+    """Save when each library's text index was last brought up to date. Call with the index lock held."""
+    status = load_text_rescan_status()
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    libraries = status.setdefault("libraries", {})
+    totals = {"new": 0, "changed": 0, "removed": 0}
+    for safe_lib, stats in results.items():
+        counts = {key: int(stats.get(f"notes_{key}", 0)) for key in totals}
+        libraries[safe_lib] = {"at": now, "trigger": trigger, **counts}
+        for key, value in counts.items():
+            totals[key] += value
+    status["last_run"] = {"at": now, "trigger": trigger, "libraries": len(results), **totals, "errors": errors or []}
+    tmp_path = TEXT_RESCAN_STATUS_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(status, indent=2))
+    tmp_path.replace(TEXT_RESCAN_STATUS_PATH)
+
+
+def resolve_text_rescan_targets(all_corpora: bool) -> list[tuple[str, str, Path]]:
+    """(display name, library key, folder) to rescan, from saved settings — safe off the script thread."""
+    settings = load_app_settings()
+    corpus_root = load_corpus_root_path()
+    if corpus_root is None or not corpus_root.is_dir():
+        return []
+    if settings.get("corpus_mode") == CORPUS_MODE_SINGLE:
+        return [(SINGLE_CORPUS_DISPLAY_NAME, SINGLE_CORPUS_LIBRARY_NAME, corpus_root)]
+    names = sorted(d.name for d in corpus_root.iterdir() if d.is_dir())
+    if all_corpora:
+        names = filter_libraries_for_display(names)
+    else:
+        names = [name for name in names if name == settings.get("last_selected_library")]
+    return [(name, sanitize_library_name(name), corpus_root / name) for name in names]
+
+
+def run_text_rescan(targets: list[tuple[str, str, Path]], trigger: str) -> dict:
+    """Text-only rescan (no embeddings) of each target. Call with the index lock held."""
+    results: dict[str, dict] = {}
+    errors: list[str] = []
+    for display_name, safe_name, folder in targets:
+        try:
+            lib = load_or_create_library(safe_name)
+            results[safe_name] = ingest_all_files(lib, folder)
+        except Exception as exc:
+            errors.append(f"{display_name}: {format_exception_for_user(exc)}")
+        gc.collect()
+    record_text_rescan(results, trigger, errors)
+    return {"results": results, "errors": errors}
+
+
+class TextRescanScheduler:
+    """Background text rescan every AUTO_RESCAN_SECONDS while the Streamlit server runs.
+
+    `lock` is held by every index write (auto rescans, Rescan, Re-index, rebuilds), so an auto
+    rescan skips its turn while a manual scan runs and a manual scan waits for an auto rescan.
+    """
+
+    def __init__(self):
+        # A cleared resource cache builds a new scheduler; retire the old thread but share its lock.
+        previous = [
+            thread.rescan_scheduler for thread in threading.enumerate() if hasattr(thread, "rescan_scheduler")
+        ]
+        for old in previous:
+            old.stop.set()
+            old.wake.set()
+        self.lock = previous[0].lock if previous else threading.Lock()
+        self.wake = threading.Event()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._loop, name="text-rescan", daemon=True)
+        self.thread.rescan_scheduler = self
+        self.thread.start()
+
+    def _loop(self) -> None:
+        while not self.stop.is_set():
+            self.wake.wait(AUTO_RESCAN_SECONDS)
+            self.wake.clear()
+            settings = load_app_settings()
+            if self.stop.is_set() or not settings.get("auto_rescan_enabled"):
+                continue
+            if not self.lock.acquire(blocking=False):
+                continue
+            try:
+                run_text_rescan(resolve_text_rescan_targets(bool(settings.get("auto_rescan_all_corpora"))), "auto")
+            except Exception as exc:
+                record_text_rescan({}, "auto", [format_exception_for_user(exc)])
+            finally:
+                self.lock.release()
+
+
+@st.cache_resource
+def get_text_rescan_scheduler() -> TextRescanScheduler:
+    return TextRescanScheduler()
+
+
+def persist_auto_rescan_settings() -> None:
+    enabled = bool(st.session_state.get("auto_rescan_enabled", False))
+    save_app_settings(
+        {
+            "auto_rescan_enabled": enabled,
+            "auto_rescan_all_corpora": bool(st.session_state.get("auto_rescan_all_corpora", False)),
+        }
+    )
+    if enabled:
+        get_text_rescan_scheduler().wake.set()
+
+
+def format_rescan_time(iso_time: str) -> str:
+    when = datetime.datetime.fromisoformat(iso_time)
+    if when.date() == datetime.date.today():
+        return when.strftime("%H:%M")
+    return when.strftime("%b %d %H:%M")
+
+
+def describe_last_text_rescan(safe_libs: list[str]) -> str:
+    """One line for the search box: when these libraries' text was last rescanned, and auto-rescan state."""
+    status = load_text_rescan_status()
+    entries = [status.get("libraries", {}).get(key) for key in safe_libs]
+    if not entries or not all(entries):
+        text = "Not rescanned since change tracking was added"
+    elif len(entries) == 1:
+        entry = entries[0]
+        text = (
+            f"Last rescan {format_rescan_time(entry['at'])} ({entry.get('trigger', 'manual')}) · "
+            f"{entry.get('new', 0)} new, {entry.get('changed', 0)} changed, {entry.get('removed', 0)} removed"
+        )
+    else:
+        oldest = min(entry["at"] for entry in entries)
+        text = f"All {len(entries)} libraries rescanned since {format_rescan_time(oldest)}"
+
+    settings = load_app_settings()
+    if settings.get("auto_rescan_enabled"):
+        scope = "all visible corpora" if settings.get("auto_rescan_all_corpora") else "this corpus"
+        text += f" · auto every {AUTO_RESCAN_SECONDS // 60} min ({scope})"
+    else:
+        text += " · auto-rescan off"
+    errors = status.get("last_run", {}).get("errors") or []
+    if errors:
+        text += f" · ⚠️ last run: {errors[0]}"
+    return text
 
 
 def get_collection_name(safe_lib: str, embedding_model: str) -> str:
@@ -3325,10 +3592,12 @@ def run_with_embedding_progress(
     container = container or st.sidebar
     error: list[Exception | None] = [None]
     ingest_stats: list[dict] = [{}]
+    index_lock = get_text_rescan_scheduler().lock
 
     def worker() -> None:
         try:
-            ingest_stats[0] = work_fn() or {}
+            with index_lock:
+                ingest_stats[0] = work_fn() or {}
         except Exception as exc:
             error[0] = exc
 
@@ -3401,9 +3670,12 @@ def run_with_embedding_progress(
 
 
 def run_multi_corpus_rebuild(
-    libraries: list[str], corpus_root: Path, embedding_model: str, container=None
+    libraries: list[str], corpus_root: Path, embedding_model: str, container=None, text_only: bool = False
 ) -> dict:
-    """Full hard rebuild of every sub-corpus, one after another, on a single embedding model."""
+    """Full hard rebuild of every sub-corpus, one after another, on a single embedding model.
+
+    With `text_only`, only the text index is rebuilt; embeddings wait for each corpus's next Rescan.
+    """
     container = container or st.sidebar
     total = len(libraries)
     overall_bar = container.progress(0.0, text=f"Multi-corpus rebuild: 0/{total} complete")
@@ -3420,6 +3692,10 @@ def run_multi_corpus_rebuild(
 
         def _sync_rebuild(name: str = safe_name, path: Path = content_path) -> dict:
             lib = load_or_create_library(name, force_create=True, embedding_model=embedding_model)
+            if text_only:
+                stats = ingest_all_files(lib, path)
+                record_text_rescan({name: stats}, "rebuild")
+                return stats
             return sync_library(lib, path, embedding_model)
 
         try:
@@ -3442,6 +3718,51 @@ def run_multi_corpus_rebuild(
     overall_bar.progress(1.0, text=f"Multi-corpus rebuild: {len(succeeded)}/{total} succeeded")
     return {
         "embedding_model": embedding_model,
+        "text_only": text_only,
+        "completed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "succeeded": succeeded,
+        "failed": failed,
+    }
+
+
+def run_multi_corpus_rescan(libraries: list[str], corpus_root: Path, container=None) -> dict:
+    """Incremental rescan of every sub-corpus, one after another, each on its own embedding engine.
+
+    New and edited notes are (re-)ingested and embedded, removed ones dropped; nothing is wiped.
+    """
+    container = container or st.sidebar
+    total = len(libraries)
+    overall_bar = container.progress(0.0, text=f"Multi-corpus rescan: 0/{total} complete")
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    for index, lib_name in enumerate(libraries, start=1):
+        safe_name = sanitize_library_name(lib_name)
+        content_path = corpus_root / lib_name
+        overall_bar.progress(
+            (index - 1) / total,
+            text=f"Multi-corpus rescan: {index - 1}/{total} complete · now '{lib_name}'",
+        )
+        try:
+            lib = load_or_create_library(safe_name)
+            # Keep the engine the corpus is embedded with, so no corpus needs a full re-embed.
+            embedding_model = get_active_library_embedding(lib) or get_corpus_config(safe_name)["embedding_model"]
+            ensure_embedding_dependencies(embedding_model)
+
+            def _sync(lib: Library = lib, path: Path = content_path, model: str = embedding_model) -> dict:
+                return sync_library(lib, path, model)
+
+            job_status = run_with_embedding_progress(
+                f"Rescanning '{lib_name}' ({index}/{total})", safe_name, embedding_model, _sync, container
+            )
+            commit_job_status(job_status, lib_name, safe_name)
+            succeeded.append(lib_name)
+        except Exception as exc:
+            failed.append((lib_name, format_exception_for_user(exc)))
+
+    overall_bar.progress(1.0, text=f"Multi-corpus rescan: {len(succeeded)}/{total} succeeded")
+    return {
+        "operation": "rescan",
         "completed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "succeeded": succeeded,
         "failed": failed,
@@ -3454,10 +3775,18 @@ def render_multi_corpus_rebuild_summary() -> None:
         return
     succeeded, failed = summary["succeeded"], summary["failed"]
     total = len(succeeded) + len(failed)
-    message = (
-        f"Multi-corpus rebuild on `{summary['embedding_model']}`: "
-        f"{len(succeeded)}/{total} corpora rebuilt · {summary['completed_at']}"
-    )
+    if summary.get("operation") == "rescan":
+        message = (
+            f"Multi-corpus rescan: {len(succeeded)}/{total} corpora rescanned · {summary['completed_at']}"
+        )
+    else:
+        engine = "text only" if summary.get("text_only") else f"`{summary['embedding_model']}`"
+        message = (
+            f"Multi-corpus rebuild on {engine}: "
+            f"{len(succeeded)}/{total} corpora rebuilt · {summary['completed_at']}"
+        )
+    if summary.get("text_only"):
+        message += " — use **⚡ Rescan** in a corpus to rebuild its embeddings"
     if failed:
         st.sidebar.warning(message)
         for lib_name, reason in failed:
@@ -4300,6 +4629,8 @@ _migrated_tables = migrate_all_legacy_vectors()
 # PAGE SETUP
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="RAG Workspace Manager", layout="wide")
+# Starts the background auto-rescan thread once per server process.
+get_text_rescan_scheduler()
 if st.query_params.get("page") == "prompts":
     render_prompt_library_page()
     st.stop()
@@ -4390,6 +4721,8 @@ if not all_libraries:
     else:
         st.sidebar.error(f"No subfolders found in:\n`{corpus_root_path}`")
     st.stop()
+# All-corpora scans and rebuilds skip hidden corpora.
+scan_libraries = filter_libraries_for_display(all_libraries)
 
 if is_single_corpus_mode():
     selected_lib = SINGLE_CORPUS_DISPLAY_NAME
@@ -4455,6 +4788,29 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
         help=(
             "Global setting for all corpus scans. Uses CUDA when available, "
             "or the Apple Silicon GPU (MPS) on Mac. Models marked (g) can use the GPU."
+        ),
+    )
+    auto_rescan_enabled = st.checkbox(
+        f"Auto-rescan every {AUTO_RESCAN_SECONDS // 60} min (text only)",
+        value=bool(_app_settings.get("auto_rescan_enabled", False)),
+        key="auto_rescan_enabled",
+        on_change=persist_auto_rescan_settings,
+        help=(
+            "While the app's server is running (even with no browser tab open), checks the selected "
+            "corpus for new, edited and deleted notes and updates the text index, so filters and "
+            "literal search find them. Only changed notes are read.\n\n"
+            "Embeddings are not built: semantic search sees the changes after **⚡ Rescan**."
+        ),
+    )
+    st.checkbox(
+        "…in every corpus",
+        value=bool(_app_settings.get("auto_rescan_all_corpora", False)),
+        key="auto_rescan_all_corpora",
+        on_change=persist_auto_rescan_settings,
+        disabled=not auto_rescan_enabled or is_single_corpus_mode(),
+        help=(
+            "Rescan every visible sub-corpus, not just the selected one — so a note added to another "
+            "corpus turns up in **Search all libraries**. Hidden corpora are skipped. Still text only."
         ),
     )
     st.caption(f"Global — saved to `{APP_SETTINGS_PATH}`")
@@ -4546,8 +4902,8 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
         st.divider()
         st.markdown("**Multi-corpus clean rebuild**")
         st.caption(
-            f"Full hard rebuild of all {len(all_libraries)} sub-corpora (including hidden ones), "
-            "in order, using one embedding engine."
+            f"Full hard rebuild of the {len(scan_libraries)} visible sub-corpora (hidden ones are "
+            "skipped), in order, using one embedding engine."
         )
         multi_show_all = st.checkbox(
             "Show all local embedding models",
@@ -4569,23 +4925,39 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
         multi_deps_missing = get_missing_embedding_dependencies(multi_rebuild_model)
         if multi_deps_missing:
             render_embedding_dependency_install_help(multi_deps_missing, multi_rebuild_model)
-        st.caption("Order: " + " → ".join(all_libraries))
+        st.caption("Order: " + " → ".join(scan_libraries))
         multi_rebuild_ack = st.checkbox(
-            "I understand this deletes and rebuilds the index for **every** sub-corpus.",
+            "I understand this deletes and rebuilds the index for **every** visible sub-corpus.",
             value=False,
             key="multi_rebuild_ack",
         )
         if st.button(
             "🔨 Rebuild all corpora",
-            disabled=not multi_rebuild_ack or bool(multi_deps_missing),
+            disabled=not multi_rebuild_ack or bool(multi_deps_missing) or not scan_libraries,
             key="multi_rebuild_start",
         ):
             st.session_state["multi_rebuild_request"] = multi_rebuild_model
+        if st.button(
+            "🔨 Rebuild all corpora — text only",
+            disabled=not multi_rebuild_ack or not scan_libraries,
+            key="multi_rebuild_text_only_start",
+            help=(
+                "Deletes every visible sub-corpus's index (hidden ones are skipped), **embeddings included**, and rebuilds only the text, "
+                "so filters and literal search work again straight away. Semantic search in a corpus then "
+                "needs **⚡ Rescan**, which re-embeds every note in it.\n\n"
+                "Rescans (auto or manual) already pick up new, edited and deleted notes, so you rarely "
+                "need this — use it when the text index seems out of step with your notes, for example "
+                "after a scan was interrupted."
+            ),
+        ):
+            st.session_state["multi_rebuild_request"] = multi_rebuild_model
+            st.session_state["multi_rebuild_text_only"] = True
 
 with st.sidebar.expander("Debug details", expanded=False):
     render_debug_panel(selected_lib, safe_lib, _status_lib, corpus_config)
 
 st.sidebar.divider()
+st.sidebar.markdown(f"**This corpus** — {selected_lib}")
 
 pending_model, pending_threshold, reembed_ack = get_pending_index_settings(safe_lib, corpus_config)
 first_index = is_first_index_run(active_model)
@@ -4647,14 +5019,34 @@ if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, 
     except Exception as exc:
         handle_embedding_run_error(exc, pending_model, sidebar=True)
 
+if not is_single_corpus_mode():
+    st.sidebar.markdown("**All corpora**")
+    if st.sidebar.button(
+        "⚡ Rescan all corpora",
+        key="multi_rescan_start",
+        disabled=not scan_libraries,
+        help=(
+            f"Rescans the {len(scan_libraries)} visible sub-corpora (hidden ones are skipped) in turn, like the "
+            "Getting started wizard: new and edited notes are indexed and embedded, deleted notes "
+            "dropped. Each corpus keeps its own embedding engine and nothing is wiped — only changes "
+            "are processed, so after the first run this is quick."
+        ),
+    ):
+        ensure_corpus_root_persisted(corpus_root_path)
+        set_embedding_acceleration(get_use_gpu_for_embeddings())
+        st.session_state["multi_rebuild_summary"] = run_multi_corpus_rescan(scan_libraries, corpus_root_path)
+        st.rerun()
+
 multi_rebuild_request = st.session_state.pop("multi_rebuild_request", None)
+multi_rebuild_text_only = st.session_state.pop("multi_rebuild_text_only", False)
 if multi_rebuild_request and not is_single_corpus_mode():
     try:
-        ensure_embedding_dependencies(multi_rebuild_request)
+        if not multi_rebuild_text_only:
+            ensure_embedding_dependencies(multi_rebuild_request)
         ensure_corpus_root_persisted(corpus_root_path)
         set_embedding_acceleration(get_use_gpu_for_embeddings())
         st.session_state["multi_rebuild_summary"] = run_multi_corpus_rebuild(
-            all_libraries, corpus_root_path, multi_rebuild_request
+            scan_libraries, corpus_root_path, multi_rebuild_request, text_only=multi_rebuild_text_only
         )
         st.session_state.pop("multi_rebuild_ack", None)
         st.rerun()
@@ -4774,6 +5166,39 @@ with filter_box_col:
                     ),
                     use_container_width=True,
                 )
+
+            rescan_all = search_all_libraries and not is_single_corpus_mode()
+            rescan_libraries = scan_libraries if rescan_all else [selected_lib]
+            rescan_note_col, rescan_btn_col = st.columns([2, 1.2], vertical_alignment="center")
+            rescan_note_slot = rescan_note_col.empty()
+            if rescan_btn_col.button(
+                "🔄 Rescan → Filter search",
+                use_container_width=True,
+                help=(
+                    "Picks up new, edited and deleted notes in the text index — of every visible library "
+                    "when **Search all libraries** is ticked, otherwise this one — then runs "
+                    "**Filter search only**. Text only: embeddings wait for **⚡ Rescan** in the left panel."
+                ),
+            ):
+                with st.spinner("Rescanning notes…"):
+                    with get_text_rescan_scheduler().lock:
+                        rescan = run_text_rescan(
+                            [
+                                (
+                                    library,
+                                    resolve_library_registry_name(library),
+                                    resolve_library_content_path(corpus_root_path, library),
+                                )
+                                for library in rescan_libraries
+                            ],
+                            "button",
+                        )
+                for message in rescan["errors"]:
+                    st.warning(f"Rescan failed for {message}")
+                filter_only_clicked = True
+            rescan_note_slot.caption(
+                describe_last_text_rescan([resolve_library_registry_name(lib) for lib in rescan_libraries])
+            )
 
     # Filter-only results are listed here, under the Filter box.
     filter_results_slot = st.container()
