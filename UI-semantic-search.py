@@ -1251,6 +1251,7 @@ DEFAULT_TASK_PROMPTS = (
         ),
         "tags": ["email", "meeting"],
         "starred": True,
+        "output": "email",
     },
     {
         "name": "Action items",
@@ -1260,6 +1261,7 @@ DEFAULT_TASK_PROMPTS = (
         ),
         "tags": ["tasks"],
         "starred": True,
+        "output": "task",
     },
     {
         "name": "Client status update",
@@ -1268,6 +1270,7 @@ DEFAULT_TASK_PROMPTS = (
             "risks or blockers, and the next step. Plain language, no more than 150 words."
         ),
         "tags": ["client", "update"],
+        "output": "note",
     },
     {
         "name": "Key decisions",
@@ -1277,12 +1280,15 @@ DEFAULT_TASK_PROMPTS = (
 )
 
 
-def new_prompt_record(name: str, text: str, *, global_prompt: bool = False, tags=None, starred: bool = False) -> dict:
+def new_prompt_record(
+    name: str, text: str, *, global_prompt: bool = False, tags=None, starred: bool = False, output: str = "text"
+) -> dict:
     return {
         "id": uuid.uuid4().hex[:12],
         "name": name.strip(),
         "text": text.strip(),
         "global": bool(global_prompt),
+        "output": output,
         "tags": clean_filter_terms(tags or []),
         "starred": bool(starred),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1311,7 +1317,11 @@ def load_prompt_library() -> dict:
             "profile": {"text": "", "enabled": True},
             "prompts": [
                 new_prompt_record(
-                    p["name"], p["text"], tags=p.get("tags"), starred=p.get("starred", False)
+                    p["name"],
+                    p["text"],
+                    tags=p.get("tags"),
+                    starred=p.get("starred", False),
+                    output=p.get("output", "text"),
                 )
                 for p in DEFAULT_TASK_PROMPTS
             ],
@@ -1388,6 +1398,168 @@ def build_prompt_context(corpus_prompt: str = "", profile_text: str = "", global
     return "\n\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# HANDOFF — structured drafts written to an outbox for another system to act on
+# ---------------------------------------------------------------------------
+
+OUTPUT_TYPES = {"text": "Text answer", "note": "Note", "task": "Tasks", "email": "Email"}
+HANDOFF_SCHEMA_ID = "llm-notes-handoff/v1"
+HANDOFF_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "handoff.v1.schema.json"
+DEFAULT_OUTBOX_DIR = PROJECT_DIR / "outbox"
+RELATED_KINDS = ["", "opportunity", "account", "contact"]
+TASK_PRIORITIES = ["", "low", "normal", "high"]
+STRUCTURED_OUTPUT_GUIDES = {
+    "note": "Return JSON with a one-paragraph `summary` and `items` holding exactly one note: a short `title` and the note `body`.",
+    "task": (
+        "Return JSON with a one-paragraph `summary` and `items` holding one entry per task: a short `subject`, "
+        "a `description`, `due_date` as YYYY-MM-DD worked out from today's date (or \"\" if the notes give none), "
+        "`priority` (low, normal, high or \"\") and the `owner` named in the notes (or \"\")."
+    ),
+    "email": (
+        "Return JSON with a one-paragraph `summary` and `items` holding exactly one email: `to` (names or "
+        "addresses given in the notes — never invent addresses), `subject` and `body`."
+    ),
+}
+STRUCTURED_RELATED_GUIDE = (
+    "Set `related_to.name` to the client, deal or person the item is about when the notes name one, else \"\". "
+    "Set `related_to.kind` to opportunity, account or contact when that is clear, else \"\". "
+    "Use \"\" for anything the notes don't say; don't guess."
+)
+
+
+def get_prompt_output_type(prompt: dict | None) -> str:
+    output = (prompt or {}).get("output", "text")
+    return output if output in OUTPUT_TYPES else "text"
+
+
+def structured_output_schema(item_type: str) -> dict:
+    """JSON schema passed to Ollama's `format` so the model can only return valid drafts."""
+    related = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "kind": {"enum": RELATED_KINDS}},
+        "required": ["name", "kind"],
+    }
+    fields = {
+        "note": {"title": {"type": "string"}, "body": {"type": "string"}},
+        "task": {
+            "subject": {"type": "string"},
+            "description": {"type": "string"},
+            "due_date": {"type": "string"},
+            "priority": {"enum": TASK_PRIORITIES},
+            "owner": {"type": "string"},
+        },
+        "email": {"to": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}},
+    }[item_type]
+    item = {"type": "object", "properties": {**fields, "related_to": related}, "required": [*fields, "related_to"]}
+    return {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}, "items": {"type": "array", "items": item}},
+        "required": ["summary", "items"],
+    }
+
+
+def normalise_related_to(value) -> dict:
+    value = value if isinstance(value, dict) else {}
+    kind = str(value.get("kind", "")).strip().lower()
+    return {"name": str(value.get("name", "")).strip(), "kind": kind if kind in RELATED_KINDS else ""}
+
+
+def normalise_draft_item(item_type: str, item) -> dict:
+    """Coerce one model-produced item into the handoff schema shape (empty strings for unknowns)."""
+    item = item if isinstance(item, dict) else {}
+    text = lambda key: str(item.get(key, "") or "").strip()  # noqa: E731
+    draft = {"type": item_type}
+    if item_type == "note":
+        draft.update(title=text("title"), body=text("body"))
+    elif item_type == "task":
+        due = text("due_date")
+        priority = text("priority").lower()
+        draft.update(
+            subject=text("subject"),
+            description=text("description"),
+            due_date=due if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due) else "",
+            priority=priority if priority in TASK_PRIORITIES else "",
+            owner=text("owner"),
+        )
+    else:
+        recipients = item.get("to", [])
+        if isinstance(recipients, str):
+            recipients = recipients.split(",")
+        draft.update(
+            to=[str(r).strip() for r in recipients if str(r).strip()],
+            subject=text("subject"),
+            body=text("body"),
+        )
+    draft["related_to"] = normalise_related_to(item.get("related_to"))
+    return draft
+
+
+def draft_items_with_ollama(
+    question: str,
+    results: list,
+    model_name: str,
+    item_type: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+    prompt_context: str,
+    task_prompt: str,
+) -> tuple[str, list[dict], dict]:
+    """Ask the model for structured drafts; returns (summary, items, usage)."""
+    guide = f"{STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
+    full_prompt = build_llm_prompt(
+        question, results, max_tokens, temperature, prompt_context, f"{task_prompt.strip()}\n\n{guide}"
+    )
+    reply, usage = chat_with_ollama(
+        [{"role": "user", "content": full_prompt}],
+        model_name,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        response_format=structured_output_schema(item_type),
+    )
+    try:
+        data = json.loads(reply)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"`{model_name}` didn't return complete JSON — usually it ran out of tokens. "
+            "Raise **Max tokens** and try again."
+        ) from exc
+    items = [normalise_draft_item(item_type, item) for item in data.get("items", []) if isinstance(item, dict)]
+    summary = str(data.get("summary", "")).strip() or f"Drafted {len(items)} {OUTPUT_TYPES[item_type].lower()} item(s)."
+    return summary, items, usage
+
+
+def get_outbox_dir() -> Path:
+    raw = str(load_app_settings().get("outbox_path", "") or "").strip()
+    return Path(raw).expanduser() if raw else DEFAULT_OUTBOX_DIR
+
+
+def persist_outbox_path() -> None:
+    save_app_settings({"outbox_path": str(st.session_state.get("outbox_path_input", "")).strip()})
+
+
+def validate_handoff_package(package: dict) -> None:
+    """Check a package against schemas/handoff.v1.schema.json before it is written."""
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    schema = json.loads(HANDOFF_SCHEMA_PATH.read_text())
+    jsonschema.validate(package, schema)
+
+
+def write_handoff_package(package: dict, outbox: Path) -> Path:
+    """Validate, then write atomically so a connector never reads a half-written file."""
+    validate_handoff_package(package)
+    outbox.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.fromisoformat(package["created"]).strftime("%Y%m%d-%H%M%S")
+    target = outbox / f"{stamp}-{package['item_type']}-{package['id'][:8]}.json"
+    temp = outbox / f".{target.name}.tmp"
+    temp.write_text(json.dumps(package, indent=2, ensure_ascii=False))
+    temp.replace(target)
+    return target
+
+
 PROMPT_LIBRARY_PAGE_URL = "?page=prompts"
 
 
@@ -1411,6 +1583,8 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
         value = clean_filter_terms(value)
     elif field in ("global", "starred"):
         value = bool(value)
+    elif field == "output":
+        value = value if value in OUTPUT_TYPES else "text"
     else:
         value = str(value or "").strip()
         if not value:
@@ -1434,6 +1608,7 @@ def add_prompt_from_form() -> None:
             global_prompt=bool(st.session_state.get("new_prompt_global", False)),
             tags=st.session_state.get("new_prompt_tags", []),
             starred=bool(st.session_state.get("new_prompt_starred", False)),
+            output=st.session_state.get("new_prompt_output", "text"),
         )
     )
     save_prompt_library(library)
@@ -1510,6 +1685,23 @@ def render_prompt_card(prompt: dict) -> None:
                 on_change=save_prompt_field,
                 args=(prompt_id, "starred"),
                 help="Starred prompts fill the Ask panel's Starred row.",
+            )
+            st.selectbox(
+                "Output",
+                options=list(OUTPUT_TYPES),
+                index=list(OUTPUT_TYPES).index(get_prompt_output_type(prompt)),
+                format_func=OUTPUT_TYPES.get,
+                key=f"prompt_output_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "output"),
+                disabled=bool(prompt.get("global")),
+                width=150,
+                label_visibility="collapsed",
+                help=(
+                    "**Text answer** — the LLM writes prose. **Note**, **Tasks** or **Email** — it drafts records "
+                    "you can review and send to the outbox for another system (e.g. Salesforce). "
+                    "Not used for global prompts."
+                ),
             )
             st.multiselect(
                 "Tags",
@@ -1643,6 +1835,15 @@ def render_prompt_library_page() -> None:
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.checkbox("Global", key="new_prompt_global", help="Send with every LLM request in every corpus.")
                 st.checkbox("Starred", key="new_prompt_starred", help="Show it in the Ask panel's Starred row.")
+                st.selectbox(
+                    "Output",
+                    options=list(OUTPUT_TYPES),
+                    format_func=OUTPUT_TYPES.get,
+                    key="new_prompt_output",
+                    width=150,
+                    label_visibility="collapsed",
+                    help="Text answer, or drafts (note, tasks, email) to review and send to the outbox.",
+                )
                 st.multiselect(
                     "Tags",
                     options=[],
@@ -1682,7 +1883,8 @@ def render_injected_prompt_token(library: dict) -> None:
     st.multiselect(
         "Injected prompt",
         options=[task["id"]],
-        format_func=lambda _: f"Prompt: {task['name']}",
+        format_func=lambda _: f"Prompt: {task['name']}"
+        + (f" → {OUTPUT_TYPES[get_prompt_output_type(task)]}" if get_prompt_output_type(task) != "text" else ""),
         key="question_task_token",
         on_change=sync_injected_prompt_token,
         label_visibility="collapsed",
@@ -3625,8 +3827,12 @@ def chat_with_ollama(
     max_tokens: int = 512,
     temperature: float = 0.3,
     num_ctx: int | None = None,
+    response_format: dict | None = None,
 ) -> tuple[str, dict]:
-    """Send a chat conversation to a local Ollama model and return (reply, usage)."""
+    """Send a chat conversation to a local Ollama model and return (reply, usage).
+
+    `response_format` is a JSON schema; Ollama then constrains the reply to match it.
+    """
     import requests
 
     options = {
@@ -3643,6 +3849,8 @@ def chat_with_ollama(
         "stream": False,
         "options": options,
     }
+    if response_format:
+        payload["format"] = response_format
 
     try:
         response = requests.post(url, json=payload, timeout=300)
@@ -4784,22 +4992,45 @@ elif new_search and (prompt_text or run_filter_only):
                 ),
                 "task_prompt": task_prompt["text"] if task_prompt else "",
                 "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt),
+                "library_display": selected_lib if state_library == safe_lib else "All libraries",
+                "drafts": None,
             }
+            draft_type = get_prompt_output_type(task_prompt) if task_prompt else "text"
             # A chosen task can drive the answer on its own, e.g. after an exact-text search.
             if final_results and use_llm_answer and (
                 search_state["question"] or (task_prompt and not filter_only_clicked)
             ):
                 with st.spinner(f"Generating answer with `{selected_ollama_model}`…"):
                     try:
-                        search_state["answer"], search_state["usage"] = answer_with_ollama(
-                            question=search_state["question"],
-                            results=final_results,
-                            model_name=selected_ollama_model,
-                            max_tokens=llm_max_tokens,
-                            temperature=llm_temperature,
-                            corpus_prompt=search_state["prompt_context"],
-                            task_prompt=search_state["task_prompt"],
-                        )
+                        if draft_type != "text":
+                            summary, items, search_state["usage"] = draft_items_with_ollama(
+                                search_state["question"],
+                                final_results,
+                                selected_ollama_model,
+                                draft_type,
+                                max_tokens=llm_max_tokens,
+                                temperature=llm_temperature,
+                                prompt_context=search_state["prompt_context"],
+                                task_prompt=search_state["task_prompt"],
+                            )
+                            search_state["answer"] = summary
+                            search_state["drafts"] = {
+                                "id": uuid.uuid4().hex,
+                                "type": draft_type,
+                                "items": items,
+                                "prompt": {"id": task_prompt["id"], "name": task_prompt["name"]},
+                                "sent": None,
+                            }
+                        else:
+                            search_state["answer"], search_state["usage"] = answer_with_ollama(
+                                question=search_state["question"],
+                                results=final_results,
+                                model_name=selected_ollama_model,
+                                max_tokens=llm_max_tokens,
+                                temperature=llm_temperature,
+                                corpus_prompt=search_state["prompt_context"],
+                                task_prompt=search_state["task_prompt"],
+                            )
                         if task_prompt:
                             mark_prompt_used(task_prompt["id"])
                     except Exception as llm_exc:
