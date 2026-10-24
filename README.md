@@ -252,10 +252,32 @@ Results appear under **Sources** as one dropdown per document (documents with se
 ### Answer with LLM
 
 - **Answer with LLM** is enabled by default.
-- Configure **Ollama model**, **Max tokens** (slider), and **Temperature** below the search bar.
+- Configure **Ollama model**, **Max tokens** (slider), and **Temperature** below the search bar. Max tokens and Temperature are saved per corpus as soon as you move them.
 - **Distance cutoff** sits beside them (same setting as *Relevance cutoff* in the left panel, saved per corpus). After a semantic search, a bar under it shows where passages were found — green is within the cutoff, amber is where to raise it — with a **Set cutoff to …** button to include the closest match.
 - Search runs first; Ollama summarises the retrieved chunks—it does not replace retrieval.
-- **Corpus prompt** (left panel, under the library selector) — describe the role you wrote this corpus in (e.g. business owner, parent, salesperson). Tick **Apply corpus prompt** to send it to the LLM ahead of the notes for answers and follow-ups. Saved per corpus.
+- **Prompt library** (above the model settings) — see [Prompt library](#prompt-library) below.
+
+### Prompt library
+
+Open it from **Prompt Library → Open prompt library** in the left panel, or **Manage** in the Ask panel's Prompt library box. It opens in a new tab (`?page=prompts`) and saves to `llmware_data/prompt_library.json` (the corpus prompt stays in `corpus_settings.json`).
+
+| Section | What it does |
+|---------|--------------|
+| **About me** | One free-text box sent with every LLM request in every corpus — your name, where you're based, accessibility needs, how you like answers. Untick **Include in LLM requests** to switch it off. Today's date is always added. |
+| **Corpus prompt** | Pick a corpus and describe the role you wrote its notes in (e.g. business owner, salesperson). Tick **Apply corpus prompt** to send it for that corpus only. |
+| **Task prompts** | Reusable instructions such as "Write a meeting summary and next steps as an email". Each has a name, text, **Global** and **Starred** checkboxes, tags (for finding prompts) and a delete button. Edits save as you go, with a *Saved* time under the text. Tick **Global** to send a prompt with every request in every corpus, like About me — for standing instructions. Above the list: full-text search, **Clear search**, and **Common keywords** (tags from your most recently used prompts) to filter with one click. |
+| **Add a prompt** | Name, text, **Global**, **Starred** and tags, then **Add prompt**. |
+
+Four example task prompts are added the first time; edit or delete them freely.
+
+**In the Ask panel** (shown when **Answer with LLM** is on), the compact **Prompt library** box sits above the model settings and has:
+
+- **Always** — About me, the corpus prompt and each global prompt, ticked. Untick one to leave it out of this run.
+- **Task** — click a prompt to attach it (click it again, or **✕**, to remove it); your question still decides which notes are found, and the task tells the LLM what to write from them. The task also applies to follow-up questions. With **Exact text only**, a task can produce an answer even without a question.
+- **Recent** — titles of the five task prompts most recently used for an answer, newest first. **Starred** — up to five starred prompts not already in Recent, most recently used first, so favourites fill the gap. Hover a title to see the full prompt.
+- **Find a prompt** — search every task prompt by name or tag.
+
+Each request is sent in this order: today's date → About me → corpus prompt → global prompts → notes and question → task. The answer caption lists the prompts that were used.
 
 Requires Ollama running locally (`localhost:11434`).
 
@@ -288,7 +310,8 @@ llmware_data/
 ├── model_repo/           # Downloaded embedding models
 ├── corpus_settings.json  # Per-corpus embedding model, cutoff, Ollama prefs
 ├── job_status.json       # Last scan summary per corpus
-└── app_settings.json     # Global settings (GPU toggle)
+├── app_settings.json     # Global settings (GPU toggle)
+└── prompt_library.json   # About me, task and global prompts
 ```
 
 This folder is gitignored. To reset it, use `reset_rag.sh` (see [Resetting the environment](#resetting-the-environment)).
@@ -385,12 +408,12 @@ If a scan is interrupted (battery dies, crash, force quit) the index can be left
 ./reset_rag.sh             # list what will be deleted, then ask to confirm
 ./reset_rag.sh --dry-run   # only list what would be deleted
 ./reset_rag.sh --yes       # no confirmation prompt
-./reset_rag.sh --settings  # also delete app_settings.json and corpus_settings.json
+./reset_rag.sh --settings  # also delete app_settings.json, corpus_settings.json and prompt_library.json
 ```
 
 **Deleted** from `llmware_data/`: `accounts/` (SQLite text index and library folders), `lancedb/` (vector tables), `tmp/`, `parser_history/`, `query_history/`, `prompt_history/` and `job_status.json`.
 
-**Kept:** downloaded models (`llmware_data/model_repo/` and `~/.cache/huggingface`), the `venv`, your source notes, and — unless you pass `--settings` — your corpus root, GPU toggle, corpus prompts and per-corpus embedding choices.
+**Kept:** downloaded models (`llmware_data/model_repo/` and `~/.cache/huggingface`), the `venv`, your source notes, and — unless you pass `--settings` — your corpus root, GPU toggle, corpus prompts, prompt library and per-corpus embedding choices.
 
 Notes:
 

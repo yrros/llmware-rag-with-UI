@@ -8,6 +8,7 @@ import sys
 import time
 import threading
 import datetime
+import uuid
 from functools import lru_cache
 import streamlit as st
 import streamlit.components.v1 as components
@@ -110,6 +111,8 @@ LAST_SEARCH_KEY = "last_search"
 CORPUS_SETTINGS_PATH = APP_DATA_DIR / "corpus_settings.json"
 JOB_STATUS_PATH = APP_DATA_DIR / "job_status.json"
 APP_SETTINGS_PATH = APP_DATA_DIR / "app_settings.json"
+PROMPT_LIBRARY_PATH = APP_DATA_DIR / "prompt_library.json"
+PROMPT_STACK_SIZE = 5
 
 DEFAULT_APP_SETTINGS = {
     "use_gpu_for_embeddings": False,
@@ -1191,30 +1194,631 @@ def persist_corpus_prompt(safe_lib: str) -> None:
     )
 
 
-def render_corpus_prompt_controls(safe_lib: str, corpus_config: dict) -> None:
-    """Sidebar editor for the per-corpus author-role prompt."""
-    applied = bool(get_active_corpus_prompt(corpus_config))
-    with st.sidebar.expander("Corpus prompt" + (" · applied" if applied else ""), expanded=False):
+def mark_text_saved(field_key: str) -> None:
+    """Remember when a text box was last saved, for the 'Saved …' note under it."""
+    st.session_state.setdefault("text_saved_at", {})[field_key] = datetime.datetime.now()
+
+
+def render_saved_note(field_key: str) -> None:
+    saved_at = st.session_state.get("text_saved_at", {}).get(field_key)
+    if saved_at:
+        st.caption(f":material/check: Saved {saved_at:%H:%M:%S} on {saved_at:%d %b %Y}")
+
+
+def persist_corpus_prompt_text(safe_lib: str) -> None:
+    persist_corpus_prompt(safe_lib)
+    mark_text_saved(f"corpus_prompt_{safe_lib}")
+
+
+def render_corpus_prompt_editor(safe_lib: str, corpus_config: dict) -> None:
+    """Editor for the per-corpus author-role prompt (shown on the Prompt library page)."""
+    st.checkbox(
+        "Apply corpus prompt",
+        value=bool(corpus_config.get("corpus_prompt_enabled", False)),
+        key=f"corpus_prompt_enabled_{safe_lib}",
+        on_change=persist_corpus_prompt,
+        args=(safe_lib,),
+        help=(
+            "When ticked, this text is sent to the LLM ahead of the notes for every answer "
+            "and follow-up in this corpus. Saved per corpus."
+        ),
+    )
+    st.text_area(
+        "Your role as the author",
+        value=str(corpus_config.get("corpus_prompt", "")),
+        key=f"corpus_prompt_{safe_lib}",
+        on_change=persist_corpus_prompt_text,
+        args=(safe_lib,),
+        height=120,
+        placeholder="e.g. I wrote these notes as the owner of a small consultancy, tracking clients and proposals.",
+        help="Describe who you were when writing these notes. Press Cmd+Enter or click away to save.",
+    )
+    render_saved_note(f"corpus_prompt_{safe_lib}")
+
+
+# ---------------------------------------------------------------------------
+# PROMPT LIBRARY — About me, global prompts and task prompts for the LLM
+# ---------------------------------------------------------------------------
+
+DEFAULT_TASK_PROMPTS = (
+    {
+        "name": "Meeting summary email",
+        "text": (
+            "Write a meeting summary and next steps as an email I can send to the attendees. "
+            "Open with one line on the purpose of the meeting, then the key points as short bullets, "
+            "the decisions made, and the next steps with owners and dates where the notes give them. "
+            "Keep it under 250 words."
+        ),
+        "tags": ["email", "meeting"],
+        "starred": True,
+    },
+    {
+        "name": "Action items",
+        "text": (
+            "List every action item in these notes as a checklist. Give the owner and due date when "
+            "the notes say, and flag anything overdue. Don't invent owners or dates."
+        ),
+        "tags": ["tasks"],
+        "starred": True,
+    },
+    {
+        "name": "Client status update",
+        "text": (
+            "Draft a short status update for this client: where things stand, what changed recently, "
+            "risks or blockers, and the next step. Plain language, no more than 150 words."
+        ),
+        "tags": ["client", "update"],
+    },
+    {
+        "name": "Key decisions",
+        "text": "Summarise the decisions recorded in these notes, with the date and who made each one, oldest first.",
+        "tags": ["summary"],
+    },
+)
+
+
+def new_prompt_record(name: str, text: str, *, global_prompt: bool = False, tags=None, starred: bool = False) -> dict:
+    return {
+        "id": uuid.uuid4().hex[:12],
+        "name": name.strip(),
+        "text": text.strip(),
+        "global": bool(global_prompt),
+        "tags": clean_filter_terms(tags or []),
+        "starred": bool(starred),
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "last_used": None,
+    }
+
+
+def save_prompt_library(library: dict) -> dict:
+    PROMPT_LIBRARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PROMPT_LIBRARY_PATH.write_text(json.dumps(library, indent=2))
+    return library
+
+
+def load_prompt_library() -> dict:
+    """Read the prompt library, seeding example task prompts the first time."""
+    if PROMPT_LIBRARY_PATH.exists():
+        try:
+            library = json.loads(PROMPT_LIBRARY_PATH.read_text())
+        except Exception:
+            library = {}
+        library.setdefault("profile", {"text": "", "enabled": True})
+        library.setdefault("prompts", [])
+        return library
+    return save_prompt_library(
+        {
+            "profile": {"text": "", "enabled": True},
+            "prompts": [
+                new_prompt_record(
+                    p["name"], p["text"], tags=p.get("tags"), starred=p.get("starred", False)
+                )
+                for p in DEFAULT_TASK_PROMPTS
+            ],
+        }
+    )
+
+
+def find_prompt(library: dict, prompt_id: str | None) -> dict | None:
+    return next((p for p in library["prompts"] if p["id"] == prompt_id), None)
+
+
+def update_prompt(prompt_id: str, **fields) -> None:
+    library = load_prompt_library()
+    prompt = find_prompt(library, prompt_id)
+    if prompt:
+        prompt.update(fields)
+        save_prompt_library(library)
+
+
+def delete_prompt(prompt_id: str) -> None:
+    library = load_prompt_library()
+    library["prompts"] = [p for p in library["prompts"] if p["id"] != prompt_id]
+    save_prompt_library(library)
+    if st.session_state.get("active_task_prompt_id") == prompt_id:
+        st.session_state.pop("active_task_prompt_id", None)
+
+
+def mark_prompt_used(prompt_id: str) -> None:
+    update_prompt(prompt_id, last_used=datetime.datetime.now().isoformat(timespec="seconds"))
+
+
+def select_prompt_stacks(library: dict) -> tuple[list[dict], list[dict]]:
+    """Five most recently used task prompts, then the most recently used starred ones not already listed."""
+    task_prompts = [p for p in library["prompts"] if not p.get("global")]
+    recent = sorted(
+        (p for p in task_prompts if p.get("last_used")), key=lambda p: p["last_used"], reverse=True
+    )[:PROMPT_STACK_SIZE]
+    recent_ids = {p["id"] for p in recent}
+    starred = sorted(
+        (p for p in task_prompts if p.get("starred") and p["id"] not in recent_ids),
+        key=lambda p: (p.get("last_used") or "", p.get("created") or ""),
+        reverse=True,
+    )[:PROMPT_STACK_SIZE]
+    return recent, starred
+
+
+def prompt_matches_query(prompt: dict, query: str) -> bool:
+    query = query.strip().lower()
+    if not query:
+        return True
+    haystack = " ".join([prompt.get("name", ""), prompt.get("text", ""), *prompt.get("tags", [])]).lower()
+    return all(word in haystack for word in query.split())
+
+
+def truncate_text(text: str, limit: int = 60) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def build_prompt_context(corpus_prompt: str = "", profile_text: str = "", global_texts=()) -> str:
+    """Preamble sent ahead of the notes: today's date, About me, corpus prompt, global prompts."""
+    parts = [f"Today's date: {datetime.date.today():%A %d %B %Y}."]
+    if profile_text.strip():
+        parts.append(f"About the person asking (the owner of these notes):\n{profile_text.strip()}")
+    if corpus_prompt.strip():
+        parts.append(
+            "Context about the author of these notes:\n"
+            f"{corpus_prompt.strip()}\n"
+            "Use this to interpret the notes and frame your answer."
+        )
+    standing = [text.strip() for text in global_texts if text.strip()]
+    if standing:
+        parts.append("Always follow these instructions:\n" + "\n".join(f"- {text}" for text in standing))
+    return "\n\n".join(parts)
+
+
+PROMPT_LIBRARY_PAGE_URL = "?page=prompts"
+
+
+def save_profile_from_widgets() -> None:
+    library = load_prompt_library()
+    library["profile"] = {
+        "text": str(st.session_state.get("profile_text", "")),
+        "enabled": bool(st.session_state.get("profile_enabled", True)),
+    }
+    save_prompt_library(library)
+
+
+def save_profile_text() -> None:
+    save_profile_from_widgets()
+    mark_text_saved("profile_text")
+
+
+def save_prompt_field(prompt_id: str, field: str) -> None:
+    value = st.session_state.get(f"prompt_{field}_{prompt_id}")
+    if field == "tags":
+        value = clean_filter_terms(value)
+    elif field in ("global", "starred"):
+        value = bool(value)
+    else:
+        value = str(value or "").strip()
+        if not value:
+            return  # keep the old name/text rather than saving an empty prompt
+    update_prompt(prompt_id, **{field: value})
+    if field in ("name", "text"):
+        mark_text_saved(f"prompt_{prompt_id}")
+
+
+def add_prompt_from_form() -> None:
+    name = str(st.session_state.get("new_prompt_name", "")).strip()
+    text = str(st.session_state.get("new_prompt_text", "")).strip()
+    if not name or not text:
+        st.session_state["add_prompt_error"] = "Give the prompt a name and some text."
+        return
+    library = load_prompt_library()
+    library["prompts"].append(
+        new_prompt_record(
+            name,
+            text,
+            global_prompt=bool(st.session_state.get("new_prompt_global", False)),
+            tags=st.session_state.get("new_prompt_tags", []),
+            starred=bool(st.session_state.get("new_prompt_starred", False)),
+        )
+    )
+    save_prompt_library(library)
+    st.session_state["add_prompt_added"] = name
+
+
+def set_prompt_page_query(text: str) -> None:
+    st.session_state["prompt_page_query"] = text
+
+
+def common_prompt_tags(library: dict, limit: int = 8) -> list[str]:
+    """Tags of the most recently used prompts first (then newest prompts), without duplicates."""
+    ordered = sorted(
+        library["prompts"],
+        key=lambda p: (p.get("last_used") or "", p.get("created") or ""),
+        reverse=True,
+    )
+    tags: list[str] = []
+    for prompt in ordered:
+        for tag in prompt.get("tags", []):
+            if tag.lower() not in (t.lower() for t in tags):
+                tags.append(tag)
+    return tags[:limit]
+
+
+def render_prompt_card(prompt: dict) -> None:
+    prompt_id = prompt["id"]
+    with st.container(border=True):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.text_input(
+                "Name",
+                value=prompt["name"],
+                key=f"prompt_name_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "name"),
+                label_visibility="collapsed",
+            )
+            with st.popover(":material/delete:", type="tertiary", help="Delete this prompt"):
+                st.markdown(f"Delete **{prompt['name']}**? This can't be undone.")
+                st.button(
+                    "Delete",
+                    key=f"prompt_delete_{prompt_id}",
+                    type="primary",
+                    icon=":material/delete:",
+                    on_click=delete_prompt,
+                    args=(prompt_id,),
+                )
+        st.text_area(
+            "Prompt",
+            value=prompt["text"],
+            key=f"prompt_text_{prompt_id}",
+            on_change=save_prompt_field,
+            args=(prompt_id, "text"),
+            height=90,
+            label_visibility="collapsed",
+        )
+        render_saved_note(f"prompt_{prompt_id}")
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.checkbox(
+                "Global",
+                value=bool(prompt.get("global")),
+                key=f"prompt_global_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "global"),
+                help=(
+                    "Send this with **every** LLM request in **every** corpus, like About me — for standing "
+                    "instructions. It can still be left out of a single run in the Ask panel."
+                ),
+            )
+            st.checkbox(
+                "Starred",
+                value=bool(prompt.get("starred")),
+                key=f"prompt_starred_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "starred"),
+                help="Starred prompts fill the Ask panel's Starred row.",
+            )
+            st.multiselect(
+                "Tags",
+                options=prompt.get("tags", []),
+                default=prompt.get("tags", []),
+                key=f"prompt_tags_{prompt_id}",
+                accept_new_options=True,
+                on_change=save_prompt_field,
+                args=(prompt_id, "tags"),
+                placeholder="Add a tag, press Enter",
+                label_visibility="collapsed",
+            )
+        if prompt.get("last_used"):
+            st.caption(f"Last used {prompt['last_used'].replace('T', ' ')}")
+
+
+def render_prompt_library_page() -> None:
+    """Prompt library page (opened in its own tab): About me, corpus prompt, task prompts."""
+    library = load_prompt_library()
+    st.title("Prompt library")
+    st.caption(
+        "Shape what the LLM is told when it answers from your notes. Each request is built in this order: "
+        "today's date → About me → corpus prompt → global prompts → your notes and question → the task you pick."
+    )
+
+    profile = library["profile"]
+    profile_on = bool(profile.get("enabled", True) and str(profile.get("text", "")).strip())
+    with st.expander(
+        "About me · " + ("on" if profile_on else "off"),
+        expanded=not str(profile.get("text", "")).strip(),
+        key="prompt_page_about_me_open",
+        icon=":material/person:",
+    ):
+        st.caption(
+            "Sent with every LLM request in every corpus: who you are, where you're based, how you'd like "
+            "answers. Today's date is always added for you."
+        )
         st.checkbox(
-            "Apply corpus prompt",
-            value=bool(corpus_config.get("corpus_prompt_enabled", False)),
-            key=f"corpus_prompt_enabled_{safe_lib}",
-            on_change=persist_corpus_prompt,
-            args=(safe_lib,),
-            help=(
-                "When ticked, this text is sent to the LLM ahead of the notes for every answer "
-                "and follow-up in this corpus. Saved per corpus."
-            ),
+            "Include in LLM requests",
+            value=bool(library["profile"].get("enabled", True)),
+            key="profile_enabled",
+            on_change=save_profile_from_widgets,
+            help="You can also leave it out of a single run from the Ask panel.",
         )
         st.text_area(
-            "Your role as the author",
-            value=str(corpus_config.get("corpus_prompt", "")),
-            key=f"corpus_prompt_{safe_lib}",
-            on_change=persist_corpus_prompt,
-            args=(safe_lib,),
+            "About me",
+            value=str(library["profile"].get("text", "")),
+            key="profile_text",
+            on_change=save_profile_text,
             height=120,
-            placeholder="e.g. I wrote these notes as the owner of a small consultancy, tracking clients and proposals.",
-            help="Describe who you were when writing these notes. Press Cmd+Enter or click away to save.",
+            placeholder=(
+                "e.g. I'm Sam Lee, a solutions architect at Example Ltd, based in London (UK time). "
+                "I use a screen reader, so avoid tables and keep formatting simple."
+            ),
+            label_visibility="collapsed",
+        )
+        render_saved_note("profile_text")
+
+    with st.expander(
+        "Corpus prompt",
+        expanded=False,
+        key="prompt_page_corpus_prompt_open",
+        icon=":material/folder:",
+    ):
+        st.caption("Describes who wrote the notes in one corpus. Only sent for that corpus.")
+        libraries = get_libraries()
+        if not libraries:
+            st.info("Set your notes folder in the main app first.")
+        else:
+            last_library = load_last_selected_library()
+            corpus = st.selectbox(
+                "Corpus",
+                libraries,
+                index=libraries.index(last_library) if last_library in libraries else 0,
+                key="prompt_page_corpus",
+            )
+            safe_corpus = resolve_library_registry_name(corpus)
+            render_corpus_prompt_editor(safe_corpus, get_corpus_config(safe_corpus))
+
+    with st.container(border=True):
+        st.subheader("Task prompts")
+        st.caption(
+            "Pick a task in the Ask panel to tell the LLM what to write from the notes. Tick **Global** to "
+            "send a prompt with every request instead. Tags help you find prompts; tick **Starred** for the ones you use most."
+        )
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            query = st.text_input(
+                "Search prompts",
+                key="prompt_page_query",
+                placeholder="Full-text search of names, prompt text and tags",
+                icon=":material/search:",
+            )
+            st.button(
+                "Clear search",
+                icon=":material/close:",
+                on_click=set_prompt_page_query,
+                args=("",),
+                disabled=not query,
+                key="prompt_page_clear_search",
+            )
+        keywords = common_prompt_tags(library)
+        if keywords:
+            with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
+                st.caption("Common keywords:")
+                for keyword in keywords:
+                    st.button(
+                        keyword,
+                        key=f"prompt_page_keyword_{keyword}",
+                        type="primary" if query.strip().lower() == keyword.lower() else "secondary",
+                        on_click=set_prompt_page_query,
+                        args=(keyword,),
+                    )
+        shown = [p for p in library["prompts"] if prompt_matches_query(p, query)]
+        if query.strip():
+            st.caption(f"{len(shown)} of {len(library['prompts'])} prompts match.")
+        if not shown:
+            st.caption("No prompts match." if library["prompts"] else "No prompts yet — add one below.")
+        for prompt in shown:
+            render_prompt_card(prompt)
+
+    with st.container(border=True):
+        st.subheader("Add a prompt")
+        with st.form("add_prompt_form", clear_on_submit=True, border=False):
+            st.text_input("Name", key="new_prompt_name", placeholder="e.g. Proposal outline")
+            st.text_area(
+                "Prompt",
+                key="new_prompt_text",
+                height=100,
+                placeholder="What should the LLM do with the notes?",
+            )
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.checkbox("Global", key="new_prompt_global", help="Send with every LLM request in every corpus.")
+                st.checkbox("Starred", key="new_prompt_starred", help="Show it in the Ask panel's Starred row.")
+                st.multiselect(
+                    "Tags",
+                    options=[],
+                    key="new_prompt_tags",
+                    accept_new_options=True,
+                    placeholder="Add a tag, press Enter",
+                    label_visibility="collapsed",
+                )
+            st.form_submit_button("Add prompt", type="primary", icon=":material/add:", on_click=add_prompt_from_form)
+        if error := st.session_state.pop("add_prompt_error", None):
+            st.warning(error)
+        if added := st.session_state.pop("add_prompt_added", None):
+            st.success(f"Added **{added}**.")
+
+    install_filter_commit_on_blur()
+
+
+def set_active_task_prompt(prompt_id: str) -> None:
+    st.session_state["active_task_prompt_id"] = prompt_id
+
+
+def clear_active_task_prompt() -> None:
+    st.session_state.pop("active_task_prompt_id", None)
+
+
+def sync_injected_prompt_token() -> None:
+    if not st.session_state.get("question_task_token"):
+        clear_active_task_prompt()
+
+
+def render_injected_prompt_token(library: dict) -> None:
+    """Red token under the question box showing the injected task prompt; its × removes it."""
+    task = find_prompt(library, st.session_state.get("active_task_prompt_id"))
+    if not task or task.get("global"):
+        return
+    st.session_state["question_task_token"] = [task["id"]]
+    st.multiselect(
+        "Injected prompt",
+        options=[task["id"]],
+        format_func=lambda _: f"Prompt: {task['name']}",
+        key="question_task_token",
+        on_change=sync_injected_prompt_token,
+        label_visibility="collapsed",
+        help=f"Injected into the LLM request as the task:\n\n{task['text']}",
+    )
+
+
+def pick_task_prompt_from_finder() -> None:
+    prompt_id = st.session_state.get("task_prompt_finder")
+    if prompt_id:
+        set_active_task_prompt(prompt_id)
+    st.session_state["task_prompt_finder"] = None
+
+
+def resolve_run_prompts(library: dict, corpus_config: dict) -> dict:
+    """What this run sends to the LLM, honouring the per-run 'leave out' ticks in the Ask panel."""
+    profile = library["profile"]
+    profile_text = str(profile.get("text", "")).strip() if profile.get("enabled") else ""
+    corpus_prompt = get_active_corpus_prompt(corpus_config)
+    global_prompts = [p for p in library["prompts"] if p.get("global") and p.get("text", "").strip()]
+    task = find_prompt(library, st.session_state.get("active_task_prompt_id"))
+    if task and task.get("global"):
+        task = None
+    return {
+        "profile": profile_text if st.session_state.get("run_include_profile", True) else "",
+        "corpus": corpus_prompt if st.session_state.get("run_include_corpus", True) else "",
+        "globals": [p for p in global_prompts if st.session_state.get(f"run_include_global_{p['id']}", True)],
+        "task": task,
+    }
+
+
+def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
+    parts = []
+    if run_prompts["profile"]:
+        parts.append("About me")
+    if corpus_prompt:
+        parts.append("corpus prompt")
+    parts.extend(f"Global: {p['name']}" for p in run_prompts["globals"])
+    if run_prompts["task"]:
+        parts.append(f"Task: {run_prompts['task']['name']}")
+    return parts
+
+
+def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
+    """Compact 'Prompt library' box in the Ask panel: always-included prompts, task, recent and starred."""
+    profile = library["profile"]
+    profile_text = str(profile.get("text", "")).strip() if profile.get("enabled") else ""
+    corpus_prompt = get_active_corpus_prompt(corpus_config)
+    global_prompts = [p for p in library["prompts"] if p.get("global") and p.get("text", "").strip()]
+    task_prompts = [p for p in library["prompts"] if not p.get("global")]
+    active = resolve_run_prompts(library, corpus_config)["task"]
+
+    with st.container(border=True, gap="xsmall"):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown("**Prompt library**")
+            st.link_button(
+                "Manage",
+                PROMPT_LIBRARY_PAGE_URL,
+                icon=":material/open_in_new:",
+                type="tertiary",
+                help="Opens the prompt library in a new tab.",
+            )
+
+        if profile_text or corpus_prompt or global_prompts:
+            with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                st.caption("Always:")
+                if profile_text:
+                    st.checkbox("About me", value=True, key="run_include_profile", help=profile_text)
+                if corpus_prompt:
+                    st.checkbox("Corpus prompt", value=True, key="run_include_corpus", help=corpus_prompt)
+                for prompt in global_prompts:
+                    st.checkbox(
+                        prompt["name"], value=True, key=f"run_include_global_{prompt['id']}", help=prompt["text"]
+                    )
+
+        recent, starred = select_prompt_stacks(library)
+        for title, prompts in (("Recent", recent), ("Starred", starred)):
+            if not prompts:
+                continue
+            with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
+                st.caption(f"{title}:")
+                for prompt in prompts:
+                    is_active = bool(active and active["id"] == prompt["id"])
+                    st.button(
+                        truncate_text(prompt["name"], 28),
+                        key=f"use_prompt_{title}_{prompt['id']}",
+                        help=prompt["text"],
+                        type="primary" if is_active else "secondary",
+                        on_click=clear_active_task_prompt if is_active else set_active_task_prompt,
+                        args=() if is_active else (prompt["id"],),
+                    )
+
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            if active:
+                st.markdown(f"**Task:** {active['name']}", help=active["text"], width="content")
+                st.button(
+                    ":material/close:",
+                    type="tertiary",
+                    key="clear_task_prompt",
+                    on_click=clear_active_task_prompt,
+                    help="Remove the task",
+                )
+            if task_prompts:
+                labels = {p["id"]: p["name"] for p in task_prompts}
+                st.selectbox(
+                    "Find a prompt",
+                    options=list(labels),
+                    index=None,
+                    format_func=labels.get,
+                    key="task_prompt_finder",
+                    on_change=pick_task_prompt_from_finder,
+                    placeholder="Find a prompt…" if active else "No task — find a prompt…",
+                    label_visibility="collapsed",
+                )
+            else:
+                st.caption("No task prompts yet — add some with **Manage**.")
+
+
+def render_prompt_library_sidebar(corpus_config: dict) -> None:
+    """Sidebar summary of what is sent to the LLM, with a link to the Prompt library page."""
+    library = load_prompt_library()
+    profile = library["profile"]
+    global_count = sum(1 for p in library["prompts"] if p.get("global"))
+    task_count = len(library["prompts"]) - global_count
+    with st.sidebar.expander("Prompt Library", expanded=False):
+        st.caption(
+            f"About me: **{'on' if profile.get('enabled') and profile.get('text', '').strip() else 'off'}** · "
+            f"Corpus prompt: **{'applied' if get_active_corpus_prompt(corpus_config) else 'off'}**"
+        )
+        st.caption(f"Global prompts: **{global_count}** · Task prompts: **{task_count}**")
+        st.link_button(
+            "Open prompt library",
+            PROMPT_LIBRARY_PAGE_URL,
+            icon=":material/open_in_new:",
+            width="stretch",
+            help="Opens in a new tab.",
         )
 
 
@@ -1490,6 +2094,12 @@ def render_full_document(file_source: str, path: Path | None, safe_lib: str) -> 
             pass
 
 
+def describe_prompt_parts(search_state: dict) -> str:
+    """Caption suffix naming the prompts sent with this search, e.g. " with About me, Task: Action items."."""
+    parts = search_state.get("prompt_parts") or []
+    return f" with {', '.join(parts)}." if parts else "."
+
+
 def follow_up_with_ollama(
     search_state: dict,
     question: str,
@@ -1507,7 +2117,12 @@ def follow_up_with_ollama(
         messages.append({
             "role": "user",
             "content": build_llm_prompt(
-                search_state["question"], search_state["results"], max_tokens, temperature, corpus_prompt
+                search_state["question"],
+                search_state["results"],
+                max_tokens,
+                temperature,
+                corpus_prompt,
+                search_state.get("task_prompt", ""),
             ),
         })
         messages.append({"role": "assistant", "content": search_state["answer"]})
@@ -1520,7 +2135,12 @@ def follow_up_with_ollama(
     if not messages:
         # No answer yet — this turn carries the notes as context.
         user_turn["prompt"] = build_llm_prompt(
-            question, search_state["results"], max_tokens, temperature, corpus_prompt
+            question,
+            search_state["results"],
+            max_tokens,
+            temperature,
+            corpus_prompt,
+            search_state.get("task_prompt", ""),
         )
     messages.append({"role": "user", "content": user_turn.get("prompt", question)})
 
@@ -1532,6 +2152,17 @@ def follow_up_with_ollama(
         num_ctx=FOLLOW_UP_NUM_CTX,
     )
     return {"user": user_turn, "assistant": {"role": "assistant", "content": reply}}
+
+
+def persist_llm_tuning(safe_lib: str) -> None:
+    """Save Max tokens / Temperature as soon as a slider moves, so they survive new sessions."""
+    updates = {}
+    if f"llm_max_tokens_{safe_lib}" in st.session_state:
+        updates["llm_max_tokens"] = int(st.session_state[f"llm_max_tokens_{safe_lib}"])
+    if f"llm_temperature_{safe_lib}" in st.session_state:
+        updates["llm_temperature"] = float(st.session_state[f"llm_temperature_{safe_lib}"])
+    if updates:
+        save_corpus_config(safe_lib, updates)
 
 
 def persist_follow_up_model(safe_lib: str) -> None:
@@ -1574,17 +2205,30 @@ def install_filter_commit_on_blur() -> None:
 
     Streamlit's multiselect discards typed-but-uncommitted text on blur. A capture-phase
     focusout listener on the page sends Enter first, so the term is added instead of lost.
+    Only blurs the user caused (click elsewhere, Tab) commit; a rerun redrawing the page
+    mid-typing would otherwise commit each letter as its own term.
     """
     components.html(
         """
 <script>
 const page = window.parent;
-if (!page.__filterCommitOnBlur) {
-  page.__filterCommitOnBlur = true;
+if (page.__filterCommitOnBlurVersion !== 2) {
+  page.__filterCommitOnBlurVersion = 2;
+  const boxOf = (el) => (el instanceof page.Element ? el.closest('[data-testid="stMultiSelect"]') : null);
+  let userLeftAt = 0;
+  page.document.addEventListener("pointerdown", (event) => {
+    const box = boxOf(page.document.activeElement);
+    if (box && !box.contains(event.target)) userLeftAt = Date.now();
+  }, true);
+  page.document.addEventListener("keydown", (event) => {
+    if (event.key === "Tab" && boxOf(event.target)) userLeftAt = Date.now();
+  }, true);
   page.document.addEventListener("focusout", (event) => {
     const input = event.target;
     if (!(input instanceof page.HTMLInputElement) || !input.value.trim()) return;
-    if (!input.closest('[data-testid="stMultiSelect"]')) return;
+    const box = boxOf(input);
+    if (!box || (event.relatedTarget && box.contains(event.relatedTarget))) return;
+    if (Date.now() - userLeftAt > 500) return;
     const enter = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
     input.dispatchEvent(new page.KeyboardEvent("keydown", enter));
   }, true);
@@ -1658,7 +2302,7 @@ def render_follow_up_discussion(
         ),
     )
     caption = f"Follow-ups are answered from the notes in this search using `{model_name}`"
-    st.caption(caption + (" with the corpus prompt." if corpus_prompt.strip() else "."))
+    st.caption(caption + describe_prompt_parts(search_state))
 
     view_col, popout_col = st.columns(2)
     with view_col:
@@ -1745,7 +2389,7 @@ def show_discussion_dialog(
     corpus_prompt: str,
 ) -> None:
     """Pop-out window for long conversations; closing it refreshes the side panel."""
-    st.caption(f"Using `{model_name}`" + (" with the corpus prompt." if corpus_prompt.strip() else "."))
+    st.caption(f"Using `{model_name}`" + describe_prompt_parts(search_state))
     render_discussion_body(
         search_state,
         model_name,
@@ -1914,7 +2558,7 @@ def render_search_results(
                     f"Model: `{search_state['model']}` · "
                     f"{usage.get('total', '?')} tokens · "
                     f"{processing_time:.1f}s"
-                    + (" · corpus prompt applied" if search_state.get("corpus_prompt_applied") else "")
+                    + "".join(f" · {part}" for part in search_state.get("prompt_parts", []))
                 )
         elif search_state["answer_error"]:
             st.error(f"LLM answer failed: {search_state['answer_error']}")
@@ -2920,10 +3564,12 @@ def build_llm_prompt(
     max_tokens: int = 512,
     temperature: float = 0.3,
     corpus_prompt: str = "",
+    task_prompt: str = "",
 ) -> str:
     """Build the question-plus-notes prompt sent as the first turn of an LLM conversation.
 
-    `corpus_prompt` describes the author's role for this corpus and is placed before the notes.
+    `corpus_prompt` is the preamble from `build_prompt_context` (date, About me, corpus prompt,
+    global prompts) and is placed before the notes; `task_prompt` is the chosen task, placed last.
     """
     from llmware.prompts import PromptCatalog
 
@@ -2931,21 +3577,20 @@ def build_llm_prompt(
     if not context.strip():
         raise ValueError("No searchable text was available to send to the LLM.")
 
+    query = question.strip()
+    if task_prompt.strip():
+        query = (f"{query}\n\n" if query else "") + f"Task: {task_prompt.strip()}"
+
     prompt_dict = PromptCatalog().build_core_prompt(
         prompt_name="default_with_context",
         separator="\n",
-        query=question,
+        query=query,
         context=context,
         inference_dict={"temperature": temperature, "max_tokens": max_tokens},
     )
     core_prompt = prompt_dict["core_prompt"]
     if corpus_prompt.strip():
-        core_prompt = (
-            "Context about the author of these notes:\n"
-            f"{corpus_prompt.strip()}\n"
-            "Use this to interpret the notes and frame your answer.\n\n"
-            + core_prompt
-        )
+        core_prompt = f"{corpus_prompt.strip()}\n\n{core_prompt}"
     return core_prompt
 
 
@@ -2958,9 +3603,10 @@ def answer_with_ollama(
     max_tokens: int = 512,
     temperature: float = 0.3,
     corpus_prompt: str = "",
+    task_prompt: str = "",
 ) -> tuple[str, dict]:
     """Generate a natural-language answer from search results using a local Ollama model."""
-    full_prompt = build_llm_prompt(question, results, max_tokens, temperature, corpus_prompt)
+    full_prompt = build_llm_prompt(question, results, max_tokens, temperature, corpus_prompt, task_prompt)
     return chat_with_ollama(
         [{"role": "user", "content": full_prompt}],
         model_name,
@@ -3446,6 +4092,10 @@ _migrated_tables = migrate_all_legacy_vectors()
 # PAGE SETUP
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="RAG Workspace Manager", layout="wide")
+if st.query_params.get("page") == "prompts":
+    render_prompt_library_page()
+    st.stop()
+
 st.title("🧠 RAG Workspace Manager")
 
 if should_show_setup_wizard():
@@ -3560,8 +4210,7 @@ else:
 safe_lib = resolve_library_registry_name(selected_lib)
 library_content_path = resolve_library_content_path(corpus_root_path, selected_lib)
 corpus_config = get_corpus_config(safe_lib)
-render_corpus_prompt_controls(safe_lib, corpus_config)
-corpus_config = get_corpus_config(safe_lib)
+render_prompt_library_sidebar(corpus_config)
 
 model_catalog = list(load_embedding_model_catalog())
 model_ids = [model["id"] for model in model_catalog]
@@ -3927,6 +4576,8 @@ default_ollama = corpus_config.get("ollama_model", DEFAULT_OLLAMA_MODEL)
 if default_ollama not in ollama_model_options:
     ollama_model_options = [default_ollama] + list(ollama_model_options)
 
+prompt_library = load_prompt_library()
+
 with ask_box_col:
     with st.container(border=True):
         st.markdown("**Ask**")
@@ -3940,6 +4591,7 @@ with ask_box_col:
             on_change=persist_question,
             help="Saved locally and restored when the page is reloaded.",
         )
+        render_injected_prompt_token(prompt_library)
 
         search_col, llm_col, limit_col = st.columns([1.2, 1.6, 1.2], vertical_alignment="bottom")
         with limit_col:
@@ -3958,6 +4610,7 @@ with ask_box_col:
             search_clicked = st.button("🔍 Search", type="primary", use_container_width=True)
 
         if use_llm_answer:
+            render_ask_prompt_panel(prompt_library, corpus_config)
             selected_ollama_model = st.selectbox(
                 "Ollama model",
                 options=ollama_model_options,
@@ -3972,7 +4625,13 @@ with ask_box_col:
                     max_value=2048,
                     value=int(corpus_config["llm_max_tokens"]),
                     step=64,
-                    help="Maximum length of the generated answer. Higher values allow longer responses but take more time.",
+                    key=f"llm_max_tokens_{safe_lib}",
+                    on_change=persist_llm_tuning,
+                    args=(safe_lib,),
+                    help=(
+                        "Maximum length of the generated answer. Higher values allow longer responses but "
+                        "take more time. Saved for this corpus."
+                    ),
                 )
             with temperature_col:
                 llm_temperature = st.slider(
@@ -3981,7 +4640,13 @@ with ask_box_col:
                     max_value=1.0,
                     value=float(corpus_config["llm_temperature"]),
                     step=0.05,
-                    help="Controls creativity. Lower values (e.g. 0.2) stay closer to your notes; higher values are more varied.",
+                    key=f"llm_temperature_{safe_lib}",
+                    on_change=persist_llm_tuning,
+                    args=(safe_lib,),
+                    help=(
+                        "Controls creativity. Lower values (e.g. 0.2) stay closer to your notes; higher values "
+                        "are more varied. Saved for this corpus."
+                    ),
                 )
             if not ollama_ok:
                 st.warning(
@@ -4019,7 +4684,7 @@ with ask_box_col:
         distance_threshold = float(st.session_state[_cutoff_key])
         distance_map_slot = st.container()
 
-active_corpus_prompt = get_active_corpus_prompt(corpus_config)
+run_prompts = resolve_run_prompts(prompt_library, corpus_config)
 
 new_search = search_clicked or filter_only_clicked
 if new_search:
@@ -4091,7 +4756,8 @@ elif new_search and (prompt_text or run_filter_only):
 
         if final_results is not None:
             # Corpus prompts describe one library's author role, so skip them across libraries.
-            search_corpus_prompt = "" if search_all_libraries else active_corpus_prompt
+            search_corpus_prompt = "" if search_all_libraries else run_prompts["corpus"]
+            task_prompt = run_prompts["task"]
             search_state = {
                 "filter_only": filter_only_clicked,
                 "library": state_library,
@@ -4111,19 +4777,31 @@ elif new_search and (prompt_text or run_filter_only):
                 "usage": None,
                 "answer_error": None,
                 "discussion": [],
+                "prompt_context": build_prompt_context(
+                    search_corpus_prompt,
+                    run_prompts["profile"],
+                    [p["text"] for p in run_prompts["globals"]],
+                ),
+                "task_prompt": task_prompt["text"] if task_prompt else "",
+                "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt),
             }
-            if final_results and use_llm_answer and search_state["question"]:
+            # A chosen task can drive the answer on its own, e.g. after an exact-text search.
+            if final_results and use_llm_answer and (
+                search_state["question"] or (task_prompt and not filter_only_clicked)
+            ):
                 with st.spinner(f"Generating answer with `{selected_ollama_model}`…"):
                     try:
                         search_state["answer"], search_state["usage"] = answer_with_ollama(
-                            question=prompt_text,
+                            question=search_state["question"],
                             results=final_results,
                             model_name=selected_ollama_model,
                             max_tokens=llm_max_tokens,
                             temperature=llm_temperature,
-                            corpus_prompt=search_corpus_prompt,
+                            corpus_prompt=search_state["prompt_context"],
+                            task_prompt=search_state["task_prompt"],
                         )
-                        search_state["corpus_prompt_applied"] = bool(search_corpus_prompt)
+                        if task_prompt:
+                            mark_prompt_used(task_prompt["id"])
                     except Exception as llm_exc:
                         search_state["answer_error"] = str(llm_exc)
             st.session_state[LAST_SEARCH_KEY] = search_state
@@ -4167,6 +4845,6 @@ elif last_search and last_search["library"] in (safe_lib, ALL_LIBRARIES_KEY):
         selected_ollama_model,
         llm_max_tokens,
         llm_temperature,
-        "" if last_search["library"] == ALL_LIBRARIES_KEY else active_corpus_prompt,
+        last_search.get("prompt_context", ""),
         ollama_model_options,
     )

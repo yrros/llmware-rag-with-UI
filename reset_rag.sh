@@ -7,7 +7,8 @@ set -euo pipefail
 #
 # Usage: ./reset_rag.sh [--yes] [--settings] [--dry-run]
 #   --yes       don't ask for confirmation
-#   --settings  also delete app_settings.json and corpus_settings.json (corpus root, prompts, per-corpus models)
+#   --settings  also delete app_settings.json, corpus_settings.json and prompt_library.json
+#               (corpus root, corpus prompts, prompt library, per-corpus models)
 #   --dry-run   only list what would be deleted
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -22,7 +23,7 @@ for arg in "$@"; do
         --yes|-y) ASSUME_YES=1 ;;
         --settings) RESET_SETTINGS=1 ;;
         --dry-run) DRY_RUN=1 ;;
-        -h|--help) sed -n '4,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '4,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $arg (see --help)"; exit 1 ;;
     esac
 done
@@ -42,7 +43,7 @@ TARGETS=(
     "job_status.json"   # last scan results shown in the sidebar
 )
 if [ "$RESET_SETTINGS" -eq 1 ]; then
-    TARGETS+=("app_settings.json" "corpus_settings.json")
+    TARGETS+=("app_settings.json" "corpus_settings.json" "prompt_library.json")
 fi
 
 EXISTING=()
@@ -64,7 +65,7 @@ for target in "${EXISTING[@]}"; do
 done
 echo "Kept: model_repo/, ~/.cache/huggingface, venv/"
 if [ "$RESET_SETTINGS" -eq 0 ]; then
-    echo "Kept: app_settings.json, corpus_settings.json (use --settings to delete them too)"
+    echo "Kept: app_settings.json, corpus_settings.json, prompt_library.json (use --settings to delete them too)"
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
