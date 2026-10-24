@@ -10,6 +10,7 @@ pillow>=12.3
 safetensors>=0.4
 tokenizers>=0.15
 pydub>=0.25
+jsonschema>=4.20
 audioop-lts>=0.2.2; python_version >= "3.13"
 
 # Security minimums for transitive dependencies (known vulnerabilities in older releases)

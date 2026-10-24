@@ -1410,6 +1410,7 @@ OUTPUT_TYPES = {"text": "Text answer", "note": "Note", "task": "Tasks", "email":
 HANDOFF_SCHEMA_ID = "llm-notes-handoff/v1"
 HANDOFF_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "handoff.v1.schema.json"
 DEFAULT_OUTBOX_DIR = PROJECT_DIR / "outbox"
+HANDOFF_RESULT_DIRS = ("processed", "failed")  # where connectors move packages, with a receipt beside each
 RELATED_KINDS = ["", "opportunity", "account", "contact"]
 TASK_PRIORITIES = ["", "low", "normal", "high"]
 STRUCTURED_OUTPUT_GUIDES = {
@@ -1544,10 +1545,8 @@ def persist_outbox_path() -> None:
 
 def validate_handoff_package(package: dict) -> None:
     """Check a package against schemas/handoff.v1.schema.json before it is written."""
-    try:
-        import jsonschema
-    except ImportError:
-        return
+    import jsonschema
+
     schema = json.loads(HANDOFF_SCHEMA_PATH.read_text())
     jsonschema.validate(package, schema)
 
@@ -1562,6 +1561,92 @@ def write_handoff_package(package: dict, outbox: Path) -> Path:
     temp.write_text(json.dumps(package, indent=2, ensure_ascii=False))
     temp.replace(target)
     return target
+
+
+def build_handoff_package(search_state: dict, items: list[dict], source_notes: list[tuple[str, Path | None]]) -> dict:
+    drafts = search_state["drafts"]
+    return {
+        "schema": HANDOFF_SCHEMA_ID,
+        "id": drafts["id"],
+        "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "item_type": drafts["type"],
+        "source": {
+            "library": search_state.get("library_display") or search_state["library"],
+            "library_key": search_state["library"],
+            "question": search_state["question"],
+            "prompt": drafts["prompt"],
+            "model": search_state["model"],
+            "notes": [{"file": file, **({"path": str(path)} if path else {})} for file, path in source_notes],
+        },
+        "items": items,
+    }
+
+
+def read_handoff_receipt(package_file: Path) -> dict | None:
+    """The receipt a connector left beside the package in processed/ or failed/, if there is one yet."""
+    for folder in HANDOFF_RESULT_DIRS:
+        receipt = package_file.parent / folder / f"{package_file.stem}.receipt.json"
+        if receipt.is_file():
+            try:
+                return json.loads(receipt.read_text())
+            except ValueError:
+                return None
+    return None
+
+
+def draft_key(drafts: dict, index: int, field: str) -> str:
+    return f"draft_{drafts['id']}_{index}_{field}"
+
+
+def collect_draft_items(drafts: dict) -> tuple[list[dict], list[int], list[str]]:
+    """Read the edited drafts from their widgets; returns (items, original indexes, problems)."""
+    items, indexes, problems = [], [], []
+    for index, item in enumerate(drafts["items"]):
+        value = lambda field: st.session_state.get(draft_key(drafts, index, field), item.get(field))  # noqa: E731
+        if not st.session_state.get(draft_key(drafts, index, "include"), True):
+            continue
+        related = item.get("related_to", {})
+        edited = {
+            **item,
+            "related_to": {
+                "name": st.session_state.get(draft_key(drafts, index, "related_name"), related.get("name", "")),
+                "kind": st.session_state.get(draft_key(drafts, index, "related_kind"), related.get("kind", "")),
+            },
+        }
+        for field in ("title", "body", "subject", "description", "priority", "owner"):
+            if field in item:
+                edited[field] = value(field)
+        if "due_date" in item:
+            due = value("due_date")
+            edited["due_date"] = due.isoformat() if isinstance(due, datetime.date) else str(due or "")
+        if "to" in item:
+            to = value("to")
+            edited["to"] = to.split(",") if isinstance(to, str) else to
+        cleaned = normalise_draft_item(drafts["type"], edited)
+        label = f"{OUTPUT_TYPES[drafts['type']].rstrip('s')} {index + 1}"
+        if drafts["type"] == "note" and not cleaned["title"]:
+            problems.append(f"{label} needs a title.")
+        if drafts["type"] in ("task", "email") and not cleaned["subject"]:
+            problems.append(f"{label} needs a subject.")
+        items.append(cleaned)
+        indexes.append(index)
+    if not items:
+        problems.append("Include at least one draft.")
+    return items, indexes, problems
+
+
+def send_drafts_to_outbox(search_state: dict, source_notes: list[tuple[str, Path | None]]) -> None:
+    drafts = search_state["drafts"]
+    items, indexes, problems = collect_draft_items(drafts)
+    if problems:
+        st.session_state["draft_send_error"] = " ".join(problems)
+        return
+    try:
+        path = write_handoff_package(build_handoff_package(search_state, items, source_notes), get_outbox_dir())
+    except Exception as exc:
+        st.session_state["draft_send_error"] = f"Couldn't write to the outbox: {exc}"
+        return
+    drafts["sent"] = {"file": str(path), "indexes": indexes}
 
 
 PROMPT_LIBRARY_PAGE_URL = "?page=prompts"
@@ -1861,6 +1946,24 @@ def render_prompt_library_page() -> None:
             st.warning(error)
         if added := st.session_state.pop("add_prompt_added", None):
             st.success(f"Added **{added}**.")
+
+    with st.container(border=True):
+        st.subheader("Outbox")
+        st.caption(
+            "Drafts you send from a Note, Tasks or Email prompt are written here as JSON files. A separate "
+            "connector (e.g. Salesforce) picks them up and moves each to processed/ or failed/ with a receipt."
+        )
+        outbox = get_outbox_dir()
+        st.text_input(
+            "Outbox folder",
+            value=str(outbox),
+            key="outbox_path_input",
+            on_change=persist_outbox_path,
+            help="Must match the folder your connector reads. Leave empty for the default.",
+        )
+        waiting = len([p for p in outbox.glob("*.json") if not p.name.startswith(".")]) if outbox.is_dir() else 0
+        counts = {folder: len(list((outbox / folder).glob("*.receipt.json"))) for folder in HANDOFF_RESULT_DIRS}
+        st.caption(f"Waiting: **{waiting}** · Processed: **{counts['processed']}** · Failed: **{counts['failed']}**")
 
     install_filter_commit_on_blur()
 
@@ -2709,6 +2812,119 @@ def render_filter_results(search_state: dict, library_folder: Path, safe_lib: st
                 render_full_document(file_source, path, note_lib)
 
 
+RECEIPT_STATUS_TEXT = {
+    "done": "everything was created",
+    "partial": "some items were created; the rest need attention",
+    "needs_review": "nothing was created yet; a record or field needs choosing",
+    "failed": "it couldn't be processed",
+}
+
+
+def render_drafts(search_state: dict, source_notes: list[tuple[str, Path | None]]) -> None:
+    """Editable drafts from a Note/Tasks/Email prompt, a Send to outbox button, then the connector's result."""
+    drafts = search_state["drafts"]
+    sent = drafts.get("sent")
+    st.subheader("Drafts")
+    if not drafts["items"]:
+        st.info("The model returned no drafts. Try a different question or raise **Max tokens**.")
+        return
+    if not sent:
+        st.caption(
+            "Review and edit, then send. Sending writes one file to the outbox folder for a connector "
+            "(e.g. Salesforce) to pick up; this app never contacts other systems. Leave a field empty if the notes don't say."
+        )
+
+    for index, item in enumerate(drafts["items"]):
+        key = lambda field: draft_key(drafts, index, field)  # noqa: E731
+        with st.container(border=True):
+            st.checkbox(
+                f"{OUTPUT_TYPES[drafts['type']].rstrip('s')} {index + 1}",
+                value=True,
+                key=key("include"),
+                disabled=bool(sent),
+                help="Untick to leave this draft out.",
+            )
+            if item["type"] == "note":
+                st.text_input("Title", value=item["title"], key=key("title"), disabled=bool(sent))
+                st.text_area("Body", value=item["body"], key=key("body"), height=160, disabled=bool(sent))
+            elif item["type"] == "task":
+                st.text_input("Subject", value=item["subject"], key=key("subject"), disabled=bool(sent))
+                st.text_area("Description", value=item["description"], key=key("description"), height=80, disabled=bool(sent))
+                due_col, priority_col, owner_col = st.columns(3)
+                due_col.date_input(
+                    "Due date",
+                    value=datetime.date.fromisoformat(item["due_date"]) if item["due_date"] else None,
+                    key=key("due_date"),
+                    format="YYYY-MM-DD",
+                    disabled=bool(sent),
+                )
+                priority_col.selectbox(
+                    "Priority",
+                    TASK_PRIORITIES,
+                    index=TASK_PRIORITIES.index(item["priority"]),
+                    format_func=lambda p: p.capitalize() or "Not set",
+                    key=key("priority"),
+                    disabled=bool(sent),
+                )
+                owner_col.text_input("Owner", value=item["owner"], key=key("owner"), placeholder="Not given", disabled=bool(sent))
+            else:
+                st.text_input(
+                    "To", value=", ".join(item["to"]), key=key("to"), help="Names or addresses, comma-separated.", disabled=bool(sent)
+                )
+                st.text_input("Subject", value=item["subject"], key=key("subject"), disabled=bool(sent))
+                st.text_area("Body", value=item["body"], key=key("body"), height=160, disabled=bool(sent))
+            name_col, kind_col = st.columns([2, 1])
+            name_col.text_input(
+                "Related to",
+                value=item["related_to"]["name"],
+                key=key("related_name"),
+                placeholder="e.g. Acme pilot",
+                help="The client, deal or person this belongs to. The connector finds the matching record.",
+                disabled=bool(sent),
+            )
+            kind_col.selectbox(
+                "Kind",
+                RELATED_KINDS,
+                index=RELATED_KINDS.index(item["related_to"]["kind"]),
+                format_func=lambda k: k.capitalize() or "Not sure",
+                key=key("related_kind"),
+                disabled=bool(sent),
+            )
+
+    if not sent:
+        st.button(
+            "Send to outbox",
+            type="primary",
+            icon=":material/outbox:",
+            key=f"send_drafts_{drafts['id']}",
+            on_click=send_drafts_to_outbox,
+            args=(search_state, source_notes),
+            help=f"Writes to {get_outbox_dir()}. Change the folder on the Prompt library page.",
+        )
+        if error := st.session_state.pop("draft_send_error", None):
+            st.warning(error)
+        return
+
+    package_file = Path(sent["file"])
+    receipt = read_handoff_receipt(package_file)
+    if not receipt:
+        st.info(f"Sent to the outbox as `{package_file.name}`. Waiting for a connector to pick it up.")
+        st.button("Check again", icon=":material/refresh:", key=f"check_drafts_{drafts['id']}")
+        return
+    message = f"**{receipt.get('connector', 'Connector').capitalize()}:** {RECEIPT_STATUS_TEXT.get(receipt['status'], receipt['status'])}."
+    if receipt.get("error"):
+        message += f" {receipt['error']}"
+    (st.success if receipt["status"] == "done" else st.warning)(message)
+    for result in receipt.get("items", []):
+        if result["status"] in ("created", "exists"):
+            continue
+        number = sent["indexes"][result["index"]] + 1 if result["index"] < len(sent["indexes"]) else result["index"] + 1
+        candidates = ", ".join(c["name"] for c in result.get("candidates", []))
+        st.caption(
+            f"Draft {number}: {result['message']}" + (f" Possible matches: {candidates}." if candidates else "")
+        )
+
+
 def render_search_results(
     search_state: dict,
     library_folder: Path,
@@ -2738,6 +2954,17 @@ def render_search_results(
             hit.get("_uploads_dirs", search_state["uploads_dirs"]),
         )
 
+    # Each source note once, in rank order, with its local path when it can be found.
+    source_notes: list[tuple[str, Path | None]] = []
+    seen_sources: set[tuple[str, str]] = set()
+    for result in results:
+        file_source = str(result.get("file_source", ""))
+        source_key = (result.get("_library", ""), file_source)
+        if file_source and source_key not in seen_sources:
+            seen_sources.add(source_key)
+            result_folder, _result_lib, result_uploads = hit_location(result)
+            source_notes.append((file_source, resolve_source_path(file_source, result_folder, result_uploads)))
+
     main_col, chat_col = st.columns([3, 2], gap="large")
 
     with main_col:
@@ -2746,18 +2973,7 @@ def render_search_results(
             st.markdown(search_state["answer"])
             render_copy_button(search_state["answer"], "Copy answer")
 
-            cited_paths: list[Path] = []
-            seen_paths: set[str] = set()
-            for result in results:
-                result_folder, _result_lib, result_uploads = hit_location(result)
-                path = resolve_source_path(
-                    str(result.get("file_source", "")),
-                    result_folder,
-                    result_uploads,
-                )
-                if path and str(path) not in seen_paths:
-                    seen_paths.add(str(path))
-                    cited_paths.append(path)
+            cited_paths = list(dict.fromkeys(path for _file, path in source_notes if path))
             if cited_paths:
                 st.caption(
                     "Sources used (expand below to read them): "
@@ -2777,6 +2993,9 @@ def render_search_results(
             st.error(f"LLM answer failed: {search_state['answer_error']}")
         elif not search_state["question"]:
             st.info("No question was asked — use the discussion panel to ask about these notes.")
+
+        if search_state.get("drafts"):
+            render_drafts(search_state, source_notes)
 
         st.subheader("Sources")
         # Group hits by document, keeping the order of each document's best hit.
