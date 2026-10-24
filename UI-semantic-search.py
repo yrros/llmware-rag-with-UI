@@ -122,6 +122,11 @@ CORPUS_MODE_MULTI = "multi"
 CORPUS_MODE_SINGLE = "single"
 SINGLE_CORPUS_DISPLAY_NAME = "All notes"
 SINGLE_CORPUS_LIBRARY_NAME = "Single_Corpus"
+LOCAL_NOTES_EXPORT_URL = "https://github.com/yrros/Local-Apple-Notes-Export"
+FALCON_NOTES_EXPORTER_URL = "https://falcon.star-lord.me/exporter"
+SETUP_TRIAL = "trial"
+SETUP_WHOLE = "whole"
+SETUP_PER_FOLDER = "per_folder"
 
 DEFAULT_CORPUS_CONFIG = {
     "embedding_model": DEFAULT_EMBEDDING_MODEL,
@@ -137,7 +142,7 @@ DEFAULT_CORPUS_CONFIG = {
 
 # Hardware acceleration
 # - Ollama (Answer with LLM) uses its own Metal/GPU stack — independent of LLMWare config.
-# - LLMWare HF embedding models only check CUDA by default; patch below can route to MPS when enabled.
+# - LLMWare HF embedding models only check CUDA by default; patch below routes to CUDA or MPS when enabled.
 LLMWareConfig().set_config("hardware_accelerator", "mac_metal")
 LLMWareConfig().set_home(str(PROJECT_DIR))
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -553,21 +558,14 @@ def _pick_embedding_device(use_gpu: bool) -> str:
         return "cpu"
     if torch.cuda.is_available():
         return "cuda"
-    # PyTorch MPS hits nn.Embedding bugs on Apple Silicon — keep HF models on CPU.
+    # Apple Silicon GPU; embedding falls back to CPU if an MPS op fails mid-scan.
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
 
 
 def resolve_embedding_device_label(use_gpu: bool) -> str:
-    device = _pick_embedding_device(use_gpu)
-    if use_gpu and device == "cpu":
-        try:
-            import torch
-
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "cpu (MPS unsupported for HF embeddings on Mac)"
-        except ImportError:
-            pass
-    return device
+    return _pick_embedding_device(use_gpu)
 
 
 def _run_hf_embedding_forward(model, input_ids, attn_mask, device: str):
@@ -825,6 +823,8 @@ def load_embedding_model_catalog() -> tuple[dict, ...]:
                 "label": f"{model_id} ({card.get('embedding_dims', '?')}d)",
                 "dims": card.get("embedding_dims", 384),
                 "recommended": model_id in RECOMMENDED_EMBEDDING_MODELS,
+                # Only HF models get the GPU acceleration patch.
+                "gpu": card.get("model_family") == "HFEmbeddingModel",
             }
         )
 
@@ -1134,11 +1134,19 @@ def get_embedding_model_summary(embedding_model: str) -> str:
     return "Local embedding model used to power semantic search."
 
 
+def will_embed_on_gpu(embedding_model: str) -> bool:
+    """True when this model would embed on a GPU on this machine (whether or not the GPU option is ticked)."""
+    if _pick_embedding_device(True) == "cpu":
+        return False
+    return any(m["id"] == embedding_model and m["gpu"] for m in load_embedding_model_catalog())
+
+
 def format_embedding_model_option(model_id: str, model_labels: dict[str, str]) -> str:
-    """Format a selectbox label with model name, size, and summary."""
+    """Format a selectbox label with model name, size, and summary; (g) marks models that will use the GPU."""
     label = model_labels.get(model_id, model_id)
     summary = get_embedding_model_summary(model_id)
-    return f"{label} — {summary}"
+    prefix = "(g) " if will_embed_on_gpu(model_id) else ""
+    return f"{prefix}{label} — {summary}"
 
 
 def load_all_corpus_settings() -> dict:
@@ -2464,8 +2472,11 @@ def get_embedding_progress(safe_lib: str, embedding_model: str) -> dict | None:
     return status_list[0]
 
 
-def run_with_embedding_progress(operation_label: str, safe_lib: str, embedding_model: str, work_fn) -> dict:
+def run_with_embedding_progress(
+    operation_label: str, safe_lib: str, embedding_model: str, work_fn, container=None
+) -> dict:
     """Run sync/rebuild work in a background thread and poll embedding progress every 5s."""
+    container = container or st.sidebar
     error: list[Exception | None] = [None]
     ingest_stats: list[dict] = [{}]
 
@@ -2478,8 +2489,8 @@ def run_with_embedding_progress(operation_label: str, safe_lib: str, embedding_m
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
-    progress_bar = st.sidebar.progress(0.0, text=f"{operation_label}: starting…")
-    live_status = st.sidebar.empty()
+    progress_bar = container.progress(0.0, text=f"{operation_label}: starting…")
+    live_status = container.empty()
 
     while True:
         entry = get_embedding_progress(safe_lib, embedding_model)
@@ -2541,6 +2552,323 @@ def run_with_embedding_progress(operation_label: str, safe_lib: str, embedding_m
         "blocks_total": stats.get("blocks_total", blocks_total),
         "vectors": stats.get("vectors", vectors),
     }
+
+
+def run_multi_corpus_rebuild(
+    libraries: list[str], corpus_root: Path, embedding_model: str, container=None
+) -> dict:
+    """Full hard rebuild of every sub-corpus, one after another, on a single embedding model."""
+    container = container or st.sidebar
+    total = len(libraries)
+    overall_bar = container.progress(0.0, text=f"Multi-corpus rebuild: 0/{total} complete")
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    for index, lib_name in enumerate(libraries, start=1):
+        safe_name = sanitize_library_name(lib_name)
+        content_path = corpus_root / lib_name
+        overall_bar.progress(
+            (index - 1) / total,
+            text=f"Multi-corpus rebuild: {index - 1}/{total} complete · now '{lib_name}'",
+        )
+
+        def _sync_rebuild(name: str = safe_name, path: Path = content_path) -> dict:
+            lib = load_or_create_library(name, force_create=True, embedding_model=embedding_model)
+            return sync_library(lib, path, embedding_model)
+
+        try:
+            job_status = run_with_embedding_progress(
+                f"Rebuilding '{lib_name}' ({index}/{total})",
+                safe_name,
+                embedding_model,
+                _sync_rebuild,
+                container,
+            )
+            commit_job_status(job_status, lib_name, safe_name)
+            save_corpus_config(safe_name, {"embedding_model": embedding_model, "vector_db": VECTOR_DB})
+            succeeded.append(lib_name)
+        except Exception as exc:
+            failed.append((lib_name, format_exception_for_user(exc)))
+
+        # Drop stale per-corpus widget values so the new saved model is picked up.
+        st.session_state.pop(f"embedding_model_{safe_name}", None)
+
+    overall_bar.progress(1.0, text=f"Multi-corpus rebuild: {len(succeeded)}/{total} succeeded")
+    return {
+        "embedding_model": embedding_model,
+        "completed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "succeeded": succeeded,
+        "failed": failed,
+    }
+
+
+def render_multi_corpus_rebuild_summary() -> None:
+    summary = st.session_state.get("multi_rebuild_summary")
+    if not summary:
+        return
+    succeeded, failed = summary["succeeded"], summary["failed"]
+    total = len(succeeded) + len(failed)
+    message = (
+        f"Multi-corpus rebuild on `{summary['embedding_model']}`: "
+        f"{len(succeeded)}/{total} corpora rebuilt · {summary['completed_at']}"
+    )
+    if failed:
+        st.sidebar.warning(message)
+        for lib_name, reason in failed:
+            st.sidebar.caption(f"❌ **{lib_name}** — {reason}")
+    else:
+        st.sidebar.success(message)
+
+
+# ---------------------------------------------------------------------------
+# GETTING STARTED WIZARD (first run, or after reset_rag.sh)
+# ---------------------------------------------------------------------------
+
+def has_indexed_library() -> bool:
+    """True once any library has text blocks — i.e. the app has been set up before."""
+    try:
+        cards = LibraryCatalog().all_library_cards() or []
+    except Exception:
+        return False
+    return any(int(card.get("blocks", 0) or 0) > 0 for card in cards if isinstance(card, dict))
+
+
+def should_show_setup_wizard() -> bool:
+    if st.session_state.get("setup_wizard_done"):
+        return False
+    return not has_indexed_library()
+
+
+@st.cache_data(ttl=60, max_entries=8, show_spinner="Counting files…")
+def scan_corpus_folders(corpus_root: str) -> tuple[int, dict[str, int]]:
+    """Count ingestible files in the whole tree and in each top-level folder."""
+    root = Path(corpus_root)
+    per_folder = {d.name: 0 for d in root.iterdir() if d.is_dir()}
+    total = 0
+    for path in root.rglob("*"):
+        if should_skip_ingest_path(path) or not path.is_file():
+            continue
+        if path.suffix.lower() not in INGEST_EXTENSIONS:
+            continue
+        total += 1
+        parts = path.relative_to(root).parts
+        if len(parts) > 1 and parts[0] in per_folder:
+            per_folder[parts[0]] += 1
+    return total, dict(sorted(per_folder.items()))
+
+
+def wizard_browse_for_root() -> None:
+    picked = browse_for_directory(st.session_state.get("wizard_corpus_root") or None)
+    if picked:
+        st.session_state["wizard_corpus_root"] = picked.strip()
+
+
+def dismiss_setup_wizard() -> None:
+    st.session_state["setup_wizard_done"] = True
+
+
+def render_setup_wizard() -> None:
+    """Three-step getting started guide: notes folder, indexing approach, embedding engine."""
+    if "wizard_corpus_root" not in st.session_state:
+        saved_root = load_corpus_root_path()
+        st.session_state["wizard_corpus_root"] = str(saved_root) if saved_root else ""
+
+    st.header("Getting started")
+    st.markdown(
+        "Welcome! Three quick steps and your notes will be searchable by meaning, not just keywords. "
+        "This guide appears on first run and after a reset; everything here can be changed later in the sidebar."
+    )
+
+    with st.container(border=True):
+        st.subheader("1. Choose your notes folder")
+        st.markdown(
+            "Point the app at a folder of notes. Any of these work:\n"
+            f"- **[Local Apple Notes Export]({LOCAL_NOTES_EXPORT_URL})** — our companion app. "
+            "Exports your Apple Notes to Markdown folders on this Mac.\n"
+            f"- **[Falcon Notes Exporter]({FALCON_NOTES_EXPORTER_URL})** — another way to export Apple Notes to Markdown.\n"
+            "- **Any other Markdown corpus** — an Obsidian vault, a docs folder, a repo of notes. "
+            "PDF, Word, PowerPoint, Excel, CSV, JSON and plain-text files are indexed too."
+        )
+        st.caption(
+            "Using an exporter? Pick the folder that holds one subfolder per account or category "
+            "(often called `iCloud`)."
+        )
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            st.text_input(
+                "Notes folder",
+                key="wizard_corpus_root",
+                placeholder="/Users/you/Documents/notes-export/iCloud",
+            )
+            st.button("Browse…", icon=":material/folder_open:", on_click=wizard_browse_for_root)
+
+        raw_root = str(st.session_state.get("wizard_corpus_root", "")).strip()
+        if not raw_root:
+            st.info("Choose a folder to continue.")
+            return
+        corpus_root = Path(raw_root).expanduser()
+        if not corpus_root.is_dir():
+            st.error(f"Folder not found: `{corpus_root}`")
+            return
+        total_files, folder_counts = scan_corpus_folders(str(corpus_root))
+        if not total_files:
+            st.warning(
+                "No files the app can index were found here. "
+                f"Supported types: {', '.join(sorted(INGEST_EXTENSIONS))}"
+            )
+            return
+        filled_folders = {name: count for name, count in folder_counts.items() if count}
+        st.success(
+            f"Found **{total_files:,}** files to index"
+            + (f" across **{len(filled_folders)}** top-level folders." if filled_folders else ".")
+        )
+
+    with st.container(border=True):
+        st.subheader("2. Choose how to index")
+        choices = {
+            SETUP_TRIAL: (
+                "Try a small corpus first — fastest",
+                "Index one top-level folder so you can see how search feels in a few minutes. "
+                "Add the other folders whenever you're ready.",
+            ),
+            SETUP_WHOLE: (
+                "Index everything as one corpus — simplest, but slowest",
+                "One search across all your notes. The first build takes longest, and changing the "
+                "embedding engine means re-indexing the lot.",
+            ),
+            SETUP_PER_FOLDER: (
+                "Index each top-level folder as its own corpus — most flexible",
+                "Each folder gets its own database. Search them one at a time, and re-index, hide or "
+                "change the engine for one folder without touching the others.",
+            ),
+        }
+        options = [SETUP_TRIAL, SETUP_WHOLE, SETUP_PER_FOLDER] if filled_folders else [SETUP_WHOLE]
+        choice = st.radio(
+            "Indexing approach",
+            options,
+            format_func=lambda key: choices[key][0],
+            captions=[choices[key][1] for key in options],
+            key="wizard_choice",
+            label_visibility="collapsed",
+        )
+        trial_folder = None
+        if not filled_folders:
+            st.caption("Your notes aren't split into subfolders, so they'll be indexed as one corpus.")
+        elif choice == SETUP_TRIAL:
+            folder_names = list(filled_folders)
+            smallest = min(folder_names, key=lambda name: filled_folders[name])
+            trial_folder = st.selectbox(
+                "Folder to try",
+                folder_names,
+                index=folder_names.index(smallest),
+                format_func=lambda name: f"{name} — {filled_folders[name]:,} files",
+                key="wizard_trial_folder",
+            )
+            st.caption(
+                "Later, index the rest from the sidebar one at a time, or all at once with "
+                "**Rebuild all corpora** in Advanced."
+            )
+        elif choice == SETUP_PER_FOLDER:
+            st.caption("Folders are indexed one after another: " + " → ".join(filled_folders))
+            empty_folders = [name for name, count in folder_counts.items() if not count]
+            if empty_folders:
+                st.caption(f"Skipping {len(empty_folders)} empty folder(s): {', '.join(empty_folders)}")
+        else:
+            st.caption(f"All {total_files:,} files will go into a single corpus called **{SINGLE_CORPUS_DISPLAY_NAME}**.")
+
+    with st.container(border=True):
+        st.subheader("3. Choose an embedding engine")
+        catalog = load_embedding_model_catalog()
+        labels = {model["id"]: model["label"] for model in catalog}
+        model_options = [model_id for model_id in RECOMMENDED_EMBEDDING_MODELS if model_id in labels]
+        embedding_model = st.selectbox(
+            "Embedding engine",
+            model_options,
+            index=model_options.index(DEFAULT_EMBEDDING_MODEL) if DEFAULT_EMBEDDING_MODEL in model_options else 0,
+            format_func=lambda model_id: format_embedding_model_option(model_id, labels),
+            key="wizard_embedding_model",
+        )
+        st.caption(
+            f"Not sure? Keep **{DEFAULT_EMBEDDING_MODEL}** — it's the quickest. Larger engines find subtler "
+            "matches but take longer to build. Models marked **(g)** can use this machine's GPU."
+        )
+        missing_deps = get_missing_embedding_dependencies(embedding_model)
+        if missing_deps:
+            render_embedding_dependency_install_help(missing_deps, embedding_model)
+        use_gpu = st.checkbox(
+            "Use GPU for embeddings",
+            value=bool(load_app_settings().get("use_gpu_for_embeddings", False)),
+            key="wizard_use_gpu",
+            help="Faster on models marked (g). Falls back to CPU automatically if the GPU can't run a model.",
+        )
+
+    with st.container(horizontal=True, vertical_alignment="center"):
+        start = st.button(
+            "Start indexing",
+            type="primary",
+            icon=":material/play_arrow:",
+            disabled=bool(missing_deps),
+            key="wizard_start",
+        )
+        st.button("Skip for now", type="tertiary", on_click=dismiss_setup_wizard, key="wizard_skip")
+
+    if start:
+        run_setup_wizard(corpus_root, choice, trial_folder, list(filled_folders), embedding_model, use_gpu)
+
+
+def run_setup_wizard(
+    corpus_root: Path,
+    choice: str,
+    trial_folder: str | None,
+    folders: list[str],
+    embedding_model: str,
+    use_gpu: bool,
+) -> None:
+    """Save the wizard's choices, then index straight away with progress shown on the page."""
+    mode = CORPUS_MODE_SINGLE if choice == SETUP_WHOLE else CORPUS_MODE_MULTI
+    save_app_settings(
+        {"corpus_root_path": str(corpus_root), "corpus_mode": mode, "use_gpu_for_embeddings": use_gpu}
+    )
+    st.session_state["corpus_root_path_input"] = str(corpus_root)
+    st.session_state["corpus_mode_toggle"] = mode
+
+    progress = st.container()
+    try:
+        ensure_embedding_dependencies(embedding_model)
+        set_embedding_acceleration(use_gpu)
+
+        if choice == SETUP_PER_FOLDER:
+            summary = run_multi_corpus_rebuild(folders, corpus_root, embedding_model, progress)
+            st.session_state["multi_rebuild_summary"] = summary
+            if not summary["succeeded"]:
+                progress.error("None of the folders could be indexed:")
+                for lib_name, reason in summary["failed"]:
+                    progress.caption(f"❌ **{lib_name}** — {reason}")
+                return
+            first_library = summary["succeeded"][0]
+        else:
+            display_name = trial_folder or SINGLE_CORPUS_DISPLAY_NAME
+            safe_name = sanitize_library_name(trial_folder) if trial_folder else SINGLE_CORPUS_LIBRARY_NAME
+            content_path = corpus_root / trial_folder if trial_folder else corpus_root
+
+            def _index() -> dict:
+                lib = load_or_create_library(safe_name, force_create=True, embedding_model=embedding_model)
+                return sync_library(lib, content_path, embedding_model)
+
+            job_status = run_with_embedding_progress(
+                f"Indexing '{display_name}'", safe_name, embedding_model, _index, progress
+            )
+            commit_job_status(job_status, display_name, safe_name)
+            save_corpus_config(safe_name, {"embedding_model": embedding_model, "vector_db": VECTOR_DB})
+            first_library = trial_folder
+    except Exception as exc:
+        handle_embedding_run_error(exc, embedding_model)
+        return
+
+    if first_library:
+        save_app_settings({"last_selected_library": first_library})
+        st.session_state["selected_library"] = first_library
+    st.session_state["setup_wizard_done"] = True
+    st.rerun()
 
 
 def get_last_updated(corpus_folder: Path) -> str | None:
@@ -3120,6 +3448,10 @@ _migrated_tables = migrate_all_legacy_vectors()
 st.set_page_config(page_title="RAG Workspace Manager", layout="wide")
 st.title("🧠 RAG Workspace Manager")
 
+if should_show_setup_wizard():
+    render_setup_wizard()
+    st.stop()
+
 # ---------------------------------------------------------------------------
 # SIDEBAR — CORPUS ROOT
 # ---------------------------------------------------------------------------
@@ -3264,12 +3596,10 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
         key="use_gpu_for_embeddings_global",
         on_change=persist_gpu_for_embeddings_setting,
         help=(
-            "Global setting for all corpus scans. Uses CUDA when available. "
-            "On Apple Silicon, HF embedding models stay on CPU due to a PyTorch MPS bug."
+            "Global setting for all corpus scans. Uses CUDA when available, "
+            "or the Apple Silicon GPU (MPS) on Mac. Models marked (g) can use the GPU."
         ),
     )
-    if get_use_gpu_for_embeddings() and resolve_embedding_device_label(True).startswith("cpu ("):
-        st.caption("GPU toggle is on, but embedding scans will use CPU on this Mac.")
     st.caption(f"Global — saved to `{APP_SETTINGS_PATH}`")
     st.divider()
     st.caption(f"Per-corpus settings for **{selected_lib}**")
@@ -3356,6 +3686,45 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
     if not is_single_corpus_mode():
         render_corpus_visibility_controls(all_libraries)
 
+        st.divider()
+        st.markdown("**Multi-corpus clean rebuild**")
+        st.caption(
+            f"Full hard rebuild of all {len(all_libraries)} sub-corpora (including hidden ones), "
+            "in order, using one embedding engine."
+        )
+        multi_show_all = st.checkbox(
+            "Show all local embedding models",
+            value=False,
+            key="multi_rebuild_show_all_models",
+        )
+        multi_model_ids = model_ids if multi_show_all else [
+            model_id for model_id in RECOMMENDED_EMBEDDING_MODELS if model_id in model_ids
+        ]
+        if corpus_config["embedding_model"] not in multi_model_ids:
+            multi_model_ids = [corpus_config["embedding_model"]] + multi_model_ids
+        multi_rebuild_model = st.selectbox(
+            "Embedding engine for all corpora",
+            options=multi_model_ids,
+            index=multi_model_ids.index(corpus_config["embedding_model"]),
+            format_func=lambda model_id: format_embedding_model_option(model_id, model_labels),
+            key="multi_rebuild_model",
+        )
+        multi_deps_missing = get_missing_embedding_dependencies(multi_rebuild_model)
+        if multi_deps_missing:
+            render_embedding_dependency_install_help(multi_deps_missing, multi_rebuild_model)
+        st.caption("Order: " + " → ".join(all_libraries))
+        multi_rebuild_ack = st.checkbox(
+            "I understand this deletes and rebuilds the index for **every** sub-corpus.",
+            value=False,
+            key="multi_rebuild_ack",
+        )
+        if st.button(
+            "🔨 Rebuild all corpora",
+            disabled=not multi_rebuild_ack or bool(multi_deps_missing),
+            key="multi_rebuild_start",
+        ):
+            st.session_state["multi_rebuild_request"] = multi_rebuild_model
+
 with st.sidebar.expander("Debug details", expanded=False):
     render_debug_panel(selected_lib, safe_lib, _status_lib, corpus_config)
 
@@ -3421,6 +3790,21 @@ if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, 
     except Exception as exc:
         handle_embedding_run_error(exc, pending_model, sidebar=True)
 
+multi_rebuild_request = st.session_state.pop("multi_rebuild_request", None)
+if multi_rebuild_request and not is_single_corpus_mode():
+    try:
+        ensure_embedding_dependencies(multi_rebuild_request)
+        ensure_corpus_root_persisted(corpus_root_path)
+        set_embedding_acceleration(get_use_gpu_for_embeddings())
+        st.session_state["multi_rebuild_summary"] = run_multi_corpus_rebuild(
+            all_libraries, corpus_root_path, multi_rebuild_request
+        )
+        st.session_state.pop("multi_rebuild_ack", None)
+        st.rerun()
+    except Exception as exc:
+        handle_embedding_run_error(exc, multi_rebuild_request, sidebar=True)
+
+render_multi_corpus_rebuild_summary()
 render_sidebar_job_summary(selected_lib, safe_lib)
 
 # Reload saved config for search (may have just been updated in session)

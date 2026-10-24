@@ -116,9 +116,11 @@ ollama pull llama3.2:3b
 
 ### 3. Point the app at your note export
 
+**First run:** the app opens a **Getting started** guide that walks you through choosing your notes folder, how to index it, and the embedding engine — see [Getting started guide](#getting-started-guide).
+
 **In the app:** use **Notes location** at the top of the left sidebar. Enter the path to your export folder or click **Browse…** to pick it. The path is saved to `./llmware_data/app_settings.json`.
 
-**Export from Apple Notes:** use the [Falcon Notes Exporter](https://falcon.star-lord.me/exporter) to produce a folder of markdown files (typically with an `iCloud` subfolder containing one directory per note account or category).
+**Export from Apple Notes:** use our companion app [Local Apple Notes Export](https://github.com/yrros/Local-Apple-Notes-Export), or the [Falcon Notes Exporter](https://falcon.star-lord.me/exporter), to produce a folder of markdown files (typically with an `iCloud` subfolder containing one directory per note account or category).
 
 Each **immediate subfolder** of the corpus root becomes a selectable library in the UI—for example:
 
@@ -202,7 +204,20 @@ Supported ingest extensions include `.md`, `.txt`, `.pdf`, `.docx`, `.pptx`, `.x
 
 ## Operation guide
 
-### First-time indexing
+### Getting started guide
+
+On first run — and after `./reset_rag.sh` — the app shows a three-step guide instead of the normal screen. It appears whenever no corpus has been indexed yet.
+
+1. **Choose your notes folder.** Use [Local Apple Notes Export](https://github.com/yrros/Local-Apple-Notes-Export) (our companion app), the [Falcon Notes Exporter](https://falcon.star-lord.me/exporter), or any other folder of Markdown (an Obsidian vault, a docs folder…). The guide counts the files it can index.
+2. **Choose how to index:**
+   - **Try a small corpus first** — fastest. Indexes one top-level folder (the smallest is preselected) so you can try search in minutes.
+   - **Index everything as one corpus** — one search across all notes; slowest to build, and changing engine re-indexes everything. Sets **Single-Corpus** mode.
+   - **Index each top-level folder as its own corpus** — most flexible; each folder gets its own database and can be re-indexed, hidden or switched to another engine on its own. Empty folders are skipped.
+3. **Choose an embedding engine** (default `mini-lm-sbert`) and whether to use the GPU. Models marked **(g)** can use this machine's GPU.
+
+**Start indexing** saves the choices and indexes straight away with progress on the page, then opens the app on the new library. **Skip for now** goes to the normal app for this session; the guide returns next time if nothing has been indexed.
+
+### First-time indexing (manual)
 
 1. Set **Notes location** to your Apple Notes export folder (or use **Browse…**).
 2. Select a **library** (corpus) in the left sidebar.
@@ -248,7 +263,7 @@ Requires Ollama running locally (`localhost:11434`).
 
 | Setting | Scope | Notes |
 |---------|-------|-------|
-| Also use GPU for embeddings | Global | Uses CUDA when available. On Apple Silicon, HF embeddings stay on CPU due to a PyTorch MPS bug—leave off for best speed. |
+| Also use GPU for embeddings | Global | Uses CUDA when available, or the Apple Silicon GPU (MPS) on Mac. Falls back to CPU if a GPU op fails. |
 | Embedding engine | Per corpus | Changing model requires **Re-index** after acknowledging the warning. |
 | Relevance cutoff (distance) | Per corpus | Lower = stricter matches. Saved per corpus; no re-embed needed. |
 | Debug details | Per session | Paths, file counts, index health |
@@ -276,13 +291,7 @@ llmware_data/
 └── app_settings.json     # Global settings (GPU toggle)
 ```
 
-This folder is gitignored. To reset everything:
-
-```bash
-rm -rf llmware_data
-```
-
-Then re-index your corpora. Your source markdown files on disk are not deleted—only local indexes and settings.
+This folder is gitignored. To reset it, use `reset_rag.sh` (see [Resetting the environment](#resetting-the-environment)).
 
 On first run, the app may copy data from the legacy location `~/llmware_data/` if the project-local folder is empty.
 
@@ -331,7 +340,8 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 | Search returns nothing | Index empty or stale LanceDB path | Run **Re-index**; check Debug details for vector count |
 | Only a few `.md` files indexed | Old LLMWare single-level scan | This app uses recursive ingest—run **Re-index** |
 | Ollama answer fails | Ollama not running or model not pulled | `ollama serve` and `ollama pull llama3.2:3b` |
-| MPS / GPU embedding error | PyTorch MPS bug with HF embeddings | Leave **Also use GPU** off on Mac (default) |
+| MPS / GPU embedding error | PyTorch MPS op unsupported for a model | Untick **Also use GPU** and re-run the scan on CPU |
+| Database cannot be started / SQLite errors after an interrupted scan | Scan stopped mid-write (battery, crash, force quit) and left the index corrupt | Quit the app, run `./reset_rag.sh`, then restart and re-index |
 | Empty index after rebuild | Run from wrong directory | Always `cd` to project root before starting Streamlit |
 | Slow indexing | Large corpus + heavy embedding model | Use `mini-lm-sbert` or `bge-small-en-v1.5` |
 
@@ -345,6 +355,7 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 | `start_app.sh` | Start/warm Ollama, then launch Streamlit |
 | `ensure_ollama_ready.py` | Starts Ollama if needed and warms the configured LLM |
 | `Installer.sh` | Creates `venv`, installs dependencies, and builds Desktop `LLM-Notes.app` |
+| `reset_rag.sh` | Deletes indexes, vectors, histories and temp files; keeps models and settings |
 | `.gitignore` | Excludes `llmware_data/`, venvs, `__pycache__` |
 
 ---
@@ -352,3 +363,37 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 ## License
 
 Depends on upstream packages (LLMWare, Streamlit, LanceDB, HuggingFace models, Ollama). Check their respective licenses for redistribution and commercial use.
+
+---
+
+## GPU marker on embedding models
+
+In the **Advanced — Indexing & Embeddings** model lists, a **(g)** in front of a model name means that model can embed on this machine's GPU. It is shown whether or not **Also use GPU for embeddings** is ticked; the GPU is only actually used for scans when that option is on.
+
+A model is marked when:
+
+- a supported GPU is available on this machine (CUDA, or MPS on Apple Silicon), and
+- the model is a Hugging Face embedding model (all of the bundled local models are).
+
+---
+
+## Resetting the environment
+
+If a scan is interrupted (battery dies, crash, force quit) the index can be left corrupt and the app may report that the database cannot be started. `reset_rag.sh` clears the local index data so you can start clean:
+
+```bash
+./reset_rag.sh             # list what will be deleted, then ask to confirm
+./reset_rag.sh --dry-run   # only list what would be deleted
+./reset_rag.sh --yes       # no confirmation prompt
+./reset_rag.sh --settings  # also delete app_settings.json and corpus_settings.json
+```
+
+**Deleted** from `llmware_data/`: `accounts/` (SQLite text index and library folders), `lancedb/` (vector tables), `tmp/`, `parser_history/`, `query_history/`, `prompt_history/` and `job_status.json`.
+
+**Kept:** downloaded models (`llmware_data/model_repo/` and `~/.cache/huggingface`), the `venv`, your source notes, and — unless you pass `--settings` — your corpus root, GPU toggle, corpus prompts and per-corpus embedding choices.
+
+Notes:
+
+- Quit the app first; the script refuses to run while `streamlit run UI-semantic-search.py` is active (`--dry-run` works either way).
+- It leaves empty `accounts/` and `lancedb/` folders so the app does not re-copy old data from the legacy `~/llmware_data/` on next start.
+- Afterwards start the app with `./start_app.sh`; the [Getting started guide](#getting-started-guide) opens so you can re-index.
