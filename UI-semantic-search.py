@@ -7625,6 +7625,13 @@ with filter_box_col:
                         placeholder="Type a term, press Enter",
                         label_visibility="collapsed",
                     )
+        if not exact_text_only:  # a second Find under the terms, for after narrowing
+            find_clicked = st.button(
+                "🔎 Find notes",
+                key="find_notes_button_below",
+                use_container_width=True,
+                help="Same as **Find notes** above: lists the notes about what's in **Find notes about**, within these terms.",
+            ) or find_clicked
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
         if "max_results" not in st.session_state:  # saved between searches and sessions
             st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
