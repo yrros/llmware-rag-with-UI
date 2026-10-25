@@ -3287,28 +3287,43 @@ def persist_follow_up_model(safe_lib: str) -> None:
 
 def render_copy_button(text: str, label: str = "Copy") -> None:
     """Small button that copies `text` to the clipboard (component iframes may write to it)."""
-    payload = json.dumps(text).replace("</", "<\\/")
+    render_copy_buttons([(label, text)])
+
+
+def render_copy_buttons(buttons: list[tuple[str, str]]) -> None:
+    """A row of small copy buttons, one per (label, text), in a single component iframe."""
+    buttons = [(label, text) for label, text in buttons if text and text.strip()]
+    if not buttons:
+        return
+    payload = json.dumps([text for _label, text in buttons]).replace("</", "<\\/")
+    labels = json.dumps([label for label, _text in buttons]).replace("</", "<\\/")
     components.html(
         f"""
-<button id="copy" style="font:12px -apple-system,BlinkMacSystemFont,sans-serif;color:#888;
-  background:transparent;border:1px solid rgba(136,136,136,.45);border-radius:6px;
-  padding:2px 10px;cursor:pointer">📋 {label}</button>
+<div id="row" style="display:flex;gap:6px"></div>
 <script>
-const text = {payload};
-const button = document.getElementById("copy");
-button.addEventListener("click", async () => {{
-  try {{
-    await navigator.clipboard.writeText(text);
-  }} catch (err) {{
-    const area = document.createElement("textarea");
-    area.value = text;
-    document.body.appendChild(area);
-    area.select();
-    document.execCommand("copy");
-    area.remove();
-  }}
-  button.textContent = "✓ Copied";
-  setTimeout(() => (button.textContent = "📋 {label}"), 1500);
+const texts = {payload};
+const labels = {labels};
+const row = document.getElementById("row");
+labels.forEach((label, i) => {{
+  const button = document.createElement("button");
+  button.style.cssText = "font:12px -apple-system,BlinkMacSystemFont,sans-serif;color:#888;" +
+    "background:transparent;border:1px solid rgba(136,136,136,.45);border-radius:6px;padding:2px 10px;cursor:pointer";
+  button.textContent = "📋 " + label;
+  button.addEventListener("click", async () => {{
+    try {{
+      await navigator.clipboard.writeText(texts[i]);
+    }} catch (err) {{
+      const area = document.createElement("textarea");
+      area.value = texts[i];
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }}
+    button.textContent = "✓ Copied";
+    setTimeout(() => (button.textContent = "📋 " + label), 1500);
+  }});
+  row.appendChild(button);
 }});
 </script>
 """,
@@ -3429,6 +3444,9 @@ def render_follow_up_discussion(
     notes = "the notes in this search" if in_use == total else f"{in_use} of {total} notes from this search"
     caption = f"Follow-ups are answered from {notes} using `{model_name}`"
     st.caption(caption + describe_prompt_parts(search_state))
+    # The task the model was given (for an Agent: its collection prompt plus how to list and where it's
+    # heading), ready to paste into a flow or a test.
+    render_copy_buttons([("Copy task prompt", search_state.get("task_prompt", ""))])
 
     view_col, popout_col = st.columns(2)
     with view_col:
@@ -3475,8 +3493,12 @@ def render_discussion_body(
                 st.markdown(turn["content"])
                 if turn.get("model"):
                     st.caption(f"`{turn['model']}`")
-                if turn["role"] == "assistant":
-                    render_copy_button(turn["content"])
+                # Every turn can be copied. When the model was sent more than is shown (a step's prompt, or
+                # Needs work with the rejected list), that full prompt can be copied too, to reuse in flows.
+                buttons = [("Copy", turn["content"])]
+                if turn.get("prompt") and turn["prompt"] != turn["content"]:
+                    buttons.append(("Copy prompt sent", turn["prompt"]))
+                render_copy_buttons(buttons)
 
     with st.container(border=True):
         # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
@@ -3896,7 +3918,11 @@ def render_search_results(
         if search_state["answer"]:
             st.subheader("Answer")
             st.markdown(search_state["answer"])
-            render_copy_button(search_state["answer"], "Copy answer")
+            render_copy_buttons([
+                ("Copy answer", search_state["answer"]),
+                ("Copy question", search_state.get("question", "")),
+                ("Copy task prompt", search_state.get("task_prompt", "")),
+            ])
 
             cited_paths = list(dict.fromkeys(path for _file, path in source_notes if path))
             if cited_paths:
