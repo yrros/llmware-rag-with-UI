@@ -11,6 +11,7 @@ import datetime
 import uuid
 from contextlib import contextmanager
 from functools import lru_cache
+from urllib.parse import quote_plus, urlparse
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
@@ -1365,6 +1366,7 @@ def load_prompt_library() -> dict:
             library = {}
         library.setdefault("profile", {"text": "", "enabled": True})
         library.setdefault("prompts", [])
+        library.setdefault("links", [])  # common links: [{"id", "title", "url"}]; prompts pick theirs by id
         for prompt in library["prompts"]:
             # Libraries saved before Agent existed: prompts that already drafted output become Agents.
             prompt.setdefault("agent", prompt.get("output", "text") in DRAFT_OUTPUT_TYPES and not prompt.get("global"))
@@ -1372,6 +1374,7 @@ def load_prompt_library() -> dict:
             prompt.setdefault("steps", [])
             prompt.setdefault("command", DEFAULT_AGENT_COMMANDS.get(prompt.get("output", ""), ""))
             prompt.setdefault("model", "")
+            prompt.setdefault("links", [])
         return library
     return save_prompt_library(
         {
@@ -1592,6 +1595,104 @@ def build_agent_task_prompt(prompt: dict) -> str:
         f"({OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()}). Ask me the questions you need answered "
         "to do that well, and don't guess anything the notes don't say."
     )
+
+
+# --- Common links: attached to prompts, shown under the question while a prompt is injected -------------
+
+BEST_GUESS = "{best_guess}"  # in a link's address: replaced by the app's best guess at what you're looking for
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+GUESS_STOPWORDS = {
+    "I", "A", "An", "The", "What", "Who", "Whom", "When", "Where", "Why", "How", "Which", "Can", "Could", "Would",
+    "Should", "Do", "Does", "Did", "Is", "Are", "Was", "Were", "Please", "List", "Show", "Give", "Tell", "Find",
+}
+CAPITALISED_WORDS = re.compile(r"\b[A-Z][\w&'.-]*(?:\s+[A-Z][\w&'.-]*)*")
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def local_service_up(url: str) -> bool:
+    """Whether something answers at a localhost address (checked at most every 15 seconds)."""
+    import requests
+
+    try:
+        requests.get(url, timeout=0.5)
+        return True
+    except requests.RequestException:
+        return False
+
+
+def link_status_dot(url: str) -> str:
+    """🟢 / 🔴 for links to this computer, nothing for anything else."""
+    if urlparse(url).hostname not in LOCAL_HOSTS:
+        return ""
+    return "🟢 " if local_service_up(url.replace(BEST_GUESS, "")) else "🔴 "
+
+
+def best_guess(question: str, search_filter: dict | None, search_state: dict | None) -> str:
+    """What the user is probably looking for, for best guess search links (no LLM involved).
+
+    In order: the Related to names of the Agent's staged or sent records, the first Must include filter
+    term, then capitalised names in the question (skipping the question's first word when there's another).
+    """
+    agent = (search_state or {}).get("agent") or {}
+    for batch in [agent.get("staged"), *reversed(agent.get("sent") or [])]:
+        for item in (batch or {}).get("items", []):
+            name = str((item.get("related_to") or {}).get("name", "")).strip()
+            if name:
+                return name
+    must_include = (search_filter or {}).get("all") or []
+    if must_include:
+        return str(must_include[0])
+    candidates = []
+    for match in CAPITALISED_WORDS.finditer(question or ""):
+        words = [w.strip(".,;:!?") for w in match.group().split() if w.strip(".,;:!?") not in GUESS_STOPWORDS]
+        if words:
+            starts_sentence = match.start() == 0 or (question or "")[: match.start()].rstrip()[-1:] in ".?!"
+            candidates.append((starts_sentence, " ".join(words)))
+    later = [text for starts_sentence, text in candidates if not starts_sentence]
+    return (later or [text for _, text in candidates] or [""])[0]
+
+
+def render_prompt_links(prompt: dict | None, library: dict, guess: str) -> None:
+    """The injected prompt's links, inline, each opening in a new tab."""
+    if not prompt:
+        return
+    by_id = {link["id"]: link for link in library.get("links", [])}
+    parts = []
+    for link_id in prompt.get("links", []):
+        link = by_id.get(link_id)
+        if not link or not link.get("url"):
+            continue
+        title, url = link.get("title") or link["url"], link["url"]
+        if BEST_GUESS in url:
+            url = url.replace(BEST_GUESS, quote_plus(guess))
+            title = f"{title}: {guess}" if guess else title
+        title = title.replace("[", "\\[").replace("]", "\\]")
+        parts.append(f"{link_status_dot(link['url'])}[{title}]({url.replace(' ', '%20').replace(')', '%29')})")
+    if parts:
+        st.markdown(" · ".join(parts))
+
+
+def update_links(change) -> None:
+    library = load_prompt_library()
+    library["links"] = change(list(library.get("links", [])))
+    save_prompt_library(library)
+
+
+def add_link() -> None:
+    update_links(lambda links: links + [{"id": uuid.uuid4().hex[:8], "title": "", "url": ""}])
+
+
+def delete_link(link_id: str) -> None:
+    library = load_prompt_library()
+    library["links"] = [link for link in library.get("links", []) if link["id"] != link_id]
+    for prompt in library["prompts"]:
+        prompt["links"] = [i for i in prompt.get("links", []) if i != link_id]
+    save_prompt_library(library)
+
+
+def save_link_field(link_id: str, field: str) -> None:
+    value = str(st.session_state.get(f"link_{field}_{link_id}", "")).strip()
+    update_links(lambda links: [{**link, field: value} if link["id"] == link_id else link for link in links])
 
 
 TITLE_MARKER_POSITIONS = {"prefix": "Before the title", "suffix": "After the title"}
@@ -2193,6 +2294,8 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
         value = value if value in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
     elif field == "model":
         value = str(value or "")
+    elif field == "links":
+        value = [str(link_id) for link_id in (value or [])]
     else:
         value = str(value or "").strip()
         if not value:
@@ -2365,7 +2468,7 @@ def render_agent_workflow_editor(prompt: dict) -> None:
     )
 
 
-def render_prompt_card(prompt: dict, model_options: list[str]) -> None:
+def render_prompt_card(prompt: dict, model_options: list[str], links: list[dict] = ()) -> None:
     prompt_id = prompt["id"]
     agent = is_agent_prompt(prompt)
     # The key gives the card a CSS class; Agent cards get a blue border (see render_prompt_library_page).
@@ -2477,6 +2580,21 @@ def render_prompt_card(prompt: dict, model_options: list[str]) -> None:
                 placeholder="Add a tag, press Enter",
                 label_visibility="collapsed",
             )
+        if links:
+            titles = {link["id"]: link["title"] for link in links}
+            st.multiselect(
+                "Links",
+                options=list(titles),
+                default=[link_id for link_id in prompt.get("links", []) if link_id in titles],
+                format_func=lambda link_id: f"🔗 {titles.get(link_id, link_id)}",
+                key=f"prompt_links_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "links"),
+                placeholder="Links to show when this prompt is used",
+                label_visibility="collapsed",
+                help="Shown as links under the question in the Ask box while this prompt is injected. "
+                "Add links in **Common links** at the top of this page.",
+            )
         if agent:
             render_agent_workflow_editor(prompt)
         if prompt.get("last_used"):
@@ -2493,6 +2611,44 @@ def render_prompt_library_page() -> None:
         "Shape what the LLM is told when it answers from your notes. Each request is built in this order: "
         "today's date → About me → corpus prompt → global prompts → your notes and question → the task you pick."
     )
+
+    links = library.get("links", [])
+    with st.expander(f"Common links · {len(links)}", expanded=False, key="prompt_page_links_open",
+                     icon=":material/link:"):
+        st.caption(
+            "Links you attach to prompts with **Links** on each prompt card. While that prompt is injected they "
+            "show under the question in the Ask box and open in a new tab. **Keep titles to a word or two** "
+            "(e.g. *SF Tasks*): they sit inline. Put `{best_guess}` in an address for a **best guess search**: "
+            "it's replaced by the app's best guess at what you're looking for (the Agent's *Related to* names, "
+            "else the first **Must include** filter term, else names in your question). Links to this computer "
+            "(localhost) show 🟢 when the service is running and 🔴 when it isn't."
+        )
+        for link in links:
+            with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+                st.text_input(
+                    "Title",
+                    value=link.get("title", ""),
+                    key=f"link_title_{link['id']}",
+                    on_change=save_link_field,
+                    args=(link["id"], "title"),
+                    max_chars=24,
+                    width=170,
+                    placeholder="SF Tasks",
+                    help="A word or two. It's shown inline under the question.",
+                )
+                st.text_input(
+                    "Address",
+                    value=link.get("url", ""),
+                    key=f"link_url_{link['id']}",
+                    on_change=save_link_field,
+                    args=(link["id"], "url"),
+                    placeholder="https://…  (may include {best_guess})",
+                )
+                st.markdown(link_status_dot(link.get("url", "")).strip() or " ", width="content",
+                            help="🟢 running · 🔴 not running (local links only)")
+                st.button(":material/close:", key=f"link_delete_{link['id']}", type="tertiary",
+                          on_click=delete_link, args=(link["id"],), help="Remove this link, from every prompt too")
+        st.button("Add link", icon=":material/add:", key="link_add", on_click=add_link)
 
     outbox = get_outbox_dir()
     waiting = len(pending_outbox_files(outbox))
@@ -2658,7 +2814,7 @@ def render_prompt_library_page() -> None:
             st.caption("No prompts match." if library["prompts"] else "No prompts yet — add one below.")
         model_options = prompt_model_options()
         for prompt in shown:
-            render_prompt_card(prompt, model_options)
+            render_prompt_card(prompt, model_options, library.get("links", []))
 
     with st.container(border=True):
         st.subheader("Add a prompt")
@@ -6597,6 +6753,13 @@ with ask_box_col:
             key="question_text",
             on_change=persist_question,
             help="Saved locally and restored when the page is reloaded.",
+        )
+        # The injected prompt's links (e.g. Salesforce, the connector app), between the question and its token.
+        last_search_state = st.session_state.get(LAST_SEARCH_KEY)
+        render_prompt_links(
+            resolve_run_prompts(prompt_library, corpus_config)["task"],
+            prompt_library,
+            best_guess(prompt_text, search_filter, last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
         )
         render_injected_prompt_token(prompt_library)
         # Top to bottom: question → Answer with LLM → prompt library → model details → cutoff → Search → progress.

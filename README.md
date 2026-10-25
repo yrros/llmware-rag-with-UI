@@ -264,7 +264,7 @@ Results appear under **Sources** as one dropdown per document (documents with se
 
 ### Answer with LLM
 
-The Ask box reads top to bottom: your question → **Answer with LLM** → **Prompt library** → **Ollama model details** → **Search** (with **Max results**) → progress. Search settings, including **Distance cutoff**, are in the Filter box's **Advanced search settings**.
+The Ask box reads top to bottom: your question → the injected prompt's **links** (if it has any) → **Answer with LLM** → **Prompt library** → **Ollama model details** → **Search** (with **Max results**) → progress. Search settings, including **Distance cutoff**, are in the Filter box's **Advanced search settings**.
 
 - **Answer with LLM** is enabled by default.
 - **Prompt library** — see [Prompt library](#prompt-library) below.
@@ -281,7 +281,8 @@ Open it with the **Prompt library** button in the left panel (hover it for a sum
 
 | Section | What it does |
 |---------|--------------|
-| **Outbox** | Collapsed at the top. The folder that sent drafts are written to, and how many packages are waiting, processed and failed. See [Agents and the outbox](#agents-and-the-outbox). |
+| **Common links** | Folded, at the very top. Short-titled links (e.g. *SF Tasks*, *Connector*) that you attach to prompts with each card's **Links** selector. While a prompt is injected, its links show as hyperlinks between the question and the prompt token, opening in a new tab. Links to this computer (localhost) show 🟢 when the service answers and 🔴 when it doesn't (checked at most every 15 seconds). **Best guess search:** put `{best_guess}` in an address (e.g. a Salesforce search URL) and it's replaced with the app's best guess at what you're looking for, shown in the link text too (*Find in SF: Acme*): the Agent's staged or sent *Related to* names, else the first **Must include** filter term, else capitalised names in your question. Stored in `prompt_library.json`. |
+| **Outbox** | Collapsed near the top. The folder that sent drafts are written to, and how many packages are waiting, processed and failed. See [Agents and the outbox](#agents-and-the-outbox). |
 | **Task title marker** | Text added **before** or **after** the title of everything an Agent stages (task subjects, note titles, email subjects), e.g. `RAG_TEST:` or `[AI]`, so those records are easy to find later. Applied when the Agent stages, so you see it before **That's right**; titles that already contain it are left alone. Empty means off. |
 | **About me** | One free-text box sent with every LLM request in every corpus — your name, where you're based, accessibility needs, how you like answers. Untick **Include in LLM requests** to switch it off. Today's date is always added. |
 | **Corpus prompt** | Pick a corpus and describe the role you wrote its notes in (e.g. business owner, salesperson). Tick **Apply corpus prompt** to send it for that corpus only. |
