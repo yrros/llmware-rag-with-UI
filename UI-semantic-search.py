@@ -1684,8 +1684,13 @@ def latest_receipt_time(folder: Path) -> datetime.datetime | None:
     return max(times) if times else None
 
 
-def render_outbox_status() -> None:
-    """One line at the top of every page: what's waiting in the outbox and when a connector last processed it."""
+def format_when(when: datetime.datetime | None) -> str:
+    return when.strftime("%d %b %H:%M") if when else "never"
+
+
+def render_outbox_status(link: bool = True) -> None:
+    """One line at the top of every page: what's waiting in the outbox, what needs attention, and when a
+    connector last processed it, with a link to the Actions page."""
     outbox = get_outbox_dir()
     waiting = pending_outbox_files(outbox)
     items = 0
@@ -1694,19 +1699,173 @@ def render_outbox_status() -> None:
             items += len(json.loads(path.read_text()).get("items", []))
         except (OSError, ValueError, AttributeError):
             pass
-
-    def last(folder: str) -> str:
-        when = latest_receipt_time(outbox / folder)
-        return when.strftime("%d %b %H:%M") if when else "never"
+    attention = len(list((outbox / "failed").glob("*.receipt.json")))
 
     st.caption(
-        f":material/outbox: **Outbox:** {len(waiting)} waiting ({items} item{'' if items == 1 else 's'}) · "
-        f"Last processed {last('processed')} · Last error {last('failed')}",
+        f":material/outbox: **Outbox:** {len(waiting)} waiting ({items} item{'' if items == 1 else 's'})"
+        + (f" · :orange[**{attention} need{'s' if attention == 1 else ''} attention**]" if attention else "")
+        + f" · Last processed {format_when(latest_receipt_time(outbox / 'processed'))}"
+        + f" · Last error {format_when(latest_receipt_time(outbox / 'failed'))}"
+        + (f" · [Open Actions]({ACTIONS_PAGE_URL})" if link else ""),
         help=(
-            f"Folder: `{outbox}`. A connector (e.g. Salesforce) processes what's waiting. "
-            "Errors include items held for you to choose a record."
+            f"Folder: `{outbox}`. A connector (e.g. Salesforce) processes what's waiting. Errors and "
+            "\"need attention\" include items held for you to choose a record. **Open Actions** lists everything."
         ),
     )
+
+
+ACTIONS_PAGE_URL = "?page=actions"
+OUTBOX_STATES = {  # tab order on the Actions page: what needs attention first
+    "failed": ("Needs attention", "Nothing needs attention."),
+    "waiting": ("Waiting", "Nothing is waiting for a connector."),
+    "processed": ("Processed", "Nothing has been processed yet."),
+}
+PACKAGE_STATUS = {
+    "done": ("✅", "done"),
+    "partial": ("⚠️", "partly done"),
+    "needs_review": ("⚠️", "needs review"),
+    "failed": ("❌", "failed"),
+    "waiting": ("⏳", "waiting"),
+    "": ("❔", "no receipt"),
+}
+RECEIPT_ITEM_ICONS = {"created": "✅", "exists": "✅", "needs_match": "⚠️", "invalid": "⚠️", "skipped": "⏭️", "error": "❌"}
+
+
+def load_outbox_entries(outbox: Path) -> dict[str, list[dict]]:
+    """Every package by state ('failed', 'waiting', 'processed'), newest first, with its receipt if it has one."""
+    entries: dict[str, list[dict]] = {state: [] for state in OUTBOX_STATES}
+    files = [("waiting", path) for path in pending_outbox_files(outbox)]
+    for folder in HANDOFF_RESULT_DIRS:
+        files += [
+            (folder, path) for path in (outbox / folder).glob("*.json")
+            if not path.name.startswith(".") and not path.name.endswith(".receipt.json")
+        ]
+    for state, path in files:
+        entry = {"path": path, "package": None, "error": "", "receipt": None}
+        try:
+            entry["package"] = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            entry["error"] = f"This file can't be read as a package: {exc}"
+        if state != "waiting":
+            entry["receipt"] = read_handoff_receipt(outbox / path.name)
+        stamp = (entry["receipt"] or {}).get("processed_at") or (entry["package"] or {}).get("created")
+        try:
+            when = datetime.datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            when = datetime.datetime.fromtimestamp(path.stat().st_mtime)
+        entry["when"] = when if when.tzinfo else when.astimezone()
+        entries[state].append(entry)
+    for group in entries.values():
+        group.sort(key=lambda entry: entry["when"], reverse=True)
+    return entries
+
+
+def outbox_entry_matches(entry: dict, query: str) -> bool:
+    words = query.lower().split()
+    text = json.dumps([entry["package"], entry["receipt"], entry["path"].name, entry["error"]]).lower()
+    return all(word in text for word in words)
+
+
+def render_outbox_entry(entry: dict, state: str) -> None:
+    """One package on the Actions page: what it holds, where it came from, and the connector's result per item."""
+    package = entry["package"] if isinstance(entry["package"], dict) else {}
+    receipt = entry["receipt"] or {}
+    items = [item for item in package.get("items", []) if isinstance(item, dict)]
+    source = package.get("source") or {}
+    prompt_name = (source.get("prompt") or {}).get("name", "")
+    status = "waiting" if state == "waiting" else receipt.get("status", "")
+    icon, status_text = PACKAGE_STATUS.get(status, PACKAGE_STATUS[""])
+    kind = {"note": "note", "task": "task", "email": "email"}.get(package.get("item_type"), "item")
+    label = (
+        f"{icon} {format_when(entry['when'])} · {len(items)} {kind}{'' if len(items) == 1 else 's'}"
+        + (f" · Agent:{prompt_name}" if prompt_name else "")
+        + f" · {status_text}"
+    )
+    with st.expander(label, expanded=state == "failed"):
+        details = [f"File `{entry['path'].name}`"]
+        if package.get("id"):
+            details.append(f"package id `{package['id']}`")
+        if source.get("library"):
+            details.append(f"from **{source['library']}**")
+        if source.get("model"):
+            details.append(f"model `{source['model']}`")
+        st.caption(" · ".join(details))
+        if source.get("question"):
+            st.caption(f"Question: {source['question']}")
+        notes = [note.get("file", "") for note in source.get("notes", []) if isinstance(note, dict)]
+        if notes:
+            st.caption("Source notes: " + ", ".join(f"`{Path(note).name}`" for note in notes))
+
+        if entry["error"] and not receipt.get("error"):  # the connector's receipt usually says the same thing
+            st.error(entry["error"])
+        if receipt:
+            message = (
+                f"**{str(receipt.get('connector', 'Connector')).capitalize()}** ({receipt.get('target', '?')}): "
+                f"{RECEIPT_STATUS_TEXT.get(status, status)}."
+            )
+            if receipt.get("error"):
+                message += f" {receipt['error']}"
+            (st.success if status == "done" else st.warning)(message)
+        elif state == "waiting":
+            st.info("Waiting for a connector to pick this up.")
+        else:
+            st.info("No receipt yet.")
+
+        results = {r.get("index"): r for r in receipt.get("items", []) if isinstance(r, dict)}
+        for index, item in enumerate(items):
+            result = results.get(index) or {}
+            try:
+                line = describe_staged_item(item)
+            except (KeyError, TypeError):
+                line = f"**{staged_item_title(item)}**"
+            st.markdown(f"{RECEIPT_ITEM_ICONS.get(result.get('status'), '⏳' if state == 'waiting' else '')} {line}")
+            notes_line = []
+            if result.get("record_id"):
+                notes_line.append(f"{result.get('object', 'Record')} `{result['record_id']}`")
+            if result.get("message"):
+                notes_line.append(result["message"])
+            candidates = ", ".join(
+                f"{c.get('name', '?')} (`{c.get('id', '?')}`)" for c in result.get("candidates", []) if isinstance(c, dict)
+            )
+            if candidates:
+                notes_line.append(f"Possible matches: {candidates}")
+            if notes_line:
+                st.caption(" · ".join(notes_line))
+        if state == "failed":
+            st.caption(
+                "Fix this in the connector (for example, choose the record it should use), then have it retry. "
+                "It moves the package on, and this page updates."
+            )
+
+
+def render_actions_page() -> None:
+    """Actions page (?page=actions): everything Agents sent to the outbox and what the connector did with it."""
+    render_outbox_status(link=False)
+    st.title("Actions")
+    outbox = get_outbox_dir()
+    st.caption(
+        f"Everything Agents have sent to the outbox (`{outbox}`) and what the connector did with it. "
+        "This page only reads the outbox."
+    )
+    entries = load_outbox_entries(outbox)
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        query = st.text_input(
+            "Filter",
+            key="actions_query",
+            placeholder="Search subjects, titles, prompts, owners and messages",
+            icon=":material/search:",
+        )
+        st.button("Refresh", icon=":material/refresh:", key="actions_refresh")
+    tabs = st.tabs([f"{OUTBOX_STATES[state][0]} ({len(entries[state])})" for state in OUTBOX_STATES])
+    for tab, state in zip(tabs, OUTBOX_STATES):
+        with tab:
+            shown = [entry for entry in entries[state] if outbox_entry_matches(entry, query)]
+            if query.strip() and entries[state]:
+                st.caption(f"{len(shown)} of {len(entries[state])} match.")
+            if not shown:
+                st.caption(OUTBOX_STATES[state][1] if not entries[state] else "Nothing matches the filter.")
+            for entry in shown:
+                render_outbox_entry(entry, state)
 
 
 PROMPT_LIBRARY_PAGE_URL = "?page=prompts"
@@ -5283,6 +5442,9 @@ st.set_page_config(page_title="RAG Workspace Manager", layout="wide")
 get_text_rescan_scheduler()
 if st.query_params.get("page") == "prompts":
     render_prompt_library_page()
+    st.stop()
+if st.query_params.get("page") == "actions":
+    render_actions_page()
     st.stop()
 
 render_outbox_status()
