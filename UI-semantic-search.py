@@ -108,6 +108,8 @@ LLM_CONTEXT_MAX_CHARS = 12000
 FOLLOW_UP_NUM_CTX = 8192
 DISCUSSION_HEIGHT = 520
 DISCUSSION_EXPANDED_HEIGHT = 1100
+FOLLOW_UP_BOX_HEIGHT = 90
+FOLLOW_UP_BOX_EXPANDED_HEIGHT = 320
 LAST_SEARCH_KEY = "last_search"
 CORPUS_SETTINGS_PATH = APP_DATA_DIR / "corpus_settings.json"
 JOB_STATUS_PATH = APP_DATA_DIR / "job_status.json"
@@ -2988,13 +2990,24 @@ def render_discussion_body(
                 if turn["role"] == "assistant":
                     render_copy_button(turn["content"])
 
-    with st.form(f"{key_prefix}_follow_up_form", clear_on_submit=True):
-        follow_up = st.text_area(
-            "Ask a follow-up",
-            height=90,
-            placeholder="e.g. Who owns each of those requirements?",
-        )
-        submitted = st.form_submit_button("Send", type="primary", use_container_width=True)
+    with st.container(border=True):
+        # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown("Ask a follow-up", width="stretch")
+            big_box = st.toggle(
+                "Expand",
+                key=f"{key_prefix}_follow_up_expanded",
+                help="Make the follow-up box bigger for longer replies.",
+            )
+        with st.form(f"{key_prefix}_follow_up_form", clear_on_submit=True, border=False):
+            follow_up = st.text_area(
+                "Ask a follow-up",
+                key=f"{key_prefix}_follow_up_text",  # a fixed key keeps typed text when the box resizes
+                height=FOLLOW_UP_BOX_EXPANDED_HEIGHT if big_box else FOLLOW_UP_BOX_HEIGHT,
+                placeholder="e.g. Who owns each of those requirements?",
+                label_visibility="collapsed",
+            )
+            submitted = st.form_submit_button("Send", type="primary", use_container_width=True)
 
     # Inside the pop-out, rerun only the dialog so it stays open.
     rerun_scope = "fragment" if in_dialog else "app"
