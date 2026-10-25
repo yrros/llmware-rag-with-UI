@@ -3555,6 +3555,14 @@ def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
     return parts
 
 
+# The Recent and Starred prompt buttons, about a quarter smaller than a normal button; the text keeps its size.
+PROMPT_CHIP_STYLE = """<style>
+[class*="st-key-use_prompt_"] button, [class*="st-key-use_agent_prompt_"] button {
+  min-height: 1.875rem !important; padding: 0.05rem 0.55rem !important;
+}
+</style>"""
+
+
 def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
     """Compact 'Prompt library' box in the Ask panel: always-included prompts, task, recent and starred."""
     profile = library["profile"]
@@ -3566,6 +3574,7 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
     active_ids = {task["id"] for task in active}
     add_agent_border_style("[class*='st-key-use_agent_prompt_'] button", "[class*='st-key-active_agent_task']")
     st.html("<style>[class*='st-key-active_agent_task'] { padding: 0.1rem 0.25rem 0.1rem 0.75rem !important; }</style>")
+    st.html(PROMPT_CHIP_STYLE)
 
     with st.container(border=True, gap="xsmall"):
         with st.container(horizontal=True, vertical_alignment="center"):
