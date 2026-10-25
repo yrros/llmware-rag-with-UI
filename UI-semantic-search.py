@@ -892,6 +892,18 @@ def apply_quick_date(kind: str, field: str) -> None:
 
 
 QUICK_SEARCH_TERM_SLOTS = 5
+# Filter fields as small rounded boxes, and their quick dates and quick terms as rounded chips.
+FILTER_FIELD_STYLE = """<style>
+[class*="st-key-filter_field_"] { padding: 0.45rem 0.7rem 0.6rem !important; border-radius: 0.75rem !important; }
+[class*="st-key-quick_date_"] button, [class*="st-key-quick_term_"] button {
+  border: 1px solid color-mix(in srgb, currentColor 28%, transparent) !important;
+  border-radius: 999px !important; padding: 0 0.45rem !important; min-height: 1.5rem !important;
+}
+[class*="st-key-quick_date_"] button p, [class*="st-key-quick_term_"] button p { font-size: 0.8rem; }
+[class*="st-key-quick_date_"] button:hover, [class*="st-key-quick_term_"] button:hover {
+  border-color: currentColor !important;
+}
+</style>"""
 
 
 def quick_search_terms() -> list[str]:
@@ -951,11 +963,12 @@ def render_filter_heading(field: str, label: str, field_help: str) -> None:
 
 
 def clear_search_filter() -> None:
-    """Clear Filter button: empty every filter field and drop note exclusions."""
+    """Clear Filter button: empty every filter field and drop note exclusions and found notes."""
     for field in SEARCH_FILTER_FIELDS:
         st.session_state[f"filter_{field}"] = []
     save_app_settings({"search_filter": {field: [] for field in SEARCH_FILTER_FIELDS}})
     clear_excluded_notes()
+    clear_found_notes()
 
 
 def switch_to_library(library: str) -> None:
@@ -6677,6 +6690,10 @@ def build_note_filter_sql(search_filter: dict) -> tuple[str, list]:
         clauses.append("(" + " OR ".join(matches(term) for term in any_terms) + ")")
     for term in search_filter.get("none", []):
         clauses.append(f"NOT {matches(term)}")
+    included = search_filter.get("include_sources")
+    if included is not None:  # Search after Find notes: only the notes found
+        clauses.append(f"file_source IN ({', '.join('?' for _ in included)})" if included else "0")
+        params += list(included)
     excluded = search_filter.get("exclude_sources") or []
     if excluded:
         clauses.append(f"file_source NOT IN ({', '.join('?' for _ in excluded)})")
@@ -6884,7 +6901,7 @@ def filtered_semantic_search(
             )
         ]
     if not rowids:
-        return [], f"No notes match the filter {describe_search_filter(search_filter)}."
+        return [], f"No notes match {describe_search_filter(search_filter) or 'among the notes you found and kept'}."
 
     q.load_embedding_model()
     query_vector = np.asarray(q.embedding_model.embedding(prompt_text), dtype=float).reshape(-1)
@@ -6932,6 +6949,38 @@ def filtered_semantic_search(
     )
 
 
+FOUND_NOTES_KEY = "found_notes"  # {"library", "query", "sources"} from the Semantic route's Find notes
+
+
+def find_notes(
+    search_lib: Library,
+    query: str,
+    search_filter: dict,
+    embedding_model: str,
+    max_notes: int,
+    distance_threshold: float,
+) -> tuple[list, str, float | None]:
+    """Semantic route's Find notes: the passages of up to `max_notes` notes closest in meaning to `query`."""
+    passages, notice, nearest = perform_search(
+        search_lib, query, search_filter, embedding_model, max_notes * 4, distance_threshold
+    )
+    notes: list[str] = []
+    for passage in passages:  # closest first
+        source = str(passage.get("file_source", ""))
+        if source not in notes and len(notes) < max_notes:
+            notes.append(source)
+    return [p for p in passages if str(p.get("file_source", "")) in notes], notice, nearest
+
+
+def found_notes(safe_lib: str) -> dict | None:
+    found = st.session_state.get(FOUND_NOTES_KEY)
+    return found if found and found["library"] == safe_lib else None
+
+
+def clear_found_notes() -> None:
+    st.session_state.pop(FOUND_NOTES_KEY, None)
+
+
 def perform_search(
     search_lib: Library,
     prompt_text: str,
@@ -6950,7 +6999,7 @@ def perform_search(
         vector_db=VECTOR_DB,
     )
 
-    if is_filter_active(search_filter):
+    if is_filter_active(search_filter) or search_filter.get("include_sources") is not None:
         results, notice = filtered_semantic_search(
             q,
             search_lib.library_name,
@@ -7501,32 +7550,34 @@ with filter_box_col:
                 "Notes containing **any** of these terms are left out.",
             ),
         }
+        st.html(FILTER_FIELD_STYLE)
         for field, (label, field_help) in FILTER_WIDGETS.items():
             _key = f"filter_{field}"
             if _key not in st.session_state:
                 st.session_state[_key] = clean_filter_terms(_saved_filter.get(field, []))
                 # Dates restored from the last session count as left over from an earlier search.
                 st.session_state[f"searched_dates_{field}"] = date_terms(st.session_state[_key])
-            # The heading carries the field's help and its quick date buttons, on one line.
-            render_filter_heading(field, label, (
-                f"{field_help}\n\n"
-                "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
-                "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
-                + (
-                    "On the **Literal** route, **Search** returns the matching notes in full."
-                    if exact_text_only
-                    else "On the **Semantic** route, passages are ranked **only within** the matching notes."
+            # Each field is one small box: heading and quick dates, quick terms, then the terms themselves.
+            with st.container(border=True, gap="xsmall", key=f"filter_field_{field}"):
+                render_filter_heading(field, label, (
+                    f"{field_help}\n\n"
+                    "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
+                    "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
+                    + (
+                        "On the **Literal** route, **Search** returns the matching notes in full."
+                        if exact_text_only
+                        else "On the **Semantic** route, passages are ranked **only within** the matching notes."
+                    )
+                ))
+                st.multiselect(
+                    label,
+                    options=st.session_state[_key],
+                    key=_key,
+                    accept_new_options=True,
+                    on_change=persist_search_filter,
+                    placeholder="Type a term, press Enter",
+                    label_visibility="collapsed",
                 )
-            ))
-            st.multiselect(
-                label,
-                options=st.session_state[_key],
-                key=_key,
-                accept_new_options=True,
-                on_change=persist_search_filter,
-                placeholder="Type a term, press Enter",
-                label_visibility="collapsed",
-            )
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
         if "max_results" not in st.session_state:  # saved between searches and sessions
             st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
@@ -7570,6 +7621,7 @@ with filter_box_col:
                         ),
                     )
                 with filter_btn_col:
+                    find_clicked = False  # Find notes is the Semantic route's
                     filter_only_clicked = st.button(
                         "🔎 Filter search only",
                         help=(
@@ -7636,6 +7688,39 @@ with filter_box_col:
                 )
                 distance_threshold = float(st.session_state[_cutoff_key])
                 distance_map_slot = st.container()
+                # Find, then down-select, then ask: list the notes closest in meaning, untick or 🎯 the ones
+                # you want, and Search answers from those. Search on its own still does it all in one go.
+                with st.container(border=True, gap="xsmall", key="find_notes_box"):
+                    find_query = st.text_input(
+                        "Find notes about",
+                        key="find_notes_query",
+                        placeholder="e.g. pilot pricing discussions",
+                        help=(
+                            "Lists the notes closest in meaning to this (within the filter above), without an LLM "
+                            "answer. Exclude 🚫 or keep 🎯 notes in the list, then **Search** answers your "
+                            "question from the notes you kept. **Max results** is the number of notes."
+                        ),
+                    )
+                    find_clicked = st.button(
+                        "🔎 Find notes",
+                        key="find_notes_button",
+                        use_container_width=True,
+                    )
+                    if found := found_notes(safe_lib):
+                        kept = [s for s in found["sources"] if s not in get_excluded_notes(safe_lib)]
+                        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                            st.caption(
+                                f"Found {len(found['sources'])} note(s) about *{found['query']}* · "
+                                f"**Search** asks within the {len(kept)} you kept.",
+                                width="stretch",
+                            )
+                            st.button(
+                                ":material/close:",
+                                key="clear_found_notes",
+                                type="tertiary",
+                                on_click=clear_found_notes,
+                                help="Forget the found notes: **Search** looks through the whole library again.",
+                            )
 
     # Filter-only results are listed here, under the Filter box.
     filter_results_slot = st.container()
@@ -7756,7 +7841,8 @@ with ask_box_col:
             + (
                 "**Literal**: answers your question from the notes matching the filter terms, sent in full."
                 if exact_text_only
-                else "**Semantic**, by meaning."
+                else "**Semantic**: passages ranked by meaning"
+                + (" within the notes you found and kept." if found_notes(safe_lib) else ".")
             )
             + f" Returns at most {result_limit} results (**Max results**, in the Filter box).",
         )
@@ -7768,7 +7854,8 @@ with ask_box_col:
 
 run_prompts = resolve_run_prompts(prompt_library, corpus_config)
 
-new_search = search_clicked or filter_only_clicked
+new_search = search_clicked or filter_only_clicked or find_clicked
+listing = filter_only_clicked or find_clicked  # notes listed to down-select, no LLM answer
 if new_search:
     # Also save on Search, in case the box was not left before clicking.
     persist_question()
@@ -7780,9 +7867,14 @@ if new_search:
     # A new search replaces the previous results and discussion.
     st.session_state.pop(LAST_SEARCH_KEY, None)
 
+_found = None if exact_text_only else found_notes(safe_lib)
 if new_search and run_filter_only and not has_positive_filter_terms(search_filter):
     st.warning("Add at least one **Must include** or **Any of** term to filter notes.")
-elif new_search and (prompt_text or run_filter_only):
+elif find_clicked and not find_query.strip():
+    st.warning("Type what the notes are about in **Find notes about** first.")
+elif search_clicked and _found and not set(_found["sources"]) - set(get_excluded_notes(safe_lib)):
+    st.warning("Every found note is excluded: keep at least one, or clear the found notes (**×**) to search them all.")
+elif new_search and (prompt_text or run_filter_only or find_clicked):
     final_results = None
     notice = ""
     nearest_distance = None
@@ -7827,14 +7919,33 @@ elif new_search and (prompt_text or run_filter_only):
                         emb_ready, emb_message = is_embedding_ready(search_lib, selected_embedding_model)
                 if not emb_ready:
                     st.error(f"Semantic index not ready: {emb_message}")
+                elif find_clicked:
+                    with search_progress_slot.container(), st.spinner("Finding notes…", show_time=True):
+                        # Excluded notes are listed too, so they can be un-ticked.
+                        final_results, notice, nearest_distance = find_notes(
+                            search_lib,
+                            find_query.strip(),
+                            with_path_matches(search_filter, safe_lib, library_folder, corpus_root_path),
+                            selected_embedding_model,
+                            result_limit,
+                            distance_threshold,
+                        )
+                    st.session_state[FOUND_NOTES_KEY] = {
+                        "library": safe_lib,
+                        "query": find_query.strip(),
+                        "sources": list(dict.fromkeys(str(r.get("file_source", "")) for r in final_results)),
+                    }
+                    if not final_results:
+                        notice = notice or f"No notes found about *{find_query.strip()}*."
                 else:
+                    run_filter = with_exclusions(search_filter, safe_lib)
+                    if found := found_notes(safe_lib):
+                        run_filter["include_sources"] = found["sources"]
                     with search_progress_slot.container(), st.spinner("Searching…", show_time=True):
                         final_results, notice, nearest_distance = perform_search(
                             search_lib,
                             prompt_text,
-                            with_path_matches(
-                                with_exclusions(search_filter, safe_lib), safe_lib, library_folder, corpus_root_path
-                            ),
+                            with_path_matches(run_filter, safe_lib, library_folder, corpus_root_path),
                             selected_embedding_model,
                             result_limit,
                             distance_threshold,
@@ -7847,10 +7958,10 @@ elif new_search and (prompt_text or run_filter_only):
             tasks = run_prompts["tasks"]
             agents = [task for task in tasks if is_agent_prompt(task)]
             search_state = {
-                "filter_only": filter_only_clicked,
+                "filter_only": listing,
                 "library": state_library,
                 "results": final_results,
-                "question": "" if filter_only_clicked else prompt_text,
+                "question": "" if listing else prompt_text,
                 "notice": notice,
                 "distances": [
                     float(result["distance"])
@@ -7889,7 +8000,7 @@ elif new_search and (prompt_text or run_filter_only):
             }
             # A chosen task can drive the answer on its own, e.g. after an exact-text search.
             if final_results and use_llm_answer and (
-                search_state["question"] or (tasks and not filter_only_clicked)
+                search_state["question"] or (tasks and not listing)
             ):
                 with llm_progress(search_progress_slot, f"Generating answer with `{selected_ollama_model}`…") as report:
                     try:
@@ -7912,7 +8023,7 @@ elif new_search and (prompt_text or run_filter_only):
                 search_progress_slot.caption(describe_llm_speed(selected_ollama_model))
             st.session_state[LAST_SEARCH_KEY] = search_state
 
-            if final_results and use_llm_answer and not filter_only_clicked:
+            if final_results and use_llm_answer and not listing:
                 tuning = {"llm_max_tokens": llm_max_tokens, "llm_temperature": llm_temperature}
                 # A model picked by the prompt is for that prompt; don't make it the corpus default.
                 if selected_ollama_model != search_state["prompt_model"]:
