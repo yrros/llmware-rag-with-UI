@@ -3365,6 +3365,7 @@ def render_prompt_library_page() -> None:
             st.success(f"Added **{added}**. Agent prompts get their steps and Action Command on their card above.")
 
     install_filter_commit_on_blur()
+    install_tooltip_hide_on_click()
 
 
 ACTIVE_TASK_PROMPTS_KEY = "active_task_prompt_ids"
@@ -4121,37 +4122,61 @@ if (page.__filterCommitOnBlurVersion !== 2) {
     )
 
 
-def install_quick_date_tooltip_hide() -> None:
-    """Hide a quick date or quick term button's tooltip once it is clicked, until the pointer leaves it.
+def install_tooltip_hide_on_click() -> None:
+    """Show a tooltip only while the pointer is on its element, and hide a button's tooltip once it is clicked.
 
-    Otherwise the tooltip stays up over the filter field while the pointer rests on the button.
+    When a click reruns the app, Streamlit can leave tooltips open for good, even reopening those of buttons
+    clicked earlier (e.g. an Agent prompt's full text over the page). Each tooltip's element points to it with
+    aria-describedby, so a tooltip shows only while the pointer is on that element and it hasn't just been
+    clicked.
     """
     components.html(
         """
 <script>
 const page = window.parent;
-if (page.__quickDateTooltipVersion !== 3) {
-  page.__quickDateTooltipVersion = 3;
-  const style = page.document.createElement("style");
-  style.textContent = 'body.quick-date-clicked > div:has([data-testid="stTooltipContent"])'
-    + ' { visibility: hidden !important; }';
-  page.document.head.appendChild(style);
-  // The button's key class, e.g. "st-key-quick_date_all_today", which stays the same when a rerun redraws it.
-  const buttonOf = (el) => {
-    const box = el instanceof page.Element
-      ? el.closest('[class*="st-key-quick_date_"], [class*="st-key-quick_term_"]') : null;
-    return box ? [...box.classList].find((c) => c.startsWith("st-key-")) : null;
+const doc = page.document;
+if (page.__tooltipTidyVersion !== 3) {
+  page.__tooltipTidyVersion = 3;
+  const style = doc.createElement("style");
+  style.textContent = "body > div.tip-hidden { visibility: hidden !important; }";
+  doc.head.appendChild(style);
+  let tipIds = 0;
+  // An element with a tooltip, named by its widget key class (e.g. "st-key-use_agent_prompt_Recent_…"), which
+  // stays the same when a rerun redraws it, else by an id given to the element.
+  const nameOf = (el) => {
+    const hover = el instanceof page.Element ? el.closest('[data-testid="stTooltipHoverTarget"]') : null;
+    if (!hover) return null;
+    const box = hover.closest('[class*="st-key-"]');
+    const key = box && [...box.classList].find((c) => c.startsWith("st-key-"));
+    return key || (hover.dataset.tipId ||= `tip-${++tipIds}`);
   };
-  let clicked = null;
-  page.document.addEventListener("pointerdown", (event) => {
-    clicked = buttonOf(event.target);
-    if (clicked) page.document.body.classList.add("quick-date-clicked");
+  let pointerAt = null;  // the element under the pointer
+  let clicked = null;  // the name of the element clicked last, until the pointer leaves it
+  const update = () => {
+    for (const layer of doc.body.children) {
+      const tip = layer.tagName === "DIV" ? layer.querySelector('[role="tooltip"][id]') : null;
+      if (!tip || !tip.querySelector('[data-testid="stTooltipContent"]')) {
+        layer.classList.remove("tip-hidden");
+        continue;
+      }
+      const owner = doc.querySelector(`[aria-describedby="${page.CSS.escape(tip.id)}"]`);
+      const show = owner && pointerAt && owner.contains(pointerAt) && nameOf(owner) !== clicked;
+      layer.classList.toggle("tip-hidden", !show);
+    }
+  };
+  new page.MutationObserver(update).observe(doc.body, { childList: true, subtree: true, attributes: true,
+                                                         attributeFilter: ["aria-describedby"] });
+  doc.addEventListener("pointerdown", (event) => {
+    clicked = nameOf(event.target);
+    update();
   }, true);
-  page.document.addEventListener("pointermove", (event) => {
-    if (!clicked) return;
-    if (buttonOf(event.target) === clicked) return;
+  doc.addEventListener("pointermove", (event) => {
+    const before = nameOf(pointerAt);
+    pointerAt = event.target;
+    const now = nameOf(pointerAt);
+    if (now === before) return;
     clicked = null;
-    page.document.body.classList.remove("quick-date-clicked");
+    update();
   }, true);
 }
 </script>
@@ -7425,7 +7450,7 @@ with filter_box_col:
             help="The most passages (Semantic route) or notes (Literal route) a search returns. Saved for next time.",
         )
         install_filter_commit_on_blur()
-        install_quick_date_tooltip_hide()
+        install_tooltip_hide_on_click()
         search_filter = get_search_filter_from_widgets()
         if is_filter_active(search_filter):
             st.caption(f"Filter: {describe_search_filter(search_filter)}")
