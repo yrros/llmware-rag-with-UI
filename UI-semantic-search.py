@@ -3885,6 +3885,44 @@ if (page.__filterCommitOnBlurVersion !== 2) {
     )
 
 
+def install_quick_date_tooltip_hide() -> None:
+    """Hide a quick date button's tooltip once it is clicked, until the pointer leaves that button.
+
+    Otherwise the tooltip stays up over the filter field while the pointer rests on the button.
+    """
+    components.html(
+        """
+<script>
+const page = window.parent;
+if (page.__quickDateTooltipVersion !== 2) {
+  page.__quickDateTooltipVersion = 2;
+  const style = page.document.createElement("style");
+  style.textContent = 'body.quick-date-clicked > div:has([data-testid="stTooltipContent"])'
+    + ' { visibility: hidden !important; }';
+  page.document.head.appendChild(style);
+  // The button's key class, e.g. "st-key-quick_date_all_today", which stays the same when a rerun redraws it.
+  const buttonOf = (el) => {
+    const box = el instanceof page.Element ? el.closest('[class*="st-key-quick_date_"]') : null;
+    return box ? [...box.classList].find((c) => c.startsWith("st-key-")) : null;
+  };
+  let clicked = null;
+  page.document.addEventListener("pointerdown", (event) => {
+    clicked = buttonOf(event.target);
+    if (clicked) page.document.body.classList.add("quick-date-clicked");
+  }, true);
+  page.document.addEventListener("pointermove", (event) => {
+    if (!clicked) return;
+    if (buttonOf(event.target) === clicked) return;
+    clicked = null;
+    page.document.body.classList.remove("quick-date-clicked");
+  }, true);
+}
+</script>
+""",
+        height=0,
+    )
+
+
 QUESTION_LABEL = "What would you like to ask?"
 
 
@@ -7105,6 +7143,7 @@ with filter_box_col:
             help="The most passages (Semantic route) or notes (Literal route) a search returns. Saved for next time.",
         )
         install_filter_commit_on_blur()
+        install_quick_date_tooltip_hide()
         search_filter = get_search_filter_from_widgets()
         if is_filter_active(search_filter):
             st.caption(f"Filter: {describe_search_filter(search_filter)}")
