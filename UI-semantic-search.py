@@ -725,6 +725,10 @@ def saved_search_route() -> str:
     return "literal" if load_app_settings().get("exact_text_only", False) else "semantic"
 
 
+def persist_max_results() -> None:
+    save_app_settings({"max_results": int(st.session_state.get("max_results", 15))})
+
+
 def persist_search_route() -> None:
     route = st.session_state.get("search_route")
     if route is None:  # clicking the selected option again clears it: keep the route instead
@@ -827,6 +831,123 @@ def persist_search_filter() -> None:
     if not is_filter_active(current):
         clear_excluded_notes()
     save_app_settings({"search_filter": current})
+
+
+# Quick date buttons under Must include. Notes carry their date as 2026-10-25, and weekly notes are headed
+# "Week#43"; ISO weeks (Monday to Sunday) and ISO week-years, so 29 Dec 2025 is in 2026 Week#1.
+QUICK_DATE_LABELS = {
+    "today": "Today", "yesterday": "Yesterday", "this_week": "This week", "last_week": "Last week",
+    "this_month": "This month", "last_month": "Last month",
+}
+# Any date-like term, typed or added by a button: 2026-10-25, 2026-10, 2026, 2026/10/25, 2026/10, 25/10/2026,
+# 25-10-2026, Week#43 / Week 43. A quick date button removes the ones left over from the last search.
+QUICK_DATE_TERM = re.compile(
+    r"^(\d{4}([-/]\d{1,2}){0,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4}|week\s*#?\s*\d{1,2})$", re.IGNORECASE
+)
+
+
+def quick_date_terms(kind: str, today: datetime.date, field: str = "all") -> list[str]:
+    """Terms for a quick date button in a filter field, e.g. ["2026-10-25"] or ["2026-10"].
+
+    A week in Must include (AND) is the year plus "Week#43", as weekly notes are headed. In Any of (OR) and
+    Exclude (NOT) a bare year would match or drop every note that year, so a week there is its seven dates.
+    """
+    if kind in ("today", "yesterday"):
+        day = today - datetime.timedelta(days=0 if kind == "today" else 1)
+        return [day.isoformat()]
+    if kind in ("this_month", "last_month"):
+        month_start = today.replace(day=1)
+        month = month_start if kind == "this_month" else (month_start - datetime.timedelta(days=1))
+        return [f"{month:%Y-%m}"]  # matches every 2026-10-DD date in that month
+    day = today - datetime.timedelta(weeks=0 if kind == "this_week" else 1)
+    year, week, weekday = day.isocalendar()
+    if field == "all":
+        return [str(year), f"Week#{week}"]
+    monday = day - datetime.timedelta(days=weekday - 1)
+    return [(monday + datetime.timedelta(days=i)).isoformat() for i in range(7)]
+
+
+def date_terms(terms) -> list[str]:
+    return [str(t) for t in terms if QUICK_DATE_TERM.match(str(t))]
+
+
+def remember_searched_dates() -> None:
+    """Note each field's dates at a search (or as restored at start); later clicks treat them as left over."""
+    for field in SEARCH_FILTER_FIELDS:
+        st.session_state[f"searched_dates_{field}"] = date_terms(st.session_state.get(f"filter_{field}", []))
+
+
+def apply_quick_date(kind: str, field: str) -> None:
+    """Add this button's dates to a filter field, then save.
+
+    Dates left over from the last search (typed or from a button) are taken out first; dates added since,
+    such as Today then Yesterday, are kept so they can be searched together.
+    """
+    key = f"filter_{field}"
+    stale = set(st.session_state.get(f"searched_dates_{field}", []))
+    kept = [t for t in st.session_state.get(key, []) if str(t) not in stale]
+    st.session_state[key] = kept + [t for t in quick_date_terms(kind, datetime.date.today(), field) if t not in kept]
+    st.session_state[f"searched_dates_{field}"] = []
+    persist_search_filter()
+
+
+QUICK_SEARCH_TERM_SLOTS = 5
+
+
+def quick_search_terms() -> list[str]:
+    """The quick search terms set on the prompt library page (up to 5, blanks dropped)."""
+    terms = load_prompt_library().get("quick_search_terms") or []
+    return [str(t).strip() for t in terms[:QUICK_SEARCH_TERM_SLOTS] if str(t).strip()]
+
+
+def save_quick_search_terms() -> None:
+    library = load_prompt_library()
+    library["quick_search_terms"] = [
+        str(st.session_state.get(f"quick_search_term_{i}", "")).strip() for i in range(QUICK_SEARCH_TERM_SLOTS)
+    ]
+    save_prompt_library(library)
+
+
+def apply_quick_term(term: str, field: str) -> None:
+    """Add a quick search term to a filter field (once), then save."""
+    key = f"filter_{field}"
+    st.session_state[key] = clean_filter_terms(list(st.session_state.get(key, [])) + [term])
+    persist_search_filter()
+
+
+def render_filter_heading(field: str, label: str, field_help: str) -> None:
+    """A filter field's heading with its quick date buttons on the same line, and quick search terms below."""
+    today = datetime.date.today()
+    with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
+        st.markdown(label, width="content", help=field_help)
+        for kind, button_label in QUICK_DATE_LABELS.items():
+            terms = quick_date_terms(kind, today, field)
+            shown = " and ".join(f"`{t}`" for t in terms) if len(terms) <= 2 else f"`{terms[0]}` … `{terms[-1]}`"
+            st.button(
+                button_label,
+                key=f"quick_date_{field}_{kind}",
+                type="tertiary",
+                on_click=apply_quick_date,
+                args=(kind, field),
+                help=f"Adds {shown} to **{label}**, and takes out dates left from the last search.",
+            )
+    terms = quick_search_terms()
+    with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
+        for i, term in enumerate(terms):
+            st.button(
+                term,
+                key=f"quick_term_{field}_{i}",
+                type="tertiary",
+                on_click=apply_quick_term,
+                args=(term, field),
+                help=f"Adds `{term}` to **{label}**.",
+            )
+        st.link_button(
+            ":material/edit:" if terms else "Set quick search terms",
+            f"{PROMPT_LIBRARY_PAGE_URL}&section=quick_search",
+            type="tertiary",
+            help="Set up to 5 quick search terms in the prompt library (opens in a new tab).",
+        )
 
 
 def clear_search_filter() -> None:
@@ -1410,8 +1531,7 @@ def delete_prompt(prompt_id: str) -> None:
     library = load_prompt_library()
     library["prompts"] = [p for p in library["prompts"] if p["id"] != prompt_id]
     save_prompt_library(library)
-    if st.session_state.get("active_task_prompt_id") == prompt_id:
-        st.session_state.pop("active_task_prompt_id", None)
+    remove_active_task_prompt(prompt_id)
 
 
 def mark_prompt_used(prompt_id: str) -> None:
@@ -1467,13 +1587,23 @@ def build_prompt_context(corpus_prompt: str = "", profile_text: str = "", global
 # HANDOFF — structured drafts written to an outbox for another system to act on
 # ---------------------------------------------------------------------------
 
-OUTPUT_TYPES = {"text": "Text answer", "note": "Note", "task": "Tasks", "email": "Email"}
+OUTPUT_TYPES = {
+    "text": "Text answer", "note": "Note", "task": "Tasks", "email": "Email", "next_step": "Next step + chase task",
+}
 DRAFT_OUTPUT_TYPES = [t for t in OUTPUT_TYPES if t != "text"]  # what an Agent prompt can send to the outbox
 DEFAULT_AGENT_OUTPUT = "task"
-DEFAULT_AGENT_COMMANDS = {"task": "Create these as tasks", "note": "Save this as a note", "email": "Draft this as an email"}
+DEFAULT_AGENT_COMMANDS = {
+    "task": "Create these as tasks", "note": "Save this as a note", "email": "Draft this as an email",
+    "next_step": "Update the Opportunity's Next Step and create a task to chase",
+}
 AGENT_BORDER_COLOR = "#1c83e1"
 HANDOFF_SCHEMA_ID = "llm-notes-handoff/v1"
-HANDOFF_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "handoff.v1.schema.json"
+HANDOFF_SCHEMA_V2_ID = "llm-notes-handoff/v2"  # adds update items and mixed packages (e.g. Next Step + chase task)
+HANDOFF_SCHEMA_PATHS = {
+    HANDOFF_SCHEMA_ID: Path(__file__).resolve().parent / "schemas" / "handoff.v1.schema.json",
+    HANDOFF_SCHEMA_V2_ID: Path(__file__).resolve().parent / "schemas" / "handoff.v2.schema.json",
+}
+NEXT_STEP_LIMIT = 255  # characters an opportunity's Next Step can hold
 DEFAULT_OUTBOX_DIR = PROJECT_DIR / "outbox"
 HANDOFF_RESULT_DIRS = ("processed", "failed")  # where connectors move packages, with a receipt beside each
 RELATED_KINDS = ["", "opportunity", "account", "contact"]
@@ -1488,6 +1618,13 @@ STRUCTURED_OUTPUT_GUIDES = {
     "email": (
         "Return JSON with a one-paragraph `summary` and `items` holding exactly one email: `to` (names or "
         "addresses given in the notes — never invent addresses), `subject` and `body`."
+    ),
+    "next_step": (
+        "Return JSON with a one-paragraph `summary` and `items` holding one entry per opportunity to update: "
+        "`next_step` (one short sentence on where things stand and what happens next, under 200 characters; "
+        "no date or initials, they're added for you), `chase_subject` (a short subject for the follow-up task), "
+        "`chase_due_date` as YYYY-MM-DD worked out from today's date (or \"\" if the notes give none) and "
+        "`chase_description` (or \"\")."
     ),
 }
 STRUCTURED_RELATED_GUIDE = (
@@ -1536,6 +1673,12 @@ def structured_output_schema(item_type: str) -> dict:
             "owner": {"type": "string"},
         },
         "email": {"to": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}},
+        "next_step": {
+            "next_step": {"type": "string"},
+            "chase_subject": {"type": "string"},
+            "chase_due_date": {"type": "string"},
+            "chase_description": {"type": "string"},
+        },
     }[item_type]
     item = {"type": "object", "properties": {**fields, "related_to": related}, "required": [*fields, "related_to"]}
     return {
@@ -1558,6 +1701,10 @@ def normalise_draft_item(item_type: str, item) -> dict:
     draft = {"type": item_type}
     if item_type == "note":
         draft.update(title=text("title"), body=text("body"))
+    elif item_type == "update":
+        draft.update(field="next_step", value=text("value"))  # next_step is the only field v2 updates
+        if "previous" in item:
+            draft["previous"] = str(item.get("previous") or "")
     elif item_type == "task":
         due = text("due_date")
         priority = text("priority").lower()
@@ -1586,14 +1733,185 @@ def agent_command(prompt: dict) -> str:
     return str(prompt.get("command", "")).strip() or DEFAULT_AGENT_COMMANDS[get_prompt_output_type(prompt)]
 
 
-def build_agent_task_prompt(prompt: dict) -> str:
-    """Task for an Agent's first answer: its collection prompt, plus how to list items and where it's heading."""
+# --- Reference snapshot: current records a connector copied from the other system (read-only) -----------
+# The connector writes `llm-notes-reference/v1` files to <outbox>/reference/; this app only reads them, so it
+# never contacts the other system. They let the Agent use real record names and show their current state.
+
+REFERENCE_SCHEMA_ID = "llm-notes-reference/v1"
+REFERENCE_FILE = "opportunities.json"
+REFERENCE_PROMPT_LIMIT = 80  # records listed to the model; the snapshot is newest-updated first
+_reference_cache: dict = {}
+
+
+def load_reference_snapshot() -> dict | None:
+    """The connector's snapshot of open opportunities, or None if there isn't a valid one (re-read when it changes)."""
+    path = get_outbox_dir() / "reference" / REFERENCE_FILE
+    try:
+        stamp = path.stat().st_mtime
+    except OSError:
+        return None
+    if _reference_cache.get("key") != (str(path), stamp):
+        try:
+            snapshot = json.loads(path.read_text())
+        except (OSError, ValueError):
+            snapshot = None
+        if not isinstance(snapshot, dict) or snapshot.get("schema") != REFERENCE_SCHEMA_ID:
+            snapshot = None
+        _reference_cache.update(key=(str(path), stamp), snapshot=snapshot)
+    return _reference_cache["snapshot"]
+
+
+def reference_records() -> list[dict]:
+    snapshot = load_reference_snapshot()
+    return [r for r in (snapshot or {}).get("records", []) if isinstance(r, dict) and r.get("name")]
+
+
+def find_reference_record(name: str) -> dict | None:
+    """The snapshot record with exactly this name (ignoring case), as the connector matches it."""
+    wanted = (name or "").strip().lower()
+    return next((r for r in reference_records() if r["name"].strip().lower() == wanted), None) if wanted else None
+
+
+def reference_record_link(record: dict) -> str:
+    """A markdown link to the record's page in the other system, e.g. "[Open in Salesforce ↗](…)", or ""."""
+    url = str(record.get("url") or "")
+    if not url.startswith("https://"):
+        return ""
+    source = str((load_reference_snapshot() or {}).get("source") or "").strip()
+    return f"[Open in {source.title() if source else 'the other system'} ↗]({url})"
+
+
+# Text that must not get links inside it: existing markdown links, inline code and bare addresses.
+LINK_PROTECTED = re.compile(r"(\[[^\]]*\]\([^)]*\)|`[^`]*`|https?://\S+)")
+
+
+def link_opportunity_names(text: str) -> str:
+    """Markdown with each opportunity named in the reference snapshot linked to its page, for display only.
+
+    Names match whole words, ignoring case, longest first; text already in a link or code is left alone.
+    """
+    linked = {r["name"].strip().lower(): r["url"] for r in reference_records()
+              if r["name"].strip() and str(r.get("url") or "").startswith("https://")}
+    if not text or not linked:
+        return text
+    names = sorted(linked, key=len, reverse=True)
+    pattern = re.compile(r"(?<!\w)(" + "|".join(re.escape(n) for n in names) + r")(?!\w)", re.IGNORECASE)
+
+    def link(match: re.Match) -> str:
+        return f"[{match.group(1)}]({linked[match.group(1).lower()]})"
+
+    parts = LINK_PROTECTED.split(text)  # odd positions are the protected pieces
+    return "".join(part if i % 2 else pattern.sub(link, part) for i, part in enumerate(parts))
+
+
+def receipt_links(result: dict) -> list[str]:
+    """Markdown links a connector's receipt gives for one item: the record itself and the record it's on."""
+    links = []
+    for key, label in (("url", f"Open {result.get('object') or 'record'} ↗"), ("related_url", "Open the record it's on ↗")):
+        url = str(result.get(key) or "")
+        if url.startswith("https://"):
+            links.append(f"[{label}]({url})")
+    return links
+
+
+def describe_reference_record(record: dict) -> str:
+    parts = [record.get("account") or "", f"stage {record['stage']}" if record.get("stage") else "",
+             f"updated {record['last_updated']}" if record.get("last_updated") else ""]
+    return ", ".join(p for p in parts if p)
+
+
+# Words left out when matching an account name to the notes, so "Acme Ltd" matches "acme.eu".
+COMPANY_NAME_SUFFIXES = {
+    "ltd", "limited", "inc", "llc", "llp", "plc", "gmbh", "bv", "nv", "sa", "sas", "srl", "ag", "ab", "oy", "as",
+    "corp", "corporation", "co", "company", "group", "holdings",
+}
+NOTE_WORDS = re.compile(r"[a-z0-9]+")
+
+
+def reference_name_keys(name: str) -> set[str]:
+    """A name with spaces and punctuation removed, with and without Ltd/Inc…: "Acme Ltd" -> acmeltd, acme."""
+    words = NOTE_WORDS.findall((name or "").lower())
+    keys = {"".join(words), "".join(w for w in words if w not in COMPANY_NAME_SUFFIXES)}
+    return {key for key in keys if len(key) >= 3}
+
+
+def notes_reference_records(results: list) -> list[dict]:
+    """The snapshot records the notes mention, for the model to name in related_to.
+
+    A record is mentioned when its Opportunity or account name appears in a note's text, file name or folder
+    path, ignoring case, spaces, punctuation and Ltd/Inc…, so `acme.eu` and `Ac-Me` both match Acme Ltd.
+    Names are compared with runs of up to three words of the notes, so `acme` alone doesn't match "Acme Rockets".
+    """
+    records = reference_records()
+    if not records or not results:
+        return []
+    runs: set[str] = set()
+    for result in results:
+        for text in (result.get("text", ""), Path(str(result.get("file_source", ""))).name,
+                     result.get("_folder_path", "")):
+            words = NOTE_WORDS.findall(str(text or "").lower())
+            for size in (1, 2, 3):
+                runs.update("".join(words[i:i + size]) for i in range(len(words) - size + 1))
+            # Longer names (more than three words) are matched as a whole phrase.
+            runs.add(" " + " ".join(words) + " ")
+    phrases = [run for run in runs if run.startswith(" ")]
+
+    def mentioned(name: str) -> bool:
+        if reference_name_keys(name) & runs:
+            return True
+        words = NOTE_WORDS.findall((name or "").lower())
+        return len(words) > 3 and any(f" {' '.join(words)} " in phrase for phrase in phrases)
+
+    return [r for r in records if mentioned(r["name"]) or mentioned(r.get("account") or "")]
+
+
+def reference_prompt_text(records: list[dict]) -> str:
+    """The open opportunities the notes mention, for the model to name in related_to (empty if there are none)."""
+    records = records[:REFERENCE_PROMPT_LIMIT]
+    if not records:
+        return ""
+    lines = "\n".join(f"- {r['name']} ({describe_reference_record(r)})" for r in records)
     return (
-        f"{prompt['text'].strip()}\n\n"
-        "Number every item you list (1, 2, 3…) so I can pick them by number, e.g. \"Yes:1,3 ignore 2\". "
-        f"We will finish with this action: \"{agent_command(prompt)}\" "
-        f"({OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()}). Ask me the questions you need answered "
-        "to do that well, and don't guess anything the notes don't say."
+        "These open opportunities in the connected system are mentioned in the notes. Use this list only to "
+        "name the record: when an item is about one of them, set related_to.name to its exact name and "
+        "related_to.kind to \"opportunity\". Don't create an item for an opportunity just because it is listed "
+        "here; only for what the notes say. If none fits, leave related_to empty rather than inventing a "
+        f"name.\n{lines}"
+    )
+
+
+def agent_action(prompt: dict) -> str:
+    return f"\"{agent_command(prompt)}\" ({OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()})"
+
+
+def build_agent_task_prompt(prompts: list[dict], results: list) -> str:
+    """Task for an Agent's first answer: its collection prompt, plus how to list items and where it's heading.
+
+    Several Agents (e.g. SF_Next_Step and SF_Tasks) become parts of one request, each answered under its own
+    heading, with the items numbered across all parts.
+    """
+    reference = reference_prompt_text(notes_reference_records(results))
+    tail = (
+        " Ask me the questions you need answered to do that well, and don't guess anything the notes don't say."
+        + (f" Say which opportunity each item belongs to.\n\n{reference}" if reference else "")
+    )
+    if len(prompts) == 1:
+        prompt = prompts[0]
+        return (
+            f"{prompt['text'].strip()}\n\n"
+            "Number every item you list (1, 2, 3…) so I can pick them by number, e.g. \"Yes:1,3 ignore 2\". "
+            f"We will finish with this action: {agent_action(prompt)}." + tail
+        )
+    parts = "\n\n".join(
+        f"Part {number}: {prompt['name']} (we will finish with {agent_action(prompt)})\n{prompt['text'].strip()}"
+        for number, prompt in enumerate(prompts, 1)
+    )
+    return (
+        f"This request has {len(prompts)} parts. Answer each under its own heading (the part's name), and keep "
+        "each part to what it asks for.\n\n"
+        f"{parts}\n\n"
+        "Number every item you list across all parts (1, 2, 3…, continuing from one part to the next) so I can "
+        "pick them by number, e.g. \"Yes:1,3 ignore 2\"." + tail
     )
 
 
@@ -1630,8 +1948,9 @@ def link_status_dot(url: str) -> str:
 def best_guess(question: str, search_filter: dict | None, search_state: dict | None) -> str:
     """What the user is probably looking for, for best guess search links (no LLM involved).
 
-    In order: the Related to names of the Agent's staged or sent records, the first Must include filter
-    term, then capitalised names in the question (skipping the question's first word when there's another).
+    In order: the Related to names of the Agent's staged or sent records, a reference opportunity whose name
+    or account appears in the question (longest first), the first Must include filter term, then capitalised
+    names in the question (skipping the question's first word when there's another).
     """
     agent = (search_state or {}).get("agent") or {}
     for batch in [agent.get("staged"), *reversed(agent.get("sent") or [])]:
@@ -1639,6 +1958,14 @@ def best_guess(question: str, search_filter: dict | None, search_state: dict | N
             name = str((item.get("related_to") or {}).get("name", "")).strip()
             if name:
                 return name
+    asked = (question or "").lower()
+    if asked:
+        mentioned = [
+            (len(term), record["name"]) for record in reference_records()
+            for term in (record["name"], record.get("account") or "") if len(term) >= 3 and term.lower() in asked
+        ]
+        if mentioned:
+            return max(mentioned)[1]
     must_include = (search_filter or {}).get("all") or []
     if must_include:
         return str(must_include[0])
@@ -1685,11 +2012,11 @@ def link_markdown(link: dict, guess: str = "") -> str:
     return f"{link_status_dot(link['url'])}[{title}]({url.replace(' ', '%20').replace(')', '%29')})"
 
 
-def render_prompt_links(prompt: dict | None, library: dict, guess: str) -> None:
-    """The injected prompt's links, inline (task executor first), each opening in a new tab."""
-    if not prompt:
+def render_prompt_links(prompts: list[dict], library: dict, guess: str) -> None:
+    """The injected prompts' links, inline (task executor first), each opening in a new tab."""
+    chosen = {link_id for prompt in prompts for link_id in prompt.get("links", [])}
+    if not chosen:
         return
-    chosen = set(prompt.get("links", []))
     parts = [link_markdown(link, guess) for link in ordered_links(library) if link["id"] in chosen and link.get("url")]
     if parts:
         st.markdown(" · ".join(parts))
@@ -1752,6 +2079,78 @@ def apply_title_marker(item: dict, marker: dict) -> dict:
     return {**item, field: marked_title(item.get(field, ""), marker)} if field in item else item
 
 
+def profile_short_name(library: dict) -> str:
+    """Your short name (e.g. initials), set under About me; it signs Next Step updates."""
+    return str((library.get("profile") or {}).get("short_name", "")).strip()
+
+
+def next_step_text(text: str, short_name: str, today: datetime.date, marker: dict) -> str:
+    """'2026-10-25-JDOE: waiting on client…', plus the title marker."""
+    signed = f"{today:%Y-%m-%d}-{short_name}" if short_name else f"{today:%Y-%m-%d}"
+    return marked_title(f"{signed}: {text.strip()}", marker)
+
+
+def expand_next_steps(entries: list[dict], marker: dict, short_name: str, today: datetime.date) -> list[dict]:
+    """Each model entry becomes a Next Step update and a task to chase it, both on the same opportunity.
+
+    The update carries `previous` (the Next Step in the reference snapshot) so the connector only overwrites
+    what the user saw; without a snapshot entry it's left out.
+    """
+    items = []
+    for entry in entries:
+        text = str(entry.get("next_step", "") or "").strip()
+        if not text:
+            continue
+        related = normalise_related_to(entry.get("related_to"))
+        if related["name"] and not related["kind"]:
+            related["kind"] = "opportunity"  # next steps live on opportunities
+        update = {
+            "type": "update",
+            "field": "next_step",
+            "value": next_step_text(text, short_name, today, marker),
+            "related_to": related,
+        }
+        record = find_reference_record(related["name"]) if related["kind"] == "opportunity" else None
+        if record is not None:
+            update["previous"] = record.get("next_step", "")
+        chase = normalise_draft_item("task", {
+            "subject": str(entry.get("chase_subject", "") or "").strip() or f"Chase: {text}",
+            "description": str(entry.get("chase_description", "") or "").strip() or text,
+            "due_date": entry.get("chase_due_date", ""),
+            "related_to": related,
+        })
+        items += [update, apply_title_marker(chase, marker)]
+    return items
+
+
+def stage_agent_batch(
+    search_state: dict,
+    prompts: list[dict],
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+    corpus_prompt: str,
+) -> dict:
+    """Stage every injected Agent's records into one batch (one package). Each Agent is asked separately."""
+    parts = len(prompts)
+    batches = [
+        stage_agent_items(search_state, prompt, model_name, max_tokens, temperature, corpus_prompt,
+                          part=(number, parts) if parts > 1 else None)
+        for number, prompt in enumerate(prompts, 1)
+    ]
+    if parts == 1:
+        return batches[0]
+    items = [item for batch in batches for item in batch["items"]]
+    types = {item["type"] for item in items}
+    return {
+        "id": uuid.uuid4().hex,
+        "type": (types.pop() if len(types) == 1 else "mixed") if items else batches[0]["type"],
+        "summary": " ".join(batch["summary"] for batch in batches if batch["summary"]),
+        "items": items,
+        "model": model_name,
+    }
+
+
 def stage_agent_items(
     search_state: dict,
     prompt: dict,
@@ -1759,16 +2158,26 @@ def stage_agent_items(
     max_tokens: int,
     temperature: float,
     corpus_prompt: str,
+    part: tuple[int, int] | None = None,
 ) -> dict:
-    """Turn the discussion so far into exact records for the Agent's Action Command. Nothing is sent."""
+    """Turn the discussion so far into exact records for the Agent's Action Command. Nothing is sent.
+
+    `part` is (number, of) when several Agents were injected: only this Agent's part is staged here.
+    """
     item_type = get_prompt_output_type(prompt)
     messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
+    reference = reference_prompt_text(notes_reference_records(discussion_results(search_state)))
+    only_part = (
+        f"This covers only part {part[0]} of {part[1]} ({prompt['name']}): give only that part's records; "
+        "the other parts are staged separately.\n\n" if part else ""
+    )
     messages.append({
         "role": "user",
         "content": (
-            f"{agent_command(prompt)}\n\nTurn what we have agreed in this conversation into records now. "
+            f"{agent_command(prompt)}\n\n{only_part}Turn what we have agreed in this conversation into records now. "
             "Include only the items I selected or agreed, with the details we agreed, and leave out anything "
             f"I said to ignore. {STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
+            + (f"\n\n{reference}" if reference else "")
         ),
     })
     reply, _usage = chat_with_ollama(
@@ -1786,14 +2195,16 @@ def stage_agent_items(
             f"`{model_name}` didn't return complete JSON — usually it ran out of tokens. "
             "Raise **Max tokens** and try again."
         ) from exc
-    marker = get_title_marker(load_prompt_library())
-    items = [
-        apply_title_marker(normalise_draft_item(item_type, item), marker)
-        for item in data.get("items", []) if isinstance(item, dict)
-    ]
+    library = load_prompt_library()
+    marker = get_title_marker(library)
+    entries = [item for item in data.get("items", []) if isinstance(item, dict)]
+    if item_type == "next_step":
+        items = expand_next_steps(entries, marker, profile_short_name(library), datetime.date.today())
+    else:
+        items = [apply_title_marker(normalise_draft_item(item_type, item), marker) for item in entries]
     return {
         "id": uuid.uuid4().hex,  # the package id if this is sent; each staging is a new package
-        "type": item_type,
+        "type": "mixed" if item_type == "next_step" else item_type,
         "summary": str(data.get("summary", "")).strip(),
         "items": items,
         "model": model_name,
@@ -1810,11 +2221,13 @@ def persist_outbox_path() -> None:
 
 
 def validate_handoff_package(package: dict) -> None:
-    """Check a package against schemas/handoff.v1.schema.json before it is written."""
+    """Check a package against its schema (schemas/handoff.v1 or v2) before it is written."""
     import jsonschema
 
-    schema = json.loads(HANDOFF_SCHEMA_PATH.read_text())
-    jsonschema.validate(package, schema)
+    path = HANDOFF_SCHEMA_PATHS.get(package.get("schema"))
+    if path is None:
+        raise ValueError(f"unknown package format {package.get('schema')!r}")
+    jsonschema.validate(package, json.loads(path.read_text()))
 
 
 def write_handoff_package(package: dict, outbox: Path) -> Path:
@@ -1830,10 +2243,11 @@ def write_handoff_package(package: dict, outbox: Path) -> Path:
 
 
 def build_handoff_package(
-    search_state: dict, prompt: dict, staged: dict, source_notes: list[tuple[str, Path | None]]
+    search_state: dict, prompts: list[dict], staged: dict, source_notes: list[tuple[str, Path | None]]
 ) -> dict:
     return {
-        "schema": HANDOFF_SCHEMA_ID,
+        # v1 unless the package holds updates or mixed items, so connectors that only read v1 keep working.
+        "schema": HANDOFF_SCHEMA_V2_ID if staged["type"] in ("update", "mixed") else HANDOFF_SCHEMA_ID,
         "id": staged["id"],
         "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "item_type": staged["type"],
@@ -1841,7 +2255,9 @@ def build_handoff_package(
             "library": search_state.get("library_display") or search_state["library"],
             "library_key": search_state["library"],
             "question": search_state["question"],
-            "prompt": {"id": prompt["id"], "name": prompt["name"]},
+            "prompt": {  # several Agents read e.g. "SF_Next_Step + SF_Tasks"
+                "id": "+".join(p["id"] for p in prompts), "name": " + ".join(p["name"] for p in prompts),
+            },
             "model": staged["model"],
             "notes": [{"file": file, **({"path": str(path)} if path else {})} for file, path in source_notes],
         },
@@ -1927,7 +2343,11 @@ PACKAGE_STATUS = {
     "withdrawn": ("🚫", "withdrawn"),
     "": ("❔", "no receipt"),
 }
-RECEIPT_ITEM_ICONS = {"created": "✅", "exists": "✅", "needs_match": "⚠️", "invalid": "⚠️", "skipped": "⏭️", "error": "❌"}
+RECEIPT_ITEM_ICONS = {
+    "created": "✅", "updated": "✅", "exists": "✅", "needs_match": "⚠️", "invalid": "⚠️", "stale": "⚠️",
+    "skipped": "⏭️", "error": "❌",
+}
+DONE_ITEM_STATUSES = ("created", "updated", "exists")  # receipt item statuses meaning it went through
 
 
 def receipt_beside(package_file: Path) -> Path:
@@ -1988,6 +2408,23 @@ def move_outbox_package(path_text: str, destination: str, action: str) -> None:
     st.session_state["actions_notice"] = f"{action} `{path.name}`."
 
 
+def delete_withdrawn_packages(path_texts: list[str]) -> None:
+    """Delete withdrawn packages (and their receipts) for good. Only files in the withdrawn folder are touched."""
+    withdrawn = (get_outbox_dir() / WITHDRAWN_DIR).resolve()
+    deleted = 0
+    for path_text in path_texts:
+        path = Path(path_text)
+        if path.resolve().parent != withdrawn or not path.is_file():
+            continue
+        receipt_beside(path).unlink(missing_ok=True)
+        path.unlink()
+        deleted += 1
+    st.session_state["actions_notice"] = (
+        f"Deleted `{Path(path_texts[0]).name}`." if deleted == 1 and len(path_texts) == 1
+        else f"Deleted {deleted} withdrawn package{'s' if deleted != 1 else ''}."
+    )
+
+
 def outbox_entry_matches(entry: dict, query: str) -> bool:
     words = query.lower().split()
     text = json.dumps([entry["package"], entry["receipt"], entry["path"].name, entry["error"]]).lower()
@@ -2003,7 +2440,7 @@ def render_outbox_entry(entry: dict, state: str) -> None:
     prompt_name = (source.get("prompt") or {}).get("name", "")
     status = state if state in ("waiting", "withdrawn") else receipt.get("status", "")
     icon, status_text = PACKAGE_STATUS.get(status, PACKAGE_STATUS[""])
-    kind = {"note": "note", "task": "task", "email": "email"}.get(package.get("item_type"), "item")
+    kind = {"note": "note", "task": "task", "email": "email", "update": "update"}.get(package.get("item_type"), "item")
     label = (
         f"{icon} {format_when(entry['when'])} · {len(items)} {kind}{'' if len(items) == 1 else 's'}"
         + (f" · Agent:{prompt_name}" if prompt_name else "")
@@ -2051,10 +2488,12 @@ def render_outbox_entry(entry: dict, state: str) -> None:
                 line = describe_staged_item(item)
             except (KeyError, TypeError):
                 line = f"**{staged_item_title(item)}**"
-            st.markdown(f"{RECEIPT_ITEM_ICONS.get(result.get('status'), '⏳' if state == 'waiting' else '')} {line}")
+            icon = RECEIPT_ITEM_ICONS.get(result.get("status"), "⏳" if state == "waiting" else "")
+            st.markdown(f"{icon} {link_opportunity_names(line)}")
             notes_line = []
             if result.get("record_id"):
                 notes_line.append(f"{result.get('object', 'Record')} `{result['record_id']}`")
+            notes_line += receipt_links(result)
             if result.get("message"):
                 notes_line.append(result["message"])
             candidates = ", ".join(
@@ -2074,7 +2513,7 @@ def render_outbox_entry(entry: dict, state: str) -> None:
 
 
 def render_outbox_entry_actions(entry: dict, state: str) -> None:
-    """Withdraw (waiting, failed), Retry (failed) and Restore (withdrawn) buttons for one package."""
+    """Withdraw (waiting, failed), Retry (failed), and Restore and Delete (withdrawn) buttons for one package."""
     path, key = str(entry["path"]), f"{state}_{entry['path'].name}"
     unreadable = bool(entry["error"] or (entry["receipt"] or {}).get("error"))
     with st.container(horizontal=True):
@@ -2113,6 +2552,15 @@ def render_outbox_entry_actions(entry: dict, state: str) -> None:
                 args=(path, "", "Restored to the outbox:"),
                 help="Send it back to the outbox for a connector to process.",
             )
+            with st.popover("Delete", icon=":material/delete:", help="Delete this package for good"):
+                st.markdown("Delete this package and its receipt for good? This can't be undone.")
+                st.button(
+                    "Delete",
+                    key=f"actions_delete_{key}",
+                    type="primary",
+                    on_click=delete_withdrawn_packages,
+                    args=([path],),
+                )
         editable = editable_item_indexes(entry, state)
         if editable:
             editing = st.toggle(
@@ -2134,7 +2582,7 @@ def editable_item_indexes(entry: dict, state: str) -> list[int]:
         return []
     created = {
         r.get("index") for r in (entry["receipt"] or {}).get("items", [])
-        if isinstance(r, dict) and r.get("status") in ("created", "exists")
+        if isinstance(r, dict) and r.get("status") in DONE_ITEM_STATUSES
     }
     return [i for i, item in enumerate(package.get("items", [])) if isinstance(item, dict) and i not in created]
 
@@ -2153,8 +2601,11 @@ def render_package_editor(entry: dict, entry_key: str, indexes: list[int], state
             item = items[index]
             key = lambda field: package_edit_key(entry_key, index, field)  # noqa: E731
             item_type = item.get("type", "")
-            st.markdown(f"**{ {'note': 'Note', 'task': 'Task', 'email': 'Email'}.get(item_type, 'Item') } {index + 1}**")
-            if item_type == "note":
+            st.markdown(f"**{ {'note': 'Note', 'task': 'Task', 'email': 'Email', 'update': 'Next Step'}.get(item_type, 'Item') } {index + 1}**")
+            if item_type == "update":
+                st.text_area("New Next Step", value=item.get("value", ""), key=key("value"), height=80,
+                             max_chars=NEXT_STEP_LIMIT, help=f"At most {NEXT_STEP_LIMIT} characters.")
+            elif item_type == "note":
                 st.text_input("Title", value=item.get("title", ""), key=key("title"))
                 st.text_area("Body", value=item.get("body", ""), key=key("body"), height=140)
             elif item_type == "task":
@@ -2220,7 +2671,7 @@ def save_package_edits(path_text: str, entry_key: str, indexes: list[int]) -> No
                 "kind": value("related_kind", related.get("kind", "")),
             },
         }
-        for field in ("title", "body", "subject", "description", "priority", "owner"):
+        for field in ("title", "body", "subject", "description", "priority", "owner", "value"):
             if field in item:
                 edited[field] = value(field, item[field])
         if "due_date" in item:
@@ -2230,7 +2681,10 @@ def save_package_edits(path_text: str, entry_key: str, indexes: list[int]) -> No
             to = value("to", ", ".join(item["to"]))
             edited["to"] = to.split(",") if isinstance(to, str) else to
         cleaned = normalise_draft_item(item["type"], edited)
-        if not (cleaned.get("subject") or cleaned.get("title")):
+        if item["type"] == "update":
+            if not cleaned["value"]:
+                problems.append(f"Item {index + 1} needs a Next Step.")
+        elif not (cleaned.get("subject") or cleaned.get("title")):
             problems.append(f"Item {index + 1} needs a {'title' if item['type'] == 'note' else 'subject'}.")
         package["items"][index] = cleaned
     if problems:
@@ -2280,12 +2734,22 @@ def render_actions_page() -> None:
     if (linked := st.query_params.get("package")) and "actions_query" not in st.session_state:
         st.session_state["actions_query"] = Path(linked).stem
     with st.container(horizontal=True, vertical_alignment="bottom"):
-        query = st.text_input(
-            "Filter",
-            key="actions_query",
-            placeholder="Search subjects, titles, prompts, owners and messages",
-            icon=":material/search:",
-        )
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="xsmall"):
+            query = st.text_input(
+                "Filter",
+                key="actions_query",
+                placeholder="Search subjects, titles, prompts, owners and messages",
+                icon=":material/search:",
+            )
+            st.button(
+                ":material/close:",
+                key="actions_clear_query",
+                type="tertiary",
+                on_click=st.session_state.update,
+                kwargs={"actions_query": ""},
+                disabled=not query,
+                help="Clear the filter",
+            )
         st.button("Refresh", icon=":material/refresh:", key="actions_refresh")
     tabs = st.tabs([f"{OUTBOX_STATES[state][0]} ({len(entries[state])})" for state in OUTBOX_STATES])
     for tab, state in zip(tabs, OUTBOX_STATES):
@@ -2295,6 +2759,20 @@ def render_actions_page() -> None:
                 st.caption(f"{len(shown)} of {len(entries[state])} match.")
             if not shown:
                 st.caption(OUTBOX_STATES[state][1] if not entries[state] else "Nothing matches the filter.")
+            if state == "withdrawn" and shown:
+                everything = len(shown) == len(entries[state])
+                label = "Delete all" if everything else f"Delete these {len(shown)}"
+                with st.popover(label, icon=":material/delete_sweep:",
+                                help="Delete the withdrawn packages listed here for good"):
+                    st.markdown(f"Delete {'all ' if everything else ''}{len(shown)} withdrawn package"
+                                f"{'s' if len(shown) != 1 else ''} and their receipts for good? This can't be undone.")
+                    st.button(
+                        label,
+                        key="actions_delete_withdrawn",
+                        type="primary",
+                        on_click=delete_withdrawn_packages,
+                        args=([str(entry["path"]) for entry in shown],),
+                    )
             for entry in shown:
                 render_outbox_entry(entry, state)
 
@@ -2315,9 +2793,12 @@ def save_title_marker() -> None:
 
 def save_profile_from_widgets() -> None:
     library = load_prompt_library()
+    profile = library["profile"]
     library["profile"] = {
-        "text": str(st.session_state.get("profile_text", "")),
-        "enabled": bool(st.session_state.get("profile_enabled", True)),
+        **profile,  # keep fields whose widgets aren't on screen
+        "text": str(st.session_state.get("profile_text", profile.get("text", ""))),
+        "enabled": bool(st.session_state.get("profile_enabled", profile.get("enabled", True))),
+        "short_name": re.sub(r"\s+", "", str(st.session_state.get("profile_short_name", profile.get("short_name", "")))),
     }
     save_prompt_library(library)
 
@@ -2714,6 +3195,29 @@ def render_prompt_library_page() -> None:
                           on_click=delete_link, args=(link["id"],), help="Remove this link, from every prompt too")
         st.button("Add link", icon=":material/add:", key="link_add", on_click=add_link)
 
+    quick_terms = (library.get("quick_search_terms") or [])[:QUICK_SEARCH_TERM_SLOTS]
+    quick_terms += [""] * (QUICK_SEARCH_TERM_SLOTS - len(quick_terms))
+    with st.expander(
+        f"Quick search filters · {sum(1 for t in quick_terms if t.strip())} of {QUICK_SEARCH_TERM_SLOTS}",
+        expanded=st.query_params.get("section") == "quick_search",
+        key="prompt_page_quick_search_open",
+        icon=":material/bolt:",
+    ):
+        st.caption(
+            "Terms you filter by often, e.g. a customer or a folder such as `Clients-Prospects`. They show as "
+            "buttons under the quick dates on each filter field (**Must include**, **Any of**, **Exclude**); a "
+            "click adds the term to that field. Terms also match the folders notes are in. Saved as you type."
+        )
+        with st.container(horizontal=True, gap="small"):
+            for i, term in enumerate(quick_terms):
+                st.text_input(
+                    f"Term {i + 1}",
+                    value=term,
+                    key=f"quick_search_term_{i}",
+                    on_change=save_quick_search_terms,
+                    max_chars=60,
+                )
+
     outbox = get_outbox_dir()
     waiting = len(pending_outbox_files(outbox))
     with st.expander(
@@ -2779,13 +3283,27 @@ def render_prompt_library_page() -> None:
             "Sent with every LLM request in every corpus: who you are, where you're based, how you'd like "
             "answers. Today's date is always added for you."
         )
-        st.checkbox(
-            "Include in LLM requests",
-            value=bool(library["profile"].get("enabled", True)),
-            key="profile_enabled",
-            on_change=save_profile_from_widgets,
-            help="You can also leave it out of a single run from the Ask panel.",
-        )
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            st.checkbox(
+                "Include in LLM requests",
+                value=bool(library["profile"].get("enabled", True)),
+                key="profile_enabled",
+                on_change=save_profile_from_widgets,
+                help="You can also leave it out of a single run from the Ask panel.",
+            )
+            st.text_input(
+                "Short name",
+                value=profile_short_name(library),
+                key="profile_short_name",
+                on_change=save_profile_from_widgets,
+                max_chars=8,
+                width=140,
+                placeholder="e.g. JDOE",
+                help=(
+                    "Your initials or short name. It signs the updates Agents make, e.g. a Next Step reads "
+                    "*2026-10-25-JDOE: waiting on the client…*. Not sent to the LLM."
+                ),
+            )
         st.text_area(
             "About me",
             value=str(library["profile"].get("text", "")),
@@ -2932,37 +3450,58 @@ def render_prompt_library_page() -> None:
             st.success(f"Added **{added}**. Agent prompts get their steps and Action Command on their card above.")
 
     install_filter_commit_on_blur()
+    install_tooltip_hide_on_click()
+
+
+ACTIVE_TASK_PROMPTS_KEY = "active_task_prompt_ids"
+
+
+def active_task_prompts(library: dict) -> list[dict]:
+    """The injected task prompts: one plain prompt, or one or more Agents (e.g. SF_Next_Step and SF_Tasks)."""
+    prompts = (find_prompt(library, prompt_id) for prompt_id in st.session_state.get(ACTIVE_TASK_PROMPTS_KEY, []))
+    return [p for p in prompts if p and not p.get("global")]
 
 
 def set_active_task_prompt(prompt_id: str) -> None:
-    st.session_state["active_task_prompt_id"] = prompt_id
+    """Inject a task prompt. Agents add up, so one action can update Next Steps and create tasks; a plain
+    prompt replaces whatever was injected, and an Agent replaces a plain prompt."""
+    library = load_prompt_library()
+    current = active_task_prompts(library)
+    if is_agent_prompt(find_prompt(library, prompt_id)) and all(is_agent_prompt(p) for p in current):
+        ids = [p["id"] for p in current if p["id"] != prompt_id] + [prompt_id]
+    else:
+        ids = [prompt_id]
+    st.session_state[ACTIVE_TASK_PROMPTS_KEY] = ids
 
 
-def clear_active_task_prompt() -> None:
-    st.session_state.pop("active_task_prompt_id", None)
+def remove_active_task_prompt(prompt_id: str) -> None:
+    ids = st.session_state.get(ACTIVE_TASK_PROMPTS_KEY, [])
+    st.session_state[ACTIVE_TASK_PROMPTS_KEY] = [i for i in ids if i != prompt_id]
 
 
 def sync_injected_prompt_token() -> None:
-    if not st.session_state.get("question_task_token"):
-        clear_active_task_prompt()
+    st.session_state[ACTIVE_TASK_PROMPTS_KEY] = list(st.session_state.get("question_task_token") or [])
 
 
 def render_injected_prompt_token(library: dict) -> None:
-    """Red token under the question box showing the injected task prompt; its × removes it."""
-    task = find_prompt(library, st.session_state.get("active_task_prompt_id"))
-    if not task or task.get("global"):
+    """Red tokens under the question box showing the injected task prompts; each × removes that one."""
+    tasks = active_task_prompts(library)
+    if not tasks:
         return
-    st.session_state["question_task_token"] = [task["id"]]
-    if is_agent_prompt(task):
+    by_id = {task["id"]: task for task in tasks}
+    st.session_state["question_task_token"] = list(by_id)
+    if any(is_agent_prompt(task) for task in tasks):
         add_agent_border_style(".st-key-question_task_token [data-tag]")
     st.multiselect(
-        "Injected prompt",
-        options=[task["id"]],
-        format_func=lambda _: f"Prompt: {agent_prompt_label(task)}",
+        "Injected prompts",
+        options=list(by_id),
+        format_func=lambda prompt_id: f"Prompt: {agent_prompt_label(by_id[prompt_id])}",
         key="question_task_token",
         on_change=sync_injected_prompt_token,
         label_visibility="collapsed",
-        help=f"Injected into the LLM request as the task:\n\n{task['text']}",
+        help="Injected into the LLM request as the task" + (
+            "s, one part each" if len(tasks) > 1 else ""
+        ) + ":\n\n" + "\n\n".join(f"**{task['name']}:** {task['text']}" for task in tasks),
     )
 
 
@@ -2979,15 +3518,17 @@ def resolve_run_prompts(library: dict, corpus_config: dict) -> dict:
     profile_text = str(profile.get("text", "")).strip() if profile.get("enabled") else ""
     corpus_prompt = get_active_corpus_prompt(corpus_config)
     global_prompts = [p for p in library["prompts"] if p.get("global") and p.get("text", "").strip()]
-    task = find_prompt(library, st.session_state.get("active_task_prompt_id"))
-    if task and task.get("global"):
-        task = None
     return {
         "profile": profile_text if st.session_state.get("run_include_profile", True) else "",
         "corpus": corpus_prompt if st.session_state.get("run_include_corpus", True) else "",
         "globals": [p for p in global_prompts if st.session_state.get(f"run_include_global_{p['id']}", True)],
-        "task": task,
+        "tasks": active_task_prompts(library),
     }
+
+
+def first_prompt_model(prompts: list[dict]) -> str | None:
+    """The model the first of these prompts asks for, if any (a prompt can pick its own model)."""
+    return next((p["model"] for p in prompts if p.get("model")), None)
 
 
 def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
@@ -2997,8 +3538,7 @@ def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
     if corpus_prompt:
         parts.append("corpus prompt")
     parts.extend(f"Global: {p['name']}" for p in run_prompts["globals"])
-    if run_prompts["task"]:
-        parts.append(f"Task: {agent_prompt_label(run_prompts['task'])}")
+    parts.extend(f"Task: {agent_prompt_label(task)}" for task in run_prompts["tasks"])
     return parts
 
 
@@ -3009,9 +3549,10 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
     corpus_prompt = get_active_corpus_prompt(corpus_config)
     global_prompts = [p for p in library["prompts"] if p.get("global") and p.get("text", "").strip()]
     task_prompts = [p for p in library["prompts"] if not p.get("global")]
-    active = resolve_run_prompts(library, corpus_config)["task"]
-    add_agent_border_style("[class*='st-key-use_agent_prompt_'] button", ".st-key-active_agent_task")
-    st.html("<style>.st-key-active_agent_task { padding: 0.1rem 0.25rem 0.1rem 0.75rem !important; }</style>")
+    active = resolve_run_prompts(library, corpus_config)["tasks"]
+    active_ids = {task["id"] for task in active}
+    add_agent_border_style("[class*='st-key-use_agent_prompt_'] button", "[class*='st-key-active_agent_task']")
+    st.html("<style>[class*='st-key-active_agent_task'] { padding: 0.1rem 0.25rem 0.1rem 0.75rem !important; }</style>")
 
     with st.container(border=True, gap="xsmall"):
         with st.container(horizontal=True, vertical_alignment="center"):
@@ -3043,7 +3584,7 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
             with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
                 st.caption(f"{title}:")
                 for prompt in prompts:
-                    is_active = bool(active and active["id"] == prompt["id"])
+                    is_active = prompt["id"] in active_ids
                     agent = is_agent_prompt(prompt)
                     st.button(
                         truncate_text(agent_prompt_label(prompt), 34 if agent else 28),
@@ -3052,28 +3593,29 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
                         help=(f"**Agent** — ends by sending {OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()} "
                               f"to the outbox: *{agent_command(prompt)}*\n\n" if agent else "") + prompt["text"],
                         type="primary" if is_active else "secondary",
-                        on_click=clear_active_task_prompt if is_active else set_active_task_prompt,
-                        args=() if is_active else (prompt["id"],),
+                        on_click=remove_active_task_prompt if is_active else set_active_task_prompt,
+                        args=(prompt["id"],),
                     )
 
         with st.container(horizontal=True, vertical_alignment="center", gap="small"):
-            if active:
-                agent = is_agent_prompt(active)
+            for task in active:
+                agent = is_agent_prompt(task)
                 with st.container(
                     horizontal=True,
                     vertical_alignment="center",
                     gap="xsmall",
                     width="content",
                     border=agent,
-                    key="active_agent_task" if agent else "active_task",
+                    key=f"active_{'agent_' if agent else ''}task_{task['id']}",
                 ):
-                    st.markdown(f"**Task:** {agent_prompt_label(active)}", help=active["text"], width="content")
+                    st.markdown(f"**Task:** {agent_prompt_label(task)}", help=task["text"], width="content")
                     st.button(
                         ":material/close:",
                         type="tertiary",
-                        key="clear_task_prompt",
-                        on_click=clear_active_task_prompt,
-                        help="Remove the task",
+                        key=f"clear_task_prompt_{task['id']}",
+                        on_click=remove_active_task_prompt,
+                        args=(task["id"],),
+                        help="Remove this task",
                     )
             if task_prompts:
                 # A dropdown can't style single options, so Agents show what they draft instead.
@@ -3255,6 +3797,81 @@ def render_sidebar_job_summary(selected_lib: str, safe_lib: str) -> None:
         meta_parts.append(f"Embedded: **{embed_current}/{embed_total}** blocks")
     meta_parts.append(f"Folders scanned: **{status.get('dirs_scanned', 0)}**")
     st.caption(" · ".join(meta_parts))
+
+
+FOLDER_PATH_SEPARATOR = " > "
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def library_file_folders(folder: str) -> dict[str, list[str]]:
+    """{file name: [its folder, relative to `folder`]} for every note under a library folder (cached 5 min)."""
+    root = Path(folder)
+    index: dict[str, list[str]] = {}
+    if root.is_dir():
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in INGEST_EXTENSIONS and not path.name.startswith("."):
+                index.setdefault(path.name, []).append(str(path.parent.relative_to(root)))
+    return index
+
+
+def note_folder_path(file_source: str, library_folder: Path, corpus_root: Path | None) -> str:
+    """Where a note lives, from its file's location, e.g. "Clients > Prospects > Acme".
+
+    The index's own copy of a file is flat, so the note is found by name in its library folder. Empty when
+    it can't be found, or when two notes in the library share the name (rather than guess).
+    """
+    if not file_source or not library_folder:
+        return ""
+    matches = library_file_folders(str(library_folder)).get(Path(str(file_source)).name, [])
+    if len(matches) != 1:
+        return ""
+    folder = (Path(library_folder) / matches[0]).resolve()
+    # Relative to the corpus root, so multi-library paths start with the library ("Clients > …").
+    base = Path(corpus_root).resolve() if corpus_root else Path(library_folder).resolve().parent
+    if not folder.is_relative_to(base):
+        base = Path(library_folder).resolve().parent
+    return FOLDER_PATH_SEPARATOR.join(part for part in folder.relative_to(base).parts if part not in ("", "."))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def library_source_paths(safe_lib: str, library_folder: str, corpus_root: str) -> dict[str, str]:
+    """{file_source: folder path} for every note in a library's index whose folder is known (cached 5 min)."""
+    table = safe_lib.replace('"', '""')
+    try:
+        with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+            sources = [row[0] for row in conn.execute(f'SELECT DISTINCT file_source FROM "{table}"')]
+    except sqlite3.Error:
+        return {}
+    root = Path(corpus_root) if corpus_root else None
+    paths = {str(source): note_folder_path(str(source), Path(library_folder), root) for source in sources}
+    return {source: path for source, path in paths.items() if path}
+
+
+def with_path_matches(search_filter: dict, safe_lib: str, library_folder: Path | None, corpus_root: Path | None) -> dict:
+    """Let filter terms match the folders notes are in, e.g. `Clients-Prospects`.
+
+    A term matches a path written either way, "Clients > Prospects" or "Clients/Prospects".
+    """
+    terms = {term.lower() for field in SEARCH_FILTER_FIELDS for term in search_filter.get(field, [])}
+    if not terms or not library_folder:
+        return search_filter
+    paths = library_source_paths(safe_lib, str(library_folder), str(corpus_root or ""))
+    haystacks = {
+        source: f"{path}\n{path.replace(FOLDER_PATH_SEPARATOR, '/')}".lower() for source, path in paths.items()
+    }
+    path_sources = {}
+    for term in terms:
+        if hits := [source for source, haystack in haystacks.items() if term in haystack]:
+            path_sources[term] = hits
+    return {**search_filter, "path_sources": path_sources}
+
+
+def add_folder_paths(results: list, library_folder: Path, corpus_root: Path | None) -> None:
+    """Give each search result its note's folder path (`_folder_path`), for the LLM and the Sources list."""
+    for result in results:
+        result["_folder_path"] = note_folder_path(
+            str(result.get("file_source", "")), result.get("_library_folder", library_folder), corpus_root
+        )
 
 
 def resolve_source_path(
@@ -3590,6 +4207,69 @@ if (page.__filterCommitOnBlurVersion !== 2) {
     )
 
 
+def install_tooltip_hide_on_click() -> None:
+    """Show a tooltip only while the pointer is on its element, and hide a button's tooltip once it is clicked.
+
+    When a click reruns the app, Streamlit can leave tooltips open for good, even reopening those of buttons
+    clicked earlier (e.g. an Agent prompt's full text over the page). Each tooltip's element points to it with
+    aria-describedby, so a tooltip shows only while the pointer is on that element and it hasn't just been
+    clicked.
+    """
+    components.html(
+        """
+<script>
+const page = window.parent;
+const doc = page.document;
+if (page.__tooltipTidyVersion !== 3) {
+  page.__tooltipTidyVersion = 3;
+  const style = doc.createElement("style");
+  style.textContent = "body > div.tip-hidden { visibility: hidden !important; }";
+  doc.head.appendChild(style);
+  let tipIds = 0;
+  // An element with a tooltip, named by its widget key class (e.g. "st-key-use_agent_prompt_Recent_…"), which
+  // stays the same when a rerun redraws it, else by an id given to the element.
+  const nameOf = (el) => {
+    const hover = el instanceof page.Element ? el.closest('[data-testid="stTooltipHoverTarget"]') : null;
+    if (!hover) return null;
+    const box = hover.closest('[class*="st-key-"]');
+    const key = box && [...box.classList].find((c) => c.startsWith("st-key-"));
+    return key || (hover.dataset.tipId ||= `tip-${++tipIds}`);
+  };
+  let pointerAt = null;  // the element under the pointer
+  let clicked = null;  // the name of the element clicked last, until the pointer leaves it
+  const update = () => {
+    for (const layer of doc.body.children) {
+      const tip = layer.tagName === "DIV" ? layer.querySelector('[role="tooltip"][id]') : null;
+      if (!tip || !tip.querySelector('[data-testid="stTooltipContent"]')) {
+        layer.classList.remove("tip-hidden");
+        continue;
+      }
+      const owner = doc.querySelector(`[aria-describedby="${page.CSS.escape(tip.id)}"]`);
+      const show = owner && pointerAt && owner.contains(pointerAt) && nameOf(owner) !== clicked;
+      layer.classList.toggle("tip-hidden", !show);
+    }
+  };
+  new page.MutationObserver(update).observe(doc.body, { childList: true, subtree: true, attributes: true,
+                                                         attributeFilter: ["aria-describedby"] });
+  doc.addEventListener("pointerdown", (event) => {
+    clicked = nameOf(event.target);
+    update();
+  }, true);
+  doc.addEventListener("pointermove", (event) => {
+    const before = nameOf(pointerAt);
+    pointerAt = event.target;
+    const now = nameOf(pointerAt);
+    if (now === before) return;
+    clicked = null;
+    update();
+  }, true);
+}
+</script>
+""",
+        height=0,
+    )
+
+
 QUESTION_LABEL = "What would you like to ask?"
 
 
@@ -3710,7 +4390,7 @@ def render_discussion_body(
             st.caption("No follow-up questions yet.")
         for turn in discussion:
             with st.chat_message(turn["role"]):
-                st.markdown(turn["content"])
+                st.markdown(link_opportunity_names(turn["content"]))
                 if turn.get("model"):
                     st.caption(f"`{turn['model']}`")
                 # Every turn can be copied. When the model was sent more than is shown (a step's prompt, or
@@ -3833,38 +4513,54 @@ def render_filter_results(search_state: dict, library_folder: Path, safe_lib: st
     label_col.caption("Exclude all")
     st.markdown('<hr style="margin:0.1rem 0 0.6rem">', unsafe_allow_html=True)
 
-    for (library, file_source), blocks in notes.items():
-        note_lib = blocks[0].get("_safe_lib", safe_lib)
-        excluded = file_source in get_excluded_notes(note_lib)
-        name = Path(file_source).name
-        label = (f"~~{name}~~ · excluded" if excluded else name) + (f"  ·  {library}" if library else "")
-        check_col, target_col, help_col, note_col = st.columns([1, 1, 0.6, 9.4])
-        with check_col:
-            checkbox_key = exclude_checkbox_key(note_lib, file_source)
-            if checkbox_key not in st.session_state:
-                st.session_state[checkbox_key] = excluded
-            st.checkbox(
-                "🚫",
-                key=checkbox_key,
-                on_change=toggle_excluded_note,
-                args=(note_lib, file_source),
-            )
-        with target_col:
-            st.button(
-                "🎯",
-                key=f"target::{note_lib}::{file_source}",
-                type="tertiary",
-                on_click=target_note,
-                args=(note_lib, file_source, listed),
-            )
-        help_col.markdown("\u200b", help=NOTE_SELECTION_HELP)
-        with note_col:
-            with st.expander(label):
-                note_folder = blocks[0].get("_library_folder", library_folder)
-                note_uploads = blocks[0].get("_uploads_dirs", search_state["uploads_dirs"])
-                path = resolve_source_path(file_source, note_folder, note_uploads)
-                st.caption(str(path) if path else f"Source: `{file_source}`")
-                render_full_document(file_source, path, note_lib)
+    # Grouped under their folder path, sorted by path; notes whose folder isn't known come last.
+    folders: dict[str, list] = {}
+    for note_key, blocks in notes.items():
+        folders.setdefault(blocks[0].get("_folder_path", ""), []).append((note_key, blocks))
+    for folder in sorted(folders, key=lambda path: (not path, path.lower())):
+        st.markdown(f"📁 **{folder or 'Folder not known'}** · {len(folders[folder])}")
+        for (library, file_source), blocks in folders[folder]:
+            render_filter_result_row(library, file_source, blocks, listed, library_folder, safe_lib, search_state)
+
+
+def render_filter_result_row(
+    library: str, file_source: str, blocks: list, listed: list, library_folder: Path, safe_lib: str,
+    search_state: dict,
+) -> None:
+    """One note in the Filter search list: exclude box, target button and an expander with the note."""
+    note_lib = blocks[0].get("_safe_lib", safe_lib)
+    excluded = file_source in get_excluded_notes(note_lib)
+    name = Path(file_source).name
+    label = (f"~~{name}~~ · excluded" if excluded else name) + (
+        f"  ·  {library}" if library and not blocks[0].get("_folder_path") else ""
+    )
+    check_col, target_col, help_col, note_col = st.columns([1, 1, 0.6, 9.4])
+    with check_col:
+        checkbox_key = exclude_checkbox_key(note_lib, file_source)
+        if checkbox_key not in st.session_state:
+            st.session_state[checkbox_key] = excluded
+        st.checkbox(
+            "🚫",
+            key=checkbox_key,
+            on_change=toggle_excluded_note,
+            args=(note_lib, file_source),
+        )
+    with target_col:
+        st.button(
+            "🎯",
+            key=f"target::{note_lib}::{file_source}",
+            type="tertiary",
+            on_click=target_note,
+            args=(note_lib, file_source, listed),
+        )
+    help_col.markdown("\u200b", help=NOTE_SELECTION_HELP)
+    with note_col:
+        with st.expander(label):
+            note_folder = blocks[0].get("_library_folder", library_folder)
+            note_uploads = blocks[0].get("_uploads_dirs", search_state["uploads_dirs"])
+            path = resolve_source_path(file_source, note_folder, note_uploads)
+            st.caption(str(path) if path else f"Source: `{file_source}`")
+            render_full_document(file_source, path, note_lib)
 
 
 RECEIPT_STATUS_TEXT = {
@@ -3876,11 +4572,21 @@ RECEIPT_STATUS_TEXT = {
 
 
 def staged_item_title(item: dict) -> str:
+    if item.get("type") == "update":
+        return f"Next Step: {item.get('value', '')}"
     return item.get("subject") or item.get("title") or "(untitled)"
 
 
 def describe_staged_item(item: dict) -> str:
-    """One readable line (plus a short body) for a staged note, task or email."""
+    """One readable line (plus a short body) for a staged note, task, email or Next Step update."""
+    if item["type"] == "update":
+        name = item["related_to"]["name"] or "no opportunity yet"
+        text = f"**Next Step** on *{name}*  \n→ {item['value']}"
+        if len(item["value"]) > NEXT_STEP_LIMIT:
+            text += f"  \n⚠ {len(item['value'])} characters: a Next Step holds {NEXT_STEP_LIMIT}, so the connector will hold it."
+        if "previous" in item:
+            text += f"  \nNow: {item['previous'] or '(empty)'}"
+        return text
     details = []
     if item["type"] == "task":
         details += [
@@ -3900,17 +4606,89 @@ def describe_staged_item(item: dict) -> str:
 
 def unstage_item(agent: dict, index: int) -> None:
     agent["staged"]["items"].pop(index)
+    # Item positions shift, so drop the record pickers' remembered choices for this staging.
+    prefix = f"agent_ref_{agent['staged']['id']}_"
+    for key in [k for k in st.session_state if str(k).startswith(prefix)]:
+        del st.session_state[key]
+
+
+KEEP_RELATED = "__keep__"
+NO_RELATED = "__none__"
+
+
+def set_staged_related(agent: dict, index: int, widget_key: str) -> None:
+    """Apply the record picked for a staged item: a reference opportunity, or no record."""
+    choice = st.session_state.get(widget_key)
+    item = agent["staged"]["items"][index]
+    if choice == NO_RELATED:
+        item["related_to"] = {"name": "", "kind": ""}
+    elif choice and choice != KEEP_RELATED:
+        item["related_to"] = {"name": choice, "kind": "opportunity"}
+    if item["type"] == "update":
+        # The connector only overwrites the Next Step it was told the user saw, so keep that in step.
+        record = find_reference_record(item["related_to"]["name"])
+        if record is not None:
+            item["previous"] = record.get("next_step", "")
+        else:
+            item.pop("previous", None)
+
+
+def render_reference_picker(agent: dict, index: int, item: dict) -> None:
+    """Under a staged item: whether its Related to is a real open opportunity, and a picker to choose one."""
+    records = reference_records()
+    if not records:
+        return
+    related = item["related_to"]
+    match = find_reference_record(related["name"]) if related["kind"] in ("", "opportunity") else None
+    if match:
+        link = reference_record_link(match)
+        st.caption(f"✓ Opportunity *{match['name']}* · {describe_reference_record(match)}" + (f" · {link}" if link else ""))
+    elif related["name"] and related["kind"] in ("", "opportunity"):
+        st.caption(f"⚠ *{related['name']}* isn't an open opportunity in the reference: choose one below, or the "
+                   "connector will hold it.")
+    elif related["name"]:
+        st.caption(f"Related to {related['kind']} *{related['name']}* (only opportunities are in the reference).")
+    elif item["type"] in ("note", "update"):
+        st.caption(f"⚠ {'A note' if item['type'] == 'note' else 'A Next Step'} must be on a record: "
+                   "choose its opportunity below.")
+    names = [r["name"] for r in records]
+    must_link = item["type"] in ("note", "update")  # notes and Next Step updates need a record; tasks don't
+    options = ([] if match else [KEEP_RELATED]) + names + ([] if must_link else [NO_RELATED])
+    by_name = {r["name"]: r for r in records}
+
+    def label(option: str) -> str:
+        if option == KEEP_RELATED:
+            return f"Keep “{related['name']}”" if related["name"] else "Choose an opportunity…"
+        if option == NO_RELATED:
+            return "No record (standalone)"
+        return f"{option} — {describe_reference_record(by_name[option])}"
+
+    widget_key = f"agent_ref_{agent['staged']['id']}_{index}"
+    st.selectbox(
+        "Opportunity",
+        options,
+        index=options.index(match["name"]) if match else 0,
+        format_func=label,
+        key=widget_key,
+        on_change=set_staged_related,
+        args=(agent, index, widget_key),
+        label_visibility="collapsed",
+        help="Open opportunities from the connector's reference snapshot. The connector links to the one you choose.",
+    )
 
 
 def start_needs_work(agent: dict) -> None:
     agent["rejected"], agent["staged"], agent["needs_work"] = agent["staged"], None, True
 
 
-def send_staged_to_outbox(search_state: dict, prompt: dict, source_notes: list[tuple[str, Path | None]]) -> None:
+def send_staged_to_outbox(
+    search_state: dict, prompts: list[dict], source_notes: list[tuple[str, Path | None]]
+) -> None:
     agent = search_state["agent"]
     staged = agent["staged"]
     try:
-        path = write_handoff_package(build_handoff_package(search_state, prompt, staged, source_notes), get_outbox_dir())
+        package = build_handoff_package(search_state, prompts, staged, source_notes)
+        path = write_handoff_package(package, get_outbox_dir())
     except Exception as exc:
         agent["send_error"] = f"Couldn't write to the outbox: {exc}"
         return
@@ -3940,12 +4718,15 @@ def render_sent_batch(batch: dict) -> bool:
 
 def render_sent_status(batch: dict) -> bool:
     """What happened to one sent package; returns True while it's still waiting for a connector."""
-    count = f"{len(batch['items'])} {OUTPUT_TYPES[batch['type']].lower()}"
+    count = f"{len(batch['items'])} {OUTPUT_TYPES.get(batch['type'], 'items').lower()}"
     package_file = Path(batch["file"])
     if (package_file.parent / WITHDRAWN_DIR / package_file.name).is_file():
         st.info(f"Sent {count} at {batch['at']}, then withdrawn on the Actions page.")
         return False
     receipt = read_handoff_receipt(package_file)
+    if not receipt and not package_file.is_file():  # not in the outbox, withdrawn/, processed/ or failed/
+        st.info(f"Sent {count} at {batch['at']}, then withdrawn and deleted on the Actions page.")
+        return False
     if not receipt:
         st.info(f"Sent {count} to the outbox at {batch['at']}. Waiting for a connector to pick it up.")
         return True
@@ -3957,10 +4738,12 @@ def render_sent_status(batch: dict) -> bool:
         message += f" {receipt['error']}"
     (st.success if receipt["status"] == "done" else st.warning)(message)
     for result in receipt.get("items", []):
-        if result["status"] in ("created", "exists"):
-            continue
         index = result["index"]
         title = staged_item_title(batch["items"][index]) if index < len(batch["items"]) else f"Item {index + 1}"
+        if result["status"] in DONE_ITEM_STATUSES:
+            if links := receipt_links(result):  # done: just where to see it
+                st.caption(f"{title}: " + " · ".join(links))
+            continue
         candidates = ", ".join(c["name"] for c in result.get("candidates", []))
         st.caption(f"{title}: {result['message']}" + (f" Possible matches: {candidates}." if candidates else ""))
     return False
@@ -3976,25 +4759,33 @@ def render_agent_panel(
 ) -> None:
     """Agent workflow under the discussion: step buttons, Agent:<name> to stage, That's right / Needs work."""
     agent = search_state["agent"]
-    # Read the prompt live, so edits made in the prompt library apply on the next click.
-    prompt = find_prompt(load_prompt_library(), agent["prompt"]["id"]) or agent["prompt"]
-    label = agent_prompt_label(prompt)
-    item_kind = OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()
+    # Read the prompts live, so edits made in the prompt library apply on the next click. Searches from
+    # before several Agents could be injected hold one "prompt".
+    library = load_prompt_library()
+    prompts = [find_prompt(library, p["id"]) or p for p in agent.get("prompts") or [agent["prompt"]]]
+    several = len(prompts) > 1
+    label = " + ".join(agent_prompt_label(prompt) for prompt in prompts)
+    item_kind = " and ".join(OUTPUT_TYPES[get_prompt_output_type(prompt)].lower() for prompt in prompts)
     add_agent_border_style(".st-key-agent_panel", ".st-key-agent_run button", ".st-key-agent_staging")
 
     with st.container(border=True, key="agent_panel"):
         with st.container(horizontal=True, vertical_alignment="center"):
             st.markdown(f"**{label}**", width="content")
-            st.link_button(
-                "Edit prompt workflow",
-                f"{PROMPT_LIBRARY_PAGE_URL}&prompt={prompt['id']}",
-                icon=":material/open_in_new:",
-                type="tertiary",
-                help="Opens this Agent's steps and Action Command in the prompt library, in a new tab.",
-            )
-        steps = [s for s in prompt.get("steps", []) if s.get("text", "").strip()]
-        if steps:
-            with st.container(horizontal=True, gap="xsmall"):
+            for prompt in prompts:
+                st.link_button(
+                    f"Edit {prompt['name']}" if several else "Edit prompt workflow",
+                    f"{PROMPT_LIBRARY_PAGE_URL}&prompt={prompt['id']}",
+                    icon=":material/open_in_new:",
+                    type="tertiary",
+                    help="Opens this Agent's steps and Action Command in the prompt library, in a new tab.",
+                )
+        for prompt in prompts:
+            steps = [s for s in prompt.get("steps", []) if s.get("text", "").strip()]
+            if not steps:
+                continue
+            with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
+                if several:
+                    st.caption(f"{prompt['name']}:")
                 for number, step in enumerate(steps, 2):
                     if st.button(f"{number} · {step['name']}", key=f"agent_step_{step['id']}", help=step["text"]):
                         if add_discussion_turn(
@@ -4006,17 +4797,32 @@ def render_agent_panel(
             "Reply in the discussion to pick items (e.g. *Yes:1,2,3 ignore 4,5,6*), set dates and answer questions. "
             f"When it's right, stage the {item_kind}. Untick notes under Sources to narrow what the LLM uses."
         )
+        snapshot = load_reference_snapshot()
+        if snapshot:
+            refreshed = datetime.datetime.fromisoformat(snapshot["generated_at"]).strftime("%d %b %H:%M")
+            st.caption(
+                f"Reference: {len(reference_records())} {snapshot.get('scope', 'records')} from "
+                f"{snapshot.get('source', 'the connector')} ({snapshot.get('target', '?')}), refreshed {refreshed}. "
+                "The Agent uses their exact names; refresh it from the task executor."
+            )
+        else:
+            st.caption("No reference snapshot yet: the task executor can refresh one so the Agent uses real record names.")
         if st.button(
             label,
             key="agent_run",
             icon=":material/smart_toy:",
             use_container_width=True,
-            help=f"**Action Command:** {agent_command(prompt)}\n\nStages what you've agreed so you can check it first.",
+            help=(
+                "**Action Command" + ("s" if several else "") + ":** "
+                + "; ".join(agent_command(prompt) for prompt in prompts)
+                + "\n\nStages what you've agreed so you can check it first"
+                + (", asking the model once per Agent; it's all sent as one package." if several else ".")
+            ),
         ):
             with st.spinner(f"`{model_name}` is staging the {item_kind}…"):
                 try:
-                    agent["staged"] = stage_agent_items(
-                        search_state, prompt, model_name, max_tokens, temperature, corpus_prompt
+                    agent["staged"] = stage_agent_batch(
+                        search_state, prompts, model_name, max_tokens, temperature, corpus_prompt
                     )
                     agent["needs_work"] = False
                 except Exception as exc:
@@ -4028,11 +4834,16 @@ def render_agent_panel(
         if staged:
             with st.container(border=True, key="agent_staging"):
                 st.markdown(f"**Staged — check before it goes to the outbox**  \n{staged['summary']}")
+                if any(i["type"] == "update" for i in staged["items"]) and not profile_short_name(load_prompt_library()):
+                    st.warning("Next Steps are signed with the date only: set your **Short name** in the prompt "
+                               "library's **About me** (e.g. JDOE), then stage again.")
                 if not staged["items"]:
                     st.info("Nothing to send: no agreed items were found. Choose **Needs work** and say what you want.")
                 for index, item in enumerate(staged["items"]):
                     item_col, remove_col = st.columns([0.92, 0.08])
-                    item_col.markdown(describe_staged_item(item))
+                    with item_col:
+                        st.markdown(link_opportunity_names(describe_staged_item(item)))
+                        render_reference_picker(agent, index, item)
                     with remove_col:
                         st.button(
                             ":material/close:",
@@ -4049,7 +4860,7 @@ def render_agent_panel(
                     type="primary",
                     icon=":material/check:",
                     on_click=send_staged_to_outbox,
-                    args=(search_state, prompt, source_notes),
+                    args=(search_state, prompts, source_notes),
                     disabled=not staged["items"],
                     use_container_width=True,
                     help=f"Write these to the outbox ({get_outbox_dir()}).",
@@ -4137,7 +4948,7 @@ def render_search_results(
     with main_col:
         if search_state["answer"]:
             st.subheader("Answer")
-            st.markdown(search_state["answer"])
+            st.markdown(link_opportunity_names(search_state["answer"]))
             render_copy_buttons([
                 ("Copy answer", search_state["answer"]),
                 ("Copy question", search_state.get("question", "")),
@@ -4180,6 +4991,8 @@ def render_search_results(
                 default=None,
             )
             label = f"#{hits[0]['_rank']} — {Path(file_source).name}"
+            if hits[0].get("_folder_path"):
+                label += f" · {hits[0]['_folder_path']}"
             if library:
                 label = f"[{library}] " + label
             if len(hits) > 1:
@@ -5483,7 +6296,8 @@ def build_context_from_results(results: list, max_chars: int = LLM_CONTEXT_MAX_C
         if not text:
             continue
 
-        chunk = f"[Source {index}: {source}]\n{text}\n"
+        folder = result.get("_folder_path")  # where the note lives, so the LLM knows what it's about
+        chunk = f"[Source {index}: {source}" + (f", in {folder}" if folder else "") + f"]\n{text}\n"
         if total + len(chunk) > max_chars:
             break
 
@@ -5835,24 +6649,34 @@ def describe_search_filter(search_filter: dict) -> str:
 
 
 def build_note_filter_sql(search_filter: dict) -> tuple[str, list]:
-    """HAVING clause matching whole notes (any block or the file name), case-insensitively."""
+    """HAVING clause matching whole notes (any block, the file name or its folder path), case-insensitively.
+
+    Folder paths aren't in the index, so `with_path_matches` lists the notes whose folder matches each term
+    under `path_sources`.
+    """
     term_in_note = (
         "MAX(instr(lower(coalesce(text_block, '')), ?) > 0 "
         "OR instr(lower(coalesce(file_source, '')), ?) > 0)"
     )
-    clauses: list[str] = []
+    path_sources = search_filter.get("path_sources") or {}
     params: list = []
+
+    def matches(term: str) -> str:
+        params.extend([term.lower(), term.lower()])
+        sources = path_sources.get(term.lower(), [])
+        if not sources:
+            return f"{term_in_note} = 1"
+        params.extend(sources)
+        return f"({term_in_note} = 1 OR file_source IN ({', '.join('?' for _ in sources)}))"
+
+    clauses: list[str] = []
     for term in search_filter.get("all", []):
-        clauses.append(f"{term_in_note} = 1")
-        params += [term.lower(), term.lower()]
+        clauses.append(matches(term))
     any_terms = search_filter.get("any", [])
     if any_terms:
-        clauses.append("(" + " OR ".join(f"{term_in_note} = 1" for _ in any_terms) + ")")
-        for term in any_terms:
-            params += [term.lower(), term.lower()]
+        clauses.append("(" + " OR ".join(matches(term) for term in any_terms) + ")")
     for term in search_filter.get("none", []):
-        clauses.append(f"{term_in_note} = 0")
-        params += [term.lower(), term.lower()]
+        clauses.append(f"NOT {matches(term)}")
     excluded = search_filter.get("exclude_sources") or []
     if excluded:
         clauses.append(f"file_source NOT IN ({', '.join('?' for _ in excluded)})")
@@ -6000,21 +6824,23 @@ def exact_text_search_all_libraries(
     taking notes from the libraries with the most matches first. With `apply_exclusions`,
     notes the user excluded are left out.
     """
-    counts: list[tuple[str, str, int]] = []
+    counts: list[tuple[str, str, int, dict]] = []
     for library in libraries:
         lib_key = resolve_library_registry_name(library)
         lib_filter = with_exclusions(search_filter, lib_key) if apply_exclusions else search_filter
+        lib_filter = with_path_matches(
+            lib_filter, lib_key, resolve_library_content_path(corpus_root, library), corpus_root
+        )
         matches = len(find_matching_sources(lib_key, lib_filter))
         if matches:
-            counts.append((library, lib_key, matches))
+            counts.append((library, lib_key, matches, lib_filter))
     counts.sort(key=lambda item: -item[2])
 
     results: list[dict] = []
     remaining = max_documents
-    for library, lib_key, _matches in counts:
+    for library, lib_key, _matches, lib_filter in counts:
         if remaining <= 0:
             break
-        lib_filter = with_exclusions(search_filter, lib_key) if apply_exclusions else search_filter
         blocks = exact_text_search(lib_key, lib_filter, remaining)
         try:
             uploads_dirs = get_library_uploads_dirs(Library().load_library(lib_key))
@@ -6031,7 +6857,7 @@ def exact_text_search_all_libraries(
         results.extend(blocks)
         remaining -= len({block["file_source"] for block in blocks})
 
-    return results, [(library, matches) for library, _lib_key, matches in counts]
+    return results, [(library, matches) for library, _lib_key, matches, _filter in counts]
 
 
 def filtered_semantic_search(
@@ -6679,6 +7505,19 @@ with filter_box_col:
             _key = f"filter_{field}"
             if _key not in st.session_state:
                 st.session_state[_key] = clean_filter_terms(_saved_filter.get(field, []))
+                # Dates restored from the last session count as left over from an earlier search.
+                st.session_state[f"searched_dates_{field}"] = date_terms(st.session_state[_key])
+            # The heading carries the field's help and its quick date buttons, on one line.
+            render_filter_heading(field, label, (
+                f"{field_help}\n\n"
+                "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
+                "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
+                + (
+                    "On the **Literal** route, **Search** returns the matching notes in full."
+                    if exact_text_only
+                    else "On the **Semantic** route, passages are ranked **only within** the matching notes."
+                )
+            ))
             st.multiselect(
                 label,
                 options=st.session_state[_key],
@@ -6686,18 +7525,22 @@ with filter_box_col:
                 accept_new_options=True,
                 on_change=persist_search_filter,
                 placeholder="Type a term, press Enter",
-                help=(
-                    f"{field_help}\n\n"
-                    "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
-                    "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
-                    + (
-                        "On the **Literal** route, **Search** returns the matching notes in full."
-                        if exact_text_only
-                        else "On the **Semantic** route, passages are ranked **only within** the matching notes."
-                    )
-                ),
+                label_visibility="collapsed",
             )
+        # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
+        if "max_results" not in st.session_state:  # saved between searches and sessions
+            st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
+        result_limit = st.number_input(
+            "Max results",
+            min_value=1,
+            max_value=50,
+            key="max_results",
+            on_change=persist_max_results,
+            width=160,
+            help="The most passages (Semantic route) or notes (Literal route) a search returns. Saved for next time.",
+        )
         install_filter_commit_on_blur()
+        install_tooltip_hide_on_click()
         search_filter = get_search_filter_from_widgets()
         if is_filter_active(search_filter):
             st.caption(f"Filter: {describe_search_filter(search_filter)}")
@@ -6821,7 +7664,7 @@ with ask_box_col:
         # The injected prompt's links (e.g. Salesforce, the connector app), between the question and its token.
         last_search_state = st.session_state.get(LAST_SEARCH_KEY)
         render_prompt_links(
-            resolve_run_prompts(prompt_library, corpus_config)["task"],
+            resolve_run_prompts(prompt_library, corpus_config)["tasks"],
             prompt_library,
             best_guess(prompt_text, search_filter, last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
         )
@@ -6842,7 +7685,7 @@ with ask_box_col:
             render_ask_prompt_panel(prompt_library, corpus_config)
             # A task prompt with its own model preselects it. The box has no key, so its default changes with
             # the prompt; picking another model here overrides it for this run.
-            prompt_model = (resolve_run_prompts(prompt_library, corpus_config)["task"] or {}).get("model")
+            prompt_model = first_prompt_model(resolve_run_prompts(prompt_library, corpus_config)["tasks"])
             answer_model = prompt_model if prompt_model in ollama_model_options else default_ollama
             tokens_key = f"llm_max_tokens_{safe_lib}"
             saved_tokens = int(st.session_state.get(tokens_key, corpus_config["llm_max_tokens"]))
@@ -6905,17 +7748,18 @@ with ask_box_col:
             llm_max_tokens = int(corpus_config["llm_max_tokens"])
             llm_temperature = float(corpus_config["llm_temperature"])
 
-        search_col, limit_col = st.columns([2, 1], vertical_alignment="bottom")
-        with search_col:
-            search_clicked = st.button(
-                "🔍 Search exact text" if exact_text_only else "🔍 Search",
-                type="primary",
-                use_container_width=True,
-                help="Uses the route chosen in the Filter box: "
-                + ("**Literal**, the notes matching the filter terms." if exact_text_only else "**Semantic**, by meaning."),
+        search_clicked = st.button(
+            "🔍 Ask (filtered only)" if exact_text_only else "🔍 Search",
+            type="primary",
+            use_container_width=True,
+            help="Uses the route chosen in the Filter box: "
+            + (
+                "**Literal**: answers your question from the notes matching the filter terms, sent in full."
+                if exact_text_only
+                else "**Semantic**, by meaning."
             )
-        with limit_col:
-            result_limit = st.number_input("Max results", min_value=1, max_value=50, value=15)
+            + f" Returns at most {result_limit} results (**Max results**, in the Filter box).",
+        )
         # Searching and answering show their progress here, right under the button that started them.
         # Between runs it shows the selected model's last speed.
         search_progress_slot = st.empty()
@@ -6928,6 +7772,7 @@ new_search = search_clicked or filter_only_clicked
 if new_search:
     # Also save on Search, in case the box was not left before clicking.
     persist_question()
+    remember_searched_dates()
 run_filter_only = filter_only_clicked or (search_clicked and exact_text_only)
 search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode()
 
@@ -6970,6 +7815,7 @@ elif new_search and (prompt_text or run_filter_only):
                 with search_progress_slot.container(), st.spinner("Searching for exact text…", show_time=True):
                     # Filter search only lists excluded notes too, so they can be un-ticked.
                     run_filter = search_filter if filter_only_clicked else with_exclusions(search_filter, safe_lib)
+                    run_filter = with_path_matches(run_filter, safe_lib, library_folder, corpus_root_path)
                     final_results = exact_text_search(safe_lib, run_filter, result_limit)
                 if not final_results:
                     notice = f"No notes match {describe_search_filter(search_filter)}."
@@ -6986,16 +7832,20 @@ elif new_search and (prompt_text or run_filter_only):
                         final_results, notice, nearest_distance = perform_search(
                             search_lib,
                             prompt_text,
-                            with_exclusions(search_filter, safe_lib),
+                            with_path_matches(
+                                with_exclusions(search_filter, safe_lib), safe_lib, library_folder, corpus_root_path
+                            ),
                             selected_embedding_model,
                             result_limit,
                             distance_threshold,
                         )
 
         if final_results is not None:
+            add_folder_paths(final_results, library_folder, corpus_root_path)
             # Corpus prompts describe one library's author role, so skip them across libraries.
             search_corpus_prompt = "" if search_all_libraries else run_prompts["corpus"]
-            task_prompt = run_prompts["task"]
+            tasks = run_prompts["tasks"]
+            agents = [task for task in tasks if is_agent_prompt(task)]
             search_state = {
                 "filter_only": filter_only_clicked,
                 "library": state_library,
@@ -7022,23 +7872,24 @@ elif new_search and (prompt_text or run_filter_only):
                 ),
                 # An Agent's first answer comes from its collection prompt (step 1), told where it's heading.
                 "task_prompt": (
-                    build_agent_task_prompt(task_prompt) if is_agent_prompt(task_prompt)
-                    else task_prompt["text"] if task_prompt else ""
+                    build_agent_task_prompt(agents, final_results) if agents
+                    else tasks[0]["text"] if tasks else ""
                 ),
                 "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt),
                 "library_display": selected_lib if state_library == safe_lib else "All libraries",
                 "id": uuid.uuid4().hex[:8],  # keys this search's per-note widgets
                 "left_out_notes": [],
-                "prompt_model": (task_prompt or {}).get("model") or None,
+                "prompt_model": first_prompt_model(tasks),
                 # The Agent workflow (step buttons, staging, sent batches) lives under the discussion.
                 "agent": (
-                    {"prompt": dict(task_prompt), "staged": None, "rejected": None, "needs_work": False, "sent": []}
-                    if use_llm_answer and is_agent_prompt(task_prompt) else None
+                    {"prompts": [dict(a) for a in agents], "staged": None, "rejected": None, "needs_work": False,
+                     "sent": []}
+                    if use_llm_answer and agents else None
                 ),
             }
             # A chosen task can drive the answer on its own, e.g. after an exact-text search.
             if final_results and use_llm_answer and (
-                search_state["question"] or (task_prompt and not filter_only_clicked)
+                search_state["question"] or (tasks and not filter_only_clicked)
             ):
                 with llm_progress(search_progress_slot, f"Generating answer with `{selected_ollama_model}`…") as report:
                     try:
@@ -7052,8 +7903,8 @@ elif new_search and (prompt_text or run_filter_only):
                             task_prompt=search_state["task_prompt"],
                             on_progress=report,
                         )
-                        if task_prompt:
-                            mark_prompt_used(task_prompt["id"])
+                        for task in tasks:
+                            mark_prompt_used(task["id"])
                     except Exception as llm_exc:
                         search_state["answer_error"] = str(llm_exc)
                 # Keep this run's speed for the model, and show it under Search now the spinner has gone.

@@ -238,7 +238,22 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
    - **Any of (OR)** — at least one term must appear.
    - **Exclude (NOT)** — notes with any of these terms are dropped.
 
-   Terms match literally and case-insensitively anywhere in the note or its file name (`2026-10` matches `2026-10-19`). With a question, semantic search ranks passages only within the matching notes. Filters are saved between sessions.
+   Terms match literally and case-insensitively anywhere in the note, its file name or the folders it's in (`2026-10` matches `2026-10-19`; `Clients-Prospects` matches every note in a folder of that name, and `Clients/Prospects` or `Clients > Prospects` match nested folders). A note whose file name appears in two folders of a library can't be placed, so only its text and name are matched. With a question, semantic search ranks passages only within the matching notes. Filters are saved between sessions.
+
+   **Quick dates** sit on the heading line of **Must include**, **Any of** and **Exclude**, and put date terms into that field. Clicks add up until you search, so **Today** then **Yesterday** in **Any of** finds notes from either day. After a search, the next click first takes out the dates that were in that field for the search (and dates restored when the app starts), whether a button added them or you typed them (`2026-10-25`, `2026-10`, `2026`, `2026/10/25`, `25/10/2026`, `Week#43`…). Other terms, and the other two fields, stay as they are:
+
+   | Button | Adds to Must include (on Sunday 25 October 2026) | Adds to Any of / Exclude |
+   |---|---|---|
+   | **Today** | `2026-10-25` | the same |
+   | **Yesterday** | `2026-10-24` | the same |
+   | **This week** | `2026` and `Week#43` | the 7 dates `2026-10-19` … `2026-10-25` |
+   | **Last week** | `2026` and `Week#42` | the 7 dates `2026-10-12` … `2026-10-18` |
+   | **This month** | `2026-10` | the same |
+   | **Last month** | `2026-09` | the same |
+
+   Days match notes that contain the date as `YYYY-MM-DD`, and months every date in that month. In **Must include**, weeks match notes headed `Week#NN` in that year, using ISO weeks (Monday to Sunday; 29 Dec 2025 is 2026 `Week#1`). The year is its own term rather than a month, so a week that spans two months still matches. Because terms match anywhere, `Week#4` also matches `Week#40`–`Week#49`, which only matters in weeks 1–9. In **Any of** and **Exclude** a bare year would match, or exclude, the whole year, so weeks are the seven days instead. A bare four-digit number counts as a year, so a button would take a leftover one out too. Hover a button to see exactly what it puts in.
+
+   **Quick search terms** sit on a second line under the quick dates, on each of the three fields: up to 5 terms you filter by often, such as a customer or a folder. A click adds the term to that field (once). Set them on the prompt library page under **Quick search filters** (folded by default); the ✏️ link beside the buttons (**Set quick search terms** until you have some) opens that section in a new tab. They're saved as you type and show on the next rerun of the search page.
 3. Enter your question in **What would you like to ask?**
 4. Click **Search**.
 
@@ -249,9 +264,9 @@ The search area is split into a **Filter** box (left) and an **Ask** box (right)
 | Route | What **Search** does | Settings shown |
 |-------|----------------------|----------------|
 | **Semantic (meaning)** | Ranks passages by meaning using the embeddings. Filter terms narrow which notes it looks in. | **Distance cutoff** (how close a match must be) and, after a search, the match bar. |
-| **Literal (exact text)** — button reads **Search exact text** | Returns the notes that match the filter terms, in full. Much faster; the question is only used for the LLM answer. | **Search all libraries**, **🔎 Filter search only**, **🔄 Rescan → Filter search**. |
+| **Literal (exact text)** — button reads **Ask (filtered only)** | Returns the notes that match the filter terms, in full. Much faster; the question is only used for the LLM answer. | **Search all libraries**, **🔎 Filter search only**, **🔄 Rescan → Filter search**. |
 
-The route is saved between sessions. **🔎 Filter search only** (Literal route) lists the matching notes under the Filter box without an LLM answer, keeping your question for later. Tick **🚫** beside a listed note to exclude it from the next **Search** (semantic ranking and LLM answer); excluded notes stay in the filter list, crossed out, and **Clear exclusions** in the Filter box resets them for the session. A full **Search** shows the answer, sources and discussion full-width below both boxes.
+The route is saved between sessions. **🔎 Filter search only** (Literal route) lists the matching notes under the Filter box without an LLM answer, keeping your question for later. Notes are grouped under 📁 headings with their folder path (e.g. `Notes > Clients-Prospects > Acme`), sorted by path, with the number of notes in each; notes whose folder isn't known come last. Tick **🚫** beside a listed note to exclude it from the next **Search** (semantic ranking and LLM answer); excluded notes stay in the filter list, crossed out, and **Clear exclusions** in the Filter box resets them for the session. A full **Search** shows the answer, sources and discussion full-width below both boxes.
 
 On the Literal route, a note shows when the text index was last rescanned (for this library, or every visible library when **Search all libraries** is ticked) and whether auto-rescan is on. **🔄 Rescan → Filter search** picks up new, edited and deleted notes first, then runs **Filter search only**. It is text only, so the filter sees the changes straight away; semantic search sees them after **⚡ Rescan**.
 
@@ -264,16 +279,18 @@ Results appear under **Sources** as one dropdown per document (documents with se
 
 ### Answer with LLM
 
-The Ask box reads top to bottom: your question → the injected prompt's **links** (if it has any) → **Answer with LLM** → **Prompt library** → **Ollama model details** → **Search** (with **Max results**) → progress. Search settings, including **Distance cutoff**, are in the Filter box's **Advanced search settings**.
+The Ask box reads top to bottom: your question → the injected prompt's **links** (if it has any) → **Answer with LLM** → **Prompt library** → **Ollama model details** → **Search** → progress. Search settings are in the Filter box: **Max results** under **Exclude (NOT)**, and **Distance cutoff** in **Advanced search settings**.
 
 - **Answer with LLM** is enabled by default.
 - **Prompt library** — see [Prompt library](#prompt-library) below.
 - **Ollama model details** is folded by default; a line under it shows the model, max tokens (with how long that would take at the model's last measured speed) and temperature in use. Inside: **Ollama model**, **Max tokens** and **Temperature** (saved per corpus as soon as you move them).
 - **Max tokens** goes up to 50,000 (≈37,500 words). Its stops include book lengths for scale — *The Very Hungry Caterpillar*, *Where the Wild Things Are*, *The Tale of Peter Rabbit*, Dr. Seuss's *The Cat in the Hat*, *The Little Prince*, *Winnie-the-Pooh*, *The Old Man and the Sea*, *Animal Farm* and *The Lion, the Witch and the Wardrobe* — and the label and the line under the slider say how long the current setting is (word counts are approximate; English runs at about 0.75 words per token). *The Hobbit* (≈127,000 tokens) and *War and Peace* (≈783,000) are beyond the limit and shown for scale. The limit includes a reasoning model's thinking. Long answers take time (at 20 tokens/s, 50,000 tokens is about 40 minutes) and use more memory: Ollama's context window grows to fit the prompt plus the answer (8k, 16k, 32k or 64k tokens).
+- **Max results** (in the Filter box, under **Exclude (NOT)**) caps how many passages (Semantic) or notes (Literal) a search returns.
 - **Distance cutoff** (in the Filter box's **Advanced search settings**, Semantic route only; same setting as *Relevance cutoff* in the left panel, saved per corpus) decides which passages count as semantic matches, so it applies with or without an LLM answer. After a semantic search, a bar under it shows where passages were found — green is within the cutoff, amber is where to raise it — with a **Set cutoff to …** button to include the closest match.
 - **Progress** shows right under **Search**: a spinner with the elapsed time while searching and answering, and beside it the generation speed (tokens per second and tokens so far), refreshed every 3 seconds. Answers stream from Ollama, so there's no overall time limit. The answer caption ends with the final tokens per second.
 - **Speed score.** After each answer the model's speed is saved (`llm_speed` in `app_settings.json`, per model) and shown under **Search** between runs, e.g. *Last run with `qwen3:30b` (25 Oct 10:42): 12.4 tokens/s · 10,000 tokens ≈ 13 min 26 s*, for whichever model is selected.
 - Search runs first; Ollama summarises the retrieved chunks—it does not replace retrieval.
+- **Folder paths.** Each result gets its note's folder path from where the file sits under the notes folder, e.g. *Clients > Prospects > Acme*. It's shown on the note in **Sources** and given to the LLM with every passage (`[Source 2: Kickoff-2026-10-20.md, in Clients > Prospects > Acme]`), so the model knows what each note is about even for passages that don't include its title. No rebuild is needed. When two notes in a library share a file name, the path is left out rather than guessed. Local Apple Notes Export can also put the path in each note's title line (its *Folder path in titles* option), which puts it in the indexed text for search, after a rescan and re-embed.
 
 ### Prompt library
 
@@ -284,7 +301,7 @@ Open it with the **Prompt library** button in the left panel (hover it for a sum
 | **Common links** | Folded, at the very top. First, the **⚙️ Task executor**: the service that processes the outbox (e.g. the Salesforce Connector app at `http://localhost:8503`). It's defined in its own row, can be cleared but not removed, is listed first wherever links are, and is shown at the top of the **Actions** page with its 🟢/🔴 status. Then **🔗 Other links**: short-titled links (e.g. *SF Tasks*, *Connector*) that you attach to prompts with each card's **Links** selector. While a prompt is injected, its links show as hyperlinks between the question and the prompt token, opening in a new tab. Links to this computer (localhost) show 🟢 when the service answers and 🔴 when it doesn't (checked at most every 15 seconds). **Best guess search:** put `{best_guess}` in an address (e.g. a Salesforce search URL) and it's replaced with the app's best guess at what you're looking for, shown in the link text too (*Find in SF: Acme*): the Agent's staged or sent *Related to* names, else the first **Must include** filter term, else capitalised names in your question. Stored in `prompt_library.json`. |
 | **Outbox** | Collapsed near the top. The folder that sent drafts are written to, and how many packages are waiting, processed and failed. See [Agents and the outbox](#agents-and-the-outbox). |
 | **Task title marker** | Text added **before** or **after** the title of everything an Agent stages (task subjects, note titles, email subjects), e.g. `RAG_TEST:` or `[AI]`, so those records are easy to find later. Applied when the Agent stages, so you see it before **That's right**; titles that already contain it are left alone. Empty means off. |
-| **About me** | One free-text box sent with every LLM request in every corpus — your name, where you're based, accessibility needs, how you like answers. Untick **Include in LLM requests** to switch it off. Today's date is always added. |
+| **About me** | One free-text box sent with every LLM request in every corpus — your name, where you're based, accessibility needs, how you like answers. Untick **Include in LLM requests** to switch it off. Today's date is always added. **Short name** (e.g. `JDOE`) signs the updates Agents make, such as a Next Step (*2026-10-25-JDOE: …*); it isn't sent to the LLM. |
 | **Corpus prompt** | Pick a corpus and describe the role you wrote its notes in (e.g. business owner, salesperson). Tick **Apply corpus prompt** to send it for that corpus only. |
 | **Task prompts** | Reusable instructions such as "Write a meeting summary and next steps as an email". Each has a name, text, **Global**, **Starred** and **Agent** checkboxes, a **Model** box, tags (for finding prompts) and a delete button. Edits save as you go, with a *Saved* time under the text. Tick **Global** to send a prompt with every request in every corpus, like About me — for standing instructions. Tick **Agent** to make it a workflow that ends by sending to the outbox (see below); Agent prompts have a blue border. **Model** picks the Ollama model used when you choose the prompt (see below). Above the list: full-text search, **Clear search**, an **Agents only** switch, and **Common keywords** (tags from your most recently used prompts) to filter with one click. |
 | **Add a prompt** | Name, text, **Global**, **Starred**, **Agent**, the Agent's output, **Model** and tags, then **Add prompt**. Add an Agent's steps and Action Command on its card afterwards. |
@@ -307,7 +324,7 @@ Four example task prompts are added the first time; edit or delete them freely.
 **In the Ask panel** (shown when **Answer with LLM** is on), the compact **Prompt library** box sits above the model settings and has:
 
 - **Always** — About me, the corpus prompt and each global prompt, ticked. Untick one to leave it out of this run.
-- **Task** — click a prompt to attach it (click it again, or **✕**, to remove it); your question still decides which notes are found, and the task tells the LLM what to write from them. The task also applies to follow-up questions. On the **Literal** search route, a task can produce an answer even without a question.
+- **Task** — click a prompt to attach it (click it again, or **✕**, to remove it). Agents add up: click **Agent:SF_Next_Step** and **Agent:SF_Tasks** to do both in one action (see [Several Agents at once](#several-agents-at-once)); a plain prompt replaces whatever was attached, and an Agent replaces a plain prompt; your question still decides which notes are found, and the task tells the LLM what to write from them. The task also applies to follow-up questions. On the **Literal** search route, a task can produce an answer even without a question.
 - **Recent** — titles of the five task prompts most recently used for an answer, newest first. **Starred** — up to five starred prompts not already in Recent, most recently used first, so favourites fill the gap. Hover a title to see the full prompt.
 - **Find a prompt** — search every task prompt by name or tag.
 - **Agent prompts** read *Agent:Name* (e.g. *Agent:SF_Tasks*) and have a blue border: on the Recent and Starred buttons, on the chosen **Task**, and on the prompt token under the question box. **Find a prompt** shows the same *Agent:* names.
@@ -325,9 +342,34 @@ Choose an Agent as the task and **Search**. Its collection prompt (step 1) write
 3. **Stage.** Click **Agent:Name** (blue outline; hover it to see the Action Command). The LLM turns what you agreed into exact records and shows them in a staging box with a one-line summary. Nothing has been sent yet. Remove any record with ✕.
 4. **That's right** writes the staged records to the outbox as one package (checked against `schemas/handoff.v1.schema.json`); each record in it becomes its own task, note or email in the other system. Under each sent package, **View in outbox** opens the Actions page in a new tab, filtered to that package. **Needs work** discards them and asks what's wrong; your explanation goes into the discussion (with the rejected list, so the LLM knows what to fix), and you carry on refining and stage again.
 
+#### Several Agents at once
+
+Attach more than one Agent, e.g. **Agent:SF_Next_Step** and **Agent:SF_Tasks**, to update Next Steps and create tasks in one action. Each shows as its own token under the question and its own **Task** box; **✕** removes just that one.
+
+- **First answer:** each Agent's collection prompt is a part of one request (*Part 1: SF_Next_Step*, *Part 2: SF_Tasks*), answered under its own heading, with items numbered across all parts so *Yes:1,3 ignore 2* still works.
+- **Agent box:** titled *Agent:SF_Next_Step + Agent:SF_Tasks*, with an **Edit** link and a row of step buttons for each Agent.
+- **Stage:** the model is asked once per Agent (each told it covers only its part), and everything lands in one staging box.
+- **That's right** sends one package. When the records differ in type it's a *mixed* `llm-notes-handoff/v2` package, and its prompt reads *SF_Next_Step + SF_Tasks*. The connector must have every type in it switched on (`item_types`), or it skips the whole package.
+
 Unknown values stay empty; nothing is guessed. **Related to** is a name (e.g. *Acme pilot*), not a link; the receiving system finds the matching record. You can stage and send more than once in the same discussion; each **That's right** is a new package.
 
-The app never contacts another system. A separate connector (for example [rag-action-interface](https://github.com/yrros/rag-action-interface) for Salesforce) reads the outbox, moves each package to `outbox/processed/` or `outbox/failed/`, and leaves a `<package name>.receipt.json` beside it. The Agent box shows each sent package's result once its receipt appears: what was created, and why anything wasn't.
+**Reference snapshot (real record names).** If the task executor provides one, `outbox/reference/opportunities.json` (format `llm-notes-reference/v1`, see `schemas/reference.v1.schema.json`) lists current records from the other system, e.g. the Salesforce connector's open opportunities with recent activity: name, account, stage, last updated, last activity, description and a link to the record. This app only reads it; it never contacts the other system. With a snapshot:
+
+- the Agent is given the real names of the records **your notes mention**, and told to use one exactly in **Related to** (or leave it empty rather than invent one), and not to create items for a record just because it's listed. A record counts as mentioned when its name or account appears in a note's text, file name or folder, ignoring case, spaces, punctuation and Ltd/Inc…, so `acme.eu` or `Ac-Me` match the account Acme Ltd. Notes that mention none get no list; choose the record with the picker below;
+- in the staging box each item shows **✓** with the record's account, stage and last update when it matches, plus an **Open in Salesforce ↗** link to the record when the snapshot gives one (refresh the snapshot once for older ones). Wherever an opportunity from the snapshot is named (the answer, the discussion, staged items and the Actions page), its name links to it too, or **⚠** when it doesn't (the connector would hold it), and a picker to choose the right record (notes must be linked; tasks can also be standalone);
+- **best guess search** links prefer a record whose name or account appears in your question;
+- the Agent box says how many records the snapshot holds and when it was refreshed. Refresh it from the task executor (the Salesforce Connector app refreshes it on every scheduled run and with **Refresh now**).
+
+The snapshot holds customer data, stays in the gitignored outbox folder and is only sent to your local Ollama model. The starter Agent **SF_Opp_Notes** (in the prompt library) summarises what your notes say about each opportunity and stages one note per chosen opportunity, linked to it in Salesforce.
+
+**Next step + chase task.** An Agent with this output updates an opportunity's **Next Step** and creates a task to chase it. For each opportunity it stages two items in one package:
+
+- **Next Step**, signed with today's date and your **Short name** (About me), plus the task title marker, e.g. *2026-10-25-JDOE: waiting on client to respond, will chase on 29 October [AI]*. The staging box shows the new text and the current Next Step from the snapshot (*Now: …*), and warns above 255 characters (the most a Next Step holds) or when no short name is set.
+- **A chase task** on the same opportunity, with the due date from your notes or discussion, and the marker.
+
+The connector writes the Next Step only if the opportunity still has the one you saw; if someone changed it since, it holds the update as *changed since staged* (refresh the snapshot and stage again). These packages use format `llm-notes-handoff/v2` (`schemas/handoff.v2.schema.json`): v1 plus update items and mixed packages. On the Actions page a waiting Next Step can be edited like any item. The starter Agent **SF_Next_Step** asks which opportunities to update and when to chase.
+
+The app never contacts another system. A separate connector (for example [rag-action-interface](https://github.com/yrros/rag-action-interface) for Salesforce) reads the outbox, moves each package to `outbox/processed/` or `outbox/failed/`, and leaves a `<package name>.receipt.json` beside it. The Agent box shows each sent package's result once its receipt appears: what was created, with links to each record and the record it's on when the connector gives them (**Open Task ↗**, **Open the record it's on ↗**), and why anything wasn't. The Actions page shows the same links beside each record.
 
 **Outbox status line.** The top of every page shows, e.g., *Outbox: 2 waiting (7 items) · 1 needs attention · Last processed 25 Oct 10:42 · Last error 24 Oct 18:03 · Open Actions*. "Waiting" counts packages not yet picked up and the records in them; "needs attention" counts packages in `failed/`, including items held for you to choose a record; the dates come from the connector's receipts.
 
@@ -340,6 +382,7 @@ The app never contacts another system. A separate connector (for example [rag-ac
 | **Withdraw** | Waiting, Needs attention | Asks to confirm, then moves the package (and its receipt) to `outbox/withdrawn/`, where connectors don't look. Nothing already created in the other system is undone. |
 | **Retry** | Needs attention | Removes the receipt and moves the package back to the outbox for the connector's next run, e.g. after a temporary error. Records already created aren't created twice. Disabled when the file itself is invalid. |
 | **Restore** | Withdrawn | Moves the package back to the outbox for a connector to process. |
+| **Delete** | Withdrawn | Deletes the package and its receipt for good, after you confirm. **Delete all** at the top of the tab does the same for every withdrawn package listed (only those matching the filter, when there is one). Only files in `outbox/withdrawn/` can be deleted. |
 | **Edit** | Waiting, Needs attention, Withdrawn | Opens the package's items for editing: subject or title, description or body, due date, priority, owner, recipients and **Related to**. **Save changes** checks the package against the schema and rewrites the file atomically, keeping its id (so nothing is ever created twice). Use it to add a marker such as `[TEST]` to find records easily, or to fix a name the connector couldn't match, then **Retry**. On a partly done package, records already created aren't shown, since editing them wouldn't change the other system. If a connector picks the package up while you edit, nothing is saved. |
 
 When a record needs choosing (an ambiguous or missing name), either choose it in the connector, which retries the package by itself, or correct **Related to** with **Edit** and press **Retry**. A package you withdraw also shows as withdrawn in the Agent box of the discussion that sent it.
@@ -472,6 +515,8 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 | `Installer.sh` | Creates `venv`, installs dependencies, and builds Desktop `LLM-Notes.app` |
 | `reset_rag.sh` | Deletes indexes, vectors, histories and temp files; keeps models and settings |
 | `schemas/handoff.v1.schema.json` | Format of the packages written to the outbox (`llm-notes-handoff/v1`), shared with connectors |
+| `schemas/handoff.v2.schema.json` | Package format v2 (`llm-notes-handoff/v2`): v1 plus update items (e.g. a Next Step) and mixed packages |
+| `schemas/reference.v1.schema.json` | Format of the read-only reference snapshot a connector writes to `outbox/reference/` (`llm-notes-reference/v1`) |
 | `.gitignore` | Excludes `llmware_data/`, `outbox/`, venvs, `__pycache__` |
 
 ---
