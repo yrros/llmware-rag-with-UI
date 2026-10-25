@@ -1779,22 +1779,69 @@ def describe_reference_record(record: dict) -> str:
     return ", ".join(p for p in parts if p)
 
 
-def reference_prompt_text() -> str:
-    """The open opportunities, for the model to name in related_to (empty if there's no snapshot)."""
-    records = reference_records()[:REFERENCE_PROMPT_LIMIT]
+# Words left out when matching an account name to the notes, so "Acme Ltd" matches "acme.eu".
+COMPANY_NAME_SUFFIXES = {
+    "ltd", "limited", "inc", "llc", "llp", "plc", "gmbh", "bv", "nv", "sa", "sas", "srl", "ag", "ab", "oy", "as",
+    "corp", "corporation", "co", "company", "group", "holdings",
+}
+NOTE_WORDS = re.compile(r"[a-z0-9]+")
+
+
+def reference_name_keys(name: str) -> set[str]:
+    """A name with spaces and punctuation removed, with and without Ltd/Inc…: "Acme Ltd" -> acmeltd, acme."""
+    words = NOTE_WORDS.findall((name or "").lower())
+    keys = {"".join(words), "".join(w for w in words if w not in COMPANY_NAME_SUFFIXES)}
+    return {key for key in keys if len(key) >= 3}
+
+
+def notes_reference_records(results: list) -> list[dict]:
+    """The snapshot records the notes mention, for the model to name in related_to.
+
+    A record is mentioned when its Opportunity or account name appears in a note's text, file name or folder
+    path, ignoring case, spaces, punctuation and Ltd/Inc…, so `acme.eu` and `Ac-Me` both match Acme Ltd.
+    Names are compared with runs of up to three words of the notes, so `acme` alone doesn't match "Acme Rockets".
+    """
+    records = reference_records()
+    if not records or not results:
+        return []
+    runs: set[str] = set()
+    for result in results:
+        for text in (result.get("text", ""), Path(str(result.get("file_source", ""))).name,
+                     result.get("_folder_path", "")):
+            words = NOTE_WORDS.findall(str(text or "").lower())
+            for size in (1, 2, 3):
+                runs.update("".join(words[i:i + size]) for i in range(len(words) - size + 1))
+            # Longer names (more than three words) are matched as a whole phrase.
+            runs.add(" " + " ".join(words) + " ")
+    phrases = [run for run in runs if run.startswith(" ")]
+
+    def mentioned(name: str) -> bool:
+        if reference_name_keys(name) & runs:
+            return True
+        words = NOTE_WORDS.findall((name or "").lower())
+        return len(words) > 3 and any(f" {' '.join(words)} " in phrase for phrase in phrases)
+
+    return [r for r in records if mentioned(r["name"]) or mentioned(r.get("account") or "")]
+
+
+def reference_prompt_text(records: list[dict]) -> str:
+    """The open opportunities the notes mention, for the model to name in related_to (empty if there are none)."""
+    records = records[:REFERENCE_PROMPT_LIMIT]
     if not records:
         return ""
     lines = "\n".join(f"- {r['name']} ({describe_reference_record(r)})" for r in records)
     return (
-        "These are the open opportunities in the connected system. When an item is about one of them, set "
-        "related_to.name to its exact name and related_to.kind to \"opportunity\". If none fits, leave "
-        f"related_to empty rather than inventing a name.\n{lines}"
+        "These open opportunities in the connected system are mentioned in the notes. Use this list only to "
+        "name the record: when an item is about one of them, set related_to.name to its exact name and "
+        "related_to.kind to \"opportunity\". Don't create an item for an opportunity just because it is listed "
+        "here; only for what the notes say. If none fits, leave related_to empty rather than inventing a "
+        f"name.\n{lines}"
     )
 
 
-def build_agent_task_prompt(prompt: dict) -> str:
+def build_agent_task_prompt(prompt: dict, results: list) -> str:
     """Task for an Agent's first answer: its collection prompt, plus how to list items and where it's heading."""
-    reference = reference_prompt_text()
+    reference = reference_prompt_text(notes_reference_records(results))
     return (
         f"{prompt['text'].strip()}\n\n"
         "Number every item you list (1, 2, 3…) so I can pick them by number, e.g. \"Yes:1,3 ignore 2\". "
@@ -2024,13 +2071,14 @@ def stage_agent_items(
     """Turn the discussion so far into exact records for the Agent's Action Command. Nothing is sent."""
     item_type = get_prompt_output_type(prompt)
     messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
+    reference = reference_prompt_text(notes_reference_records(discussion_results(search_state)))
     messages.append({
         "role": "user",
         "content": (
             f"{agent_command(prompt)}\n\nTurn what we have agreed in this conversation into records now. "
             "Include only the items I selected or agreed, with the details we agreed, and leave out anything "
             f"I said to ignore. {STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
-            + (f"\n\n{reference_prompt_text()}" if reference_records() else "")
+            + (f"\n\n{reference}" if reference else "")
         ),
     })
     reply, _usage = chat_with_ollama(
@@ -7600,7 +7648,7 @@ elif new_search and (prompt_text or run_filter_only):
                 ),
                 # An Agent's first answer comes from its collection prompt (step 1), told where it's heading.
                 "task_prompt": (
-                    build_agent_task_prompt(task_prompt) if is_agent_prompt(task_prompt)
+                    build_agent_task_prompt(task_prompt, final_results) if is_agent_prompt(task_prompt)
                     else task_prompt["text"] if task_prompt else ""
                 ),
                 "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt),

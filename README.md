@@ -346,7 +346,7 @@ Unknown values stay empty; nothing is guessed. **Related to** is a name (e.g. *A
 
 **Reference snapshot (real record names).** If the task executor provides one, `outbox/reference/opportunities.json` (format `llm-notes-reference/v1`, see `schemas/reference.v1.schema.json`) lists current records from the other system, e.g. the Salesforce connector's open opportunities with recent activity: name, account, stage, last updated, last activity and description. This app only reads it; it never contacts the other system. With a snapshot:
 
-- the Agent is given the real names and told to use one exactly in **Related to** (or leave it empty rather than invent one);
+- the Agent is given the real names of the records **your notes mention**, and told to use one exactly in **Related to** (or leave it empty rather than invent one), and not to create items for a record just because it's listed. A record counts as mentioned when its name or account appears in a note's text, file name or folder, ignoring case, spaces, punctuation and Ltd/Inc…, so `acme.eu` or `Ac-Me` match the account Acme Ltd. Notes that mention none get no list; choose the record with the picker below;
 - in the staging box each item shows **✓** with the record's account, stage and last update when it matches, or **⚠** when it doesn't (the connector would hold it), and a picker to choose the right record (notes must be linked; tasks can also be standalone);
 - **best guess search** links prefer a record whose name or account appears in your question;
 - the Agent box says how many records the snapshot holds and when it was refreshed. Refresh it from the task executor (the Salesforce Connector app refreshes it on every scheduled run and with **Refresh now**).
