@@ -1454,6 +1454,17 @@ def is_agent_prompt(prompt: dict | None) -> bool:
     return bool(prompt and prompt.get("agent") and not prompt.get("global"))
 
 
+def add_agent_border_style(*selectors: str) -> None:
+    """Blue border on the elements matched by the CSS selectors (usually st-key-* classes from widget keys)."""
+    st.html(f"<style>{', '.join(selectors)} {{ border: 1px solid {AGENT_BORDER_COLOR} !important; }}</style>")
+
+
+def agent_prompt_label(prompt: dict) -> str:
+    """Prompt name, plus what it drafts when it's an Agent (e.g. 'Action items → Tasks')."""
+    output = get_prompt_output_type(prompt)
+    return prompt["name"] + (f" → {OUTPUT_TYPES[output]}" if output != "text" else "")
+
+
 def get_prompt_output_type(prompt: dict | None) -> str:
     """Only Agent prompts draft output for the outbox; every other prompt gets a text answer."""
     if not is_agent_prompt(prompt):
@@ -1858,7 +1869,7 @@ def render_prompt_card(prompt: dict) -> None:
 def render_prompt_library_page() -> None:
     """Prompt library page (opened in its own tab): About me, corpus prompt, task prompts."""
     library = load_prompt_library()
-    st.html(f"<style>[class*='st-key-agent_prompt_card_'] {{ border-color: {AGENT_BORDER_COLOR} !important; }}</style>")
+    add_agent_border_style("[class*='st-key-agent_prompt_card_']")
     st.title("Prompt library")
     st.caption(
         "Shape what the LLM is told when it answers from your notes. Each request is built in this order: "
@@ -2056,11 +2067,12 @@ def render_injected_prompt_token(library: dict) -> None:
     if not task or task.get("global"):
         return
     st.session_state["question_task_token"] = [task["id"]]
+    if is_agent_prompt(task):
+        add_agent_border_style(".st-key-question_task_token [data-tag]")
     st.multiselect(
         "Injected prompt",
         options=[task["id"]],
-        format_func=lambda _: f"Prompt: {task['name']}"
-        + (f" → {OUTPUT_TYPES[get_prompt_output_type(task)]}" if get_prompt_output_type(task) != "text" else ""),
+        format_func=lambda _: f"Prompt: {agent_prompt_label(task)}",
         key="question_task_token",
         on_change=sync_injected_prompt_token,
         label_visibility="collapsed",
@@ -2112,6 +2124,8 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
     global_prompts = [p for p in library["prompts"] if p.get("global") and p.get("text", "").strip()]
     task_prompts = [p for p in library["prompts"] if not p.get("global")]
     active = resolve_run_prompts(library, corpus_config)["task"]
+    add_agent_border_style("[class*='st-key-use_agent_prompt_'] button", ".st-key-active_agent_task")
+    st.html("<style>.st-key-active_agent_task { padding: 0.1rem 0.25rem 0.1rem 0.75rem !important; }</style>")
 
     with st.container(border=True, gap="xsmall"):
         with st.container(horizontal=True, vertical_alignment="center"):
@@ -2144,10 +2158,13 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
                 st.caption(f"{title}:")
                 for prompt in prompts:
                     is_active = bool(active and active["id"] == prompt["id"])
+                    agent = is_agent_prompt(prompt)
                     st.button(
                         truncate_text(prompt["name"], 28),
-                        key=f"use_prompt_{title}_{prompt['id']}",
-                        help=prompt["text"],
+                        # Agent keys pick up the blue border style above.
+                        key=f"use_{'agent_' if agent else ''}prompt_{title}_{prompt['id']}",
+                        help=(f"**Agent** — drafts {OUTPUT_TYPES[get_prompt_output_type(prompt)]} for the outbox.\n\n"
+                              if agent else "") + prompt["text"],
                         type="primary" if is_active else "secondary",
                         on_click=clear_active_task_prompt if is_active else set_active_task_prompt,
                         args=() if is_active else (prompt["id"],),
@@ -2155,16 +2172,26 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
 
         with st.container(horizontal=True, vertical_alignment="center", gap="small"):
             if active:
-                st.markdown(f"**Task:** {active['name']}", help=active["text"], width="content")
-                st.button(
-                    ":material/close:",
-                    type="tertiary",
-                    key="clear_task_prompt",
-                    on_click=clear_active_task_prompt,
-                    help="Remove the task",
-                )
+                agent = is_agent_prompt(active)
+                with st.container(
+                    horizontal=True,
+                    vertical_alignment="center",
+                    gap="xsmall",
+                    width="content",
+                    border=agent,
+                    key="active_agent_task" if agent else "active_task",
+                ):
+                    st.markdown(f"**Task:** {agent_prompt_label(active)}", help=active["text"], width="content")
+                    st.button(
+                        ":material/close:",
+                        type="tertiary",
+                        key="clear_task_prompt",
+                        on_click=clear_active_task_prompt,
+                        help="Remove the task",
+                    )
             if task_prompts:
-                labels = {p["id"]: p["name"] for p in task_prompts}
+                # A dropdown can't style single options, so Agents show what they draft instead.
+                labels = {p["id"]: agent_prompt_label(p) for p in task_prompts}
                 st.selectbox(
                     "Find a prompt",
                     options=list(labels),

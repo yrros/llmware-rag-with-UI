@@ -283,6 +283,7 @@ Four example task prompts are added the first time; edit or delete them freely.
 - **Task** — click a prompt to attach it (click it again, or **✕**, to remove it); your question still decides which notes are found, and the task tells the LLM what to write from them. The task also applies to follow-up questions. With **Exact text only**, a task can produce an answer even without a question.
 - **Recent** — titles of the five task prompts most recently used for an answer, newest first. **Starred** — up to five starred prompts not already in Recent, most recently used first, so favourites fill the gap. Hover a title to see the full prompt.
 - **Find a prompt** — search every task prompt by name or tag.
+- **Agent prompts** have a blue border here too: on the Recent and Starred buttons, on the chosen **Task**, and on the prompt token under the question box. Their names show what they draft (e.g. *Action items → Tasks*), including in **Find a prompt**.
 
 Each request is sent in this order: today's date → About me → corpus prompt → global prompts → notes and question → task. The answer caption lists the prompts that were used.
 
