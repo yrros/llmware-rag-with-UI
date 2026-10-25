@@ -7478,11 +7478,15 @@ with ask_box_col:
             llm_temperature = float(corpus_config["llm_temperature"])
 
         search_clicked = st.button(
-            "🔍 Search exact text" if exact_text_only else "🔍 Search",
+            "🔍 Ask (filtered only)" if exact_text_only else "🔍 Search",
             type="primary",
             use_container_width=True,
             help="Uses the route chosen in the Filter box: "
-            + ("**Literal**, the notes matching the filter terms." if exact_text_only else "**Semantic**, by meaning.")
+            + (
+                "**Literal**: answers your question from the notes matching the filter terms, sent in full."
+                if exact_text_only
+                else "**Semantic**, by meaning."
+            )
             + f" Returns at most {result_limit} results (**Max results**, in the Filter box).",
         )
         # Searching and answering show their progress here, right under the button that started them.

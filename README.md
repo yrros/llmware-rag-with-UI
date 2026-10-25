@@ -264,7 +264,7 @@ The search area is split into a **Filter** box (left) and an **Ask** box (right)
 | Route | What **Search** does | Settings shown |
 |-------|----------------------|----------------|
 | **Semantic (meaning)** | Ranks passages by meaning using the embeddings. Filter terms narrow which notes it looks in. | **Distance cutoff** (how close a match must be) and, after a search, the match bar. |
-| **Literal (exact text)** — button reads **Search exact text** | Returns the notes that match the filter terms, in full. Much faster; the question is only used for the LLM answer. | **Search all libraries**, **🔎 Filter search only**, **🔄 Rescan → Filter search**. |
+| **Literal (exact text)** — button reads **Ask (filtered only)** | Returns the notes that match the filter terms, in full. Much faster; the question is only used for the LLM answer. | **Search all libraries**, **🔎 Filter search only**, **🔄 Rescan → Filter search**. |
 
 The route is saved between sessions. **🔎 Filter search only** (Literal route) lists the matching notes under the Filter box without an LLM answer, keeping your question for later. Notes are grouped under 📁 headings with their folder path (e.g. `Notes > Clients-Prospects > Acme`), sorted by path, with the number of notes in each; notes whose folder isn't known come last. Tick **🚫** beside a listed note to exclude it from the next **Search** (semantic ranking and LLM answer); excluded notes stay in the filter list, crossed out, and **Clear exclusions** in the Filter box resets them for the session. A full **Search** shows the answer, sources and discussion full-width below both boxes.
 
