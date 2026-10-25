@@ -270,7 +270,10 @@ Open it from **Prompt Library → Open prompt library** in the left panel, or **
 | **About me** | One free-text box sent with every LLM request in every corpus — your name, where you're based, accessibility needs, how you like answers. Untick **Include in LLM requests** to switch it off. Today's date is always added. |
 | **Corpus prompt** | Pick a corpus and describe the role you wrote its notes in (e.g. business owner, salesperson). Tick **Apply corpus prompt** to send it for that corpus only. |
 | **Task prompts** | Reusable instructions such as "Write a meeting summary and next steps as an email". Each has a name, text, **Global** and **Starred** checkboxes, tags (for finding prompts) and a delete button. Edits save as you go, with a *Saved* time under the text. Tick **Global** to send a prompt with every request in every corpus, like About me — for standing instructions. Above the list: full-text search, **Clear search**, and **Common keywords** (tags from your most recently used prompts) to filter with one click. |
-| **Add a prompt** | Name, text, **Global**, **Starred** and tags, then **Add prompt**. |
+| **Add a prompt** | Name, text, **Global**, **Starred**, **Output** and tags, then **Add prompt**. |
+| **Outbox** | The folder that sent drafts are written to, and how many packages are waiting, processed and failed. See [Drafts and the outbox](#drafts-and-the-outbox). |
+
+Each task prompt also has an **Output**: **Text answer** (the default) or **Note**, **Tasks** or **Email**, which turn the answer into drafts you can send to the outbox.
 
 Four example task prompts are added the first time; edit or delete them freely.
 
@@ -284,6 +287,20 @@ Four example task prompts are added the first time; edit or delete them freely.
 Each request is sent in this order: today's date → About me → corpus prompt → global prompts → notes and question → task. The answer caption lists the prompts that were used.
 
 Requires Ollama running locally (`localhost:11434`).
+
+### Drafts and the outbox
+
+When the task prompt's **Output** is **Note**, **Tasks** or **Email**, the LLM writes drafts instead of prose (the built-in **Action items** prompt drafts tasks). They appear under the answer as editable cards:
+
+1. Review and edit each draft. Untick a draft to leave it out. Leave a field empty when the notes don't say; nothing is guessed.
+2. **Related to** and **Kind** name the client, deal or person a draft belongs to (e.g. *Acme pilot*, *Opportunity*). They are a name, not a link; the receiving system finds the matching record.
+3. Click **Send to outbox**. The drafts are checked against `schemas/handoff.v1.schema.json` and written as one JSON file, then locked so they can't be sent twice.
+
+The app never contacts another system. A separate connector (for example [rag-action-interface](https://github.com/yrros/rag-action-interface) for Salesforce) reads the outbox, moves each package to `outbox/processed/` or `outbox/failed/`, and leaves a `<package name>.receipt.json` beside it. The drafts panel shows that result once the receipt appears: what was created, and why anything wasn't.
+
+**Default location:** `outbox/` in the project folder, i.e. the folder you run Streamlit from, which is the project folder when you start with `start_app.sh` or the Desktop launcher. Change it under **Outbox** on the Prompt library page (saved as `outbox_path` in `app_settings.json`); the connector must read the same folder. The outbox is gitignored because sent drafts contain your notes, and `reset_rag.sh` leaves it alone.
+
+Each file is named `YYYYMMDD-HHMMSS-<note|task|email>-<first 8 characters of the package id>.json` and written atomically (a hidden `.<name>.tmp` file is renamed into place).
 
 ### Advanced settings
 
@@ -334,6 +351,8 @@ llmware_data/
 
 This folder is gitignored. To reset it, use `reset_rag.sh` (see [Resetting the environment](#resetting-the-environment)).
 
+Drafts you send are written to **`./outbox/`** next to it by default (also gitignored; see [Drafts and the outbox](#drafts-and-the-outbox)).
+
 On first run, the app may copy data from the legacy location `~/llmware_data/` if the project-local folder is empty.
 
 ---
@@ -357,6 +376,7 @@ On first run, the app may copy data from the legacy location `~/llmware_data/` i
 - `auto_rescan_enabled` — default `false`; text-only rescan every 3 minutes in the background
 - `auto_rescan_all_corpora` — default `false`; auto-rescan every visible corpus instead of just the selected one
 - `hide_corpora_enabled` — default `false`; hide corpora marked `hidden` in `corpus_settings.json` from the library list and all-corpora scans
+- `outbox_path` — folder that sent drafts are written to; empty means `outbox/` in the project folder
 
 ### In-app constants (`UI-semantic-search.py`)
 
@@ -404,7 +424,8 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 | `ensure_ollama_ready.py` | Starts Ollama if needed and warms the configured LLM |
 | `Installer.sh` | Creates `venv`, installs dependencies, and builds Desktop `LLM-Notes.app` |
 | `reset_rag.sh` | Deletes indexes, vectors, histories and temp files; keeps models and settings |
-| `.gitignore` | Excludes `llmware_data/`, venvs, `__pycache__` |
+| `schemas/handoff.v1.schema.json` | Format of the packages written to the outbox (`llm-notes-handoff/v1`), shared with connectors |
+| `.gitignore` | Excludes `llmware_data/`, `outbox/`, venvs, `__pycache__` |
 
 ---
 
