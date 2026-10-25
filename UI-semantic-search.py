@@ -840,7 +840,7 @@ QUICK_DATE_LABELS = {
     "this_month": "This month", "last_month": "Last month",
 }
 # Any date-like term, typed or added by a button: 2026-10-25, 2026-10, 2026, 2026/10/25, 2026/10, 25/10/2026,
-# 25-10-2026, Week#43 / Week 43. A quick date button removes all of these from its field first.
+# 25-10-2026, Week#43 / Week 43. A quick date button removes the ones left over from the last search.
 QUICK_DATE_TERM = re.compile(
     r"^(\d{4}([-/]\d{1,2}){0,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4}|week\s*#?\s*\d{1,2})$", re.IGNORECASE
 )
@@ -867,11 +867,27 @@ def quick_date_terms(kind: str, today: datetime.date, field: str = "all") -> lis
     return [(monday + datetime.timedelta(days=i)).isoformat() for i in range(7)]
 
 
+def date_terms(terms) -> list[str]:
+    return [str(t) for t in terms if QUICK_DATE_TERM.match(str(t))]
+
+
+def remember_searched_dates() -> None:
+    """Note each field's dates at a search (or as restored at start); later clicks treat them as left over."""
+    for field in SEARCH_FILTER_FIELDS:
+        st.session_state[f"searched_dates_{field}"] = date_terms(st.session_state.get(f"filter_{field}", []))
+
+
 def apply_quick_date(kind: str, field: str) -> None:
-    """Replace every date term in a filter field (typed or from a button) with this button's, then save."""
+    """Add this button's dates to a filter field, then save.
+
+    Dates left over from the last search (typed or from a button) are taken out first; dates added since,
+    such as Today then Yesterday, are kept so they can be searched together.
+    """
     key = f"filter_{field}"
-    kept = [t for t in st.session_state.get(key, []) if not QUICK_DATE_TERM.match(str(t))]
-    st.session_state[key] = kept + quick_date_terms(kind, datetime.date.today(), field)
+    stale = set(st.session_state.get(f"searched_dates_{field}", []))
+    kept = [t for t in st.session_state.get(key, []) if str(t) not in stale]
+    st.session_state[key] = kept + [t for t in quick_date_terms(kind, datetime.date.today(), field) if t not in kept]
+    st.session_state[f"searched_dates_{field}"] = []
     persist_search_filter()
 
 
@@ -889,7 +905,7 @@ def render_filter_heading(field: str, label: str, field_help: str) -> None:
                 type="tertiary",
                 on_click=apply_quick_date,
                 args=(kind, field),
-                help=f"Puts {shown} in **{label}**, and takes out any other dates there.",
+                help=f"Adds {shown} to **{label}**, and takes out dates left from the last search.",
             )
 
 
@@ -7054,6 +7070,8 @@ with filter_box_col:
             _key = f"filter_{field}"
             if _key not in st.session_state:
                 st.session_state[_key] = clean_filter_terms(_saved_filter.get(field, []))
+                # Dates restored from the last session count as left over from an earlier search.
+                st.session_state[f"searched_dates_{field}"] = date_terms(st.session_state[_key])
             # The heading carries the field's help and its quick date buttons, on one line.
             render_filter_heading(field, label, (
                 f"{field_help}\n\n"
@@ -7314,6 +7332,7 @@ new_search = search_clicked or filter_only_clicked
 if new_search:
     # Also save on Search, in case the box was not left before clicking.
     persist_question()
+    remember_searched_dates()
 run_filter_only = filter_only_clicked or (search_clicked and exact_text_only)
 search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode()
 

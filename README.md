@@ -240,7 +240,7 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
 
    Terms match literally and case-insensitively anywhere in the note or its file name (`2026-10` matches `2026-10-19`). With a question, semantic search ranks passages only within the matching notes. Filters are saved between sessions.
 
-   **Quick dates** sit on the heading line of **Must include**, **Any of** and **Exclude**, and put date terms into that field. Each first takes every other date out of its own field, whether a button added it or you typed it (`2026-10-25`, `2026-10`, `2026`, `2026/10/25`, `25/10/2026`, `Week#43`…); other terms, and the other two fields, stay as they are:
+   **Quick dates** sit on the heading line of **Must include**, **Any of** and **Exclude**, and put date terms into that field. Clicks add up until you search, so **Today** then **Yesterday** in **Any of** finds notes from either day. After a search, the next click first takes out the dates that were in that field for the search (and dates restored when the app starts), whether a button added them or you typed them (`2026-10-25`, `2026-10`, `2026`, `2026/10/25`, `25/10/2026`, `Week#43`…). Other terms, and the other two fields, stay as they are:
 
    | Button | Adds to Must include (on Sunday 25 October 2026) | Adds to Any of / Exclude |
    |---|---|---|
@@ -251,7 +251,7 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
    | **This month** | `2026-10` | the same |
    | **Last month** | `2026-09` | the same |
 
-   Days match notes that contain the date as `YYYY-MM-DD`, and months every date in that month. In **Must include**, weeks match notes headed `Week#NN` in that year, using ISO weeks (Monday to Sunday; 29 Dec 2025 is 2026 `Week#1`). The year is its own term rather than a month, so a week that spans two months still matches. Because terms match anywhere, `Week#4` also matches `Week#40`–`Week#49`, which only matters in weeks 1–9. In **Any of** and **Exclude** a bare year would match, or exclude, the whole year, so weeks are the seven days instead. A bare four-digit number counts as a year, so a button would take it out too. Hover a button to see exactly what it puts in.
+   Days match notes that contain the date as `YYYY-MM-DD`, and months every date in that month. In **Must include**, weeks match notes headed `Week#NN` in that year, using ISO weeks (Monday to Sunday; 29 Dec 2025 is 2026 `Week#1`). The year is its own term rather than a month, so a week that spans two months still matches. Because terms match anywhere, `Week#4` also matches `Week#40`–`Week#49`, which only matters in weeks 1–9. In **Any of** and **Exclude** a bare year would match, or exclude, the whole year, so weeks are the seven days instead. A bare four-digit number counts as a year, so a button would take a leftover one out too. Hover a button to see exactly what it puts in.
 3. Enter your question in **What would you like to ask?**
 4. Click **Search**.
 
