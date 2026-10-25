@@ -2408,6 +2408,23 @@ def move_outbox_package(path_text: str, destination: str, action: str) -> None:
     st.session_state["actions_notice"] = f"{action} `{path.name}`."
 
 
+def delete_withdrawn_packages(path_texts: list[str]) -> None:
+    """Delete withdrawn packages (and their receipts) for good. Only files in the withdrawn folder are touched."""
+    withdrawn = (get_outbox_dir() / WITHDRAWN_DIR).resolve()
+    deleted = 0
+    for path_text in path_texts:
+        path = Path(path_text)
+        if path.resolve().parent != withdrawn or not path.is_file():
+            continue
+        receipt_beside(path).unlink(missing_ok=True)
+        path.unlink()
+        deleted += 1
+    st.session_state["actions_notice"] = (
+        f"Deleted `{Path(path_texts[0]).name}`." if deleted == 1 and len(path_texts) == 1
+        else f"Deleted {deleted} withdrawn package{'s' if deleted != 1 else ''}."
+    )
+
+
 def outbox_entry_matches(entry: dict, query: str) -> bool:
     words = query.lower().split()
     text = json.dumps([entry["package"], entry["receipt"], entry["path"].name, entry["error"]]).lower()
@@ -2496,7 +2513,7 @@ def render_outbox_entry(entry: dict, state: str) -> None:
 
 
 def render_outbox_entry_actions(entry: dict, state: str) -> None:
-    """Withdraw (waiting, failed), Retry (failed) and Restore (withdrawn) buttons for one package."""
+    """Withdraw (waiting, failed), Retry (failed), and Restore and Delete (withdrawn) buttons for one package."""
     path, key = str(entry["path"]), f"{state}_{entry['path'].name}"
     unreadable = bool(entry["error"] or (entry["receipt"] or {}).get("error"))
     with st.container(horizontal=True):
@@ -2535,6 +2552,15 @@ def render_outbox_entry_actions(entry: dict, state: str) -> None:
                 args=(path, "", "Restored to the outbox:"),
                 help="Send it back to the outbox for a connector to process.",
             )
+            with st.popover("Delete", icon=":material/delete:", help="Delete this package for good"):
+                st.markdown("Delete this package and its receipt for good? This can't be undone.")
+                st.button(
+                    "Delete",
+                    key=f"actions_delete_{key}",
+                    type="primary",
+                    on_click=delete_withdrawn_packages,
+                    args=([path],),
+                )
         editable = editable_item_indexes(entry, state)
         if editable:
             editing = st.toggle(
@@ -2723,6 +2749,20 @@ def render_actions_page() -> None:
                 st.caption(f"{len(shown)} of {len(entries[state])} match.")
             if not shown:
                 st.caption(OUTBOX_STATES[state][1] if not entries[state] else "Nothing matches the filter.")
+            if state == "withdrawn" and shown:
+                everything = len(shown) == len(entries[state])
+                label = "Delete all" if everything else f"Delete these {len(shown)}"
+                with st.popover(label, icon=":material/delete_sweep:",
+                                help="Delete the withdrawn packages listed here for good"):
+                    st.markdown(f"Delete {'all ' if everything else ''}{len(shown)} withdrawn package"
+                                f"{'s' if len(shown) != 1 else ''} and their receipts for good? This can't be undone.")
+                    st.button(
+                        label,
+                        key="actions_delete_withdrawn",
+                        type="primary",
+                        on_click=delete_withdrawn_packages,
+                        args=([str(entry["path"]) for entry in shown],),
+                    )
             for entry in shown:
                 render_outbox_entry(entry, state)
 
@@ -4674,6 +4714,9 @@ def render_sent_status(batch: dict) -> bool:
         st.info(f"Sent {count} at {batch['at']}, then withdrawn on the Actions page.")
         return False
     receipt = read_handoff_receipt(package_file)
+    if not receipt and not package_file.is_file():  # not in the outbox, withdrawn/, processed/ or failed/
+        st.info(f"Sent {count} at {batch['at']}, then withdrawn and deleted on the Actions page.")
+        return False
     if not receipt:
         st.info(f"Sent {count} to the outbox at {batch['at']}. Waiting for a connector to pick it up.")
         return True
