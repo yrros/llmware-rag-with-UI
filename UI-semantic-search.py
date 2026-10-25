@@ -1918,6 +1918,145 @@ def render_outbox_entry_actions(entry: dict, state: str) -> None:
                 args=(path, "", "Restored to the outbox:"),
                 help="Send it back to the outbox for a connector to process.",
             )
+        editable = editable_item_indexes(entry, state)
+        if editable:
+            editing = st.toggle(
+                "Edit",
+                key=f"actions_editing_{key}",
+                help="Change the text before a connector acts on it, e.g. add a marker like [TEST] to find it easily.",
+            )
+    if editable and editing:
+        render_package_editor(entry, key, editable, state)
+
+
+EDITABLE_OUTBOX_STATES = ("waiting", "failed", "withdrawn")
+
+
+def editable_item_indexes(entry: dict, state: str) -> list[int]:
+    """Items that can still be edited: not processed yet, or (for failed packages) not created yet."""
+    package = entry["package"]
+    if state not in EDITABLE_OUTBOX_STATES or entry["error"] or not isinstance(package, dict):
+        return []
+    created = {
+        r.get("index") for r in (entry["receipt"] or {}).get("items", [])
+        if isinstance(r, dict) and r.get("status") in ("created", "exists")
+    }
+    return [i for i, item in enumerate(package.get("items", [])) if isinstance(item, dict) and i not in created]
+
+
+def package_edit_key(entry_key: str, index: int, field: str) -> str:
+    return f"actions_edit_{entry_key}_{index}_{field}"
+
+
+def render_package_editor(entry: dict, entry_key: str, indexes: list[int], state: str) -> None:
+    """Form to edit a package's items in place; saving rewrites the file atomically with the same package id."""
+    items = entry["package"]["items"]
+    if state == "failed" and len(indexes) < len(items):
+        st.caption("Records already created aren't shown: editing them wouldn't change what's in the other system.")
+    with st.form(f"actions_edit_form_{entry_key}", border=True):
+        for index in indexes:
+            item = items[index]
+            key = lambda field: package_edit_key(entry_key, index, field)  # noqa: E731
+            item_type = item.get("type", "")
+            st.markdown(f"**{ {'note': 'Note', 'task': 'Task', 'email': 'Email'}.get(item_type, 'Item') } {index + 1}**")
+            if item_type == "note":
+                st.text_input("Title", value=item.get("title", ""), key=key("title"))
+                st.text_area("Body", value=item.get("body", ""), key=key("body"), height=140)
+            elif item_type == "task":
+                st.text_input("Subject", value=item.get("subject", ""), key=key("subject"))
+                st.text_area("Description", value=item.get("description", ""), key=key("description"), height=80)
+                due_col, priority_col, owner_col = st.columns(3)
+                due = item.get("due_date", "")
+                due_col.date_input(
+                    "Due date",
+                    value=datetime.date.fromisoformat(due) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due) else None,
+                    key=key("due_date"),
+                    format="YYYY-MM-DD",
+                )
+                priority = item.get("priority", "")
+                priority_col.selectbox(
+                    "Priority",
+                    TASK_PRIORITIES,
+                    index=TASK_PRIORITIES.index(priority) if priority in TASK_PRIORITIES else 0,
+                    format_func=lambda p: p.capitalize() or "Not set",
+                    key=key("priority"),
+                )
+                owner_col.text_input("Owner", value=item.get("owner", ""), key=key("owner"), placeholder="Not given")
+            else:
+                st.text_input("To", value=", ".join(item.get("to", [])), key=key("to"), help="Comma-separated.")
+                st.text_input("Subject", value=item.get("subject", ""), key=key("subject"))
+                st.text_area("Body", value=item.get("body", ""), key=key("body"), height=140)
+            related = item.get("related_to") or {}
+            name_col, kind_col = st.columns([2, 1])
+            name_col.text_input("Related to", value=related.get("name", ""), key=key("related_name"))
+            kind = related.get("kind", "")
+            kind_col.selectbox(
+                "Kind",
+                RELATED_KINDS,
+                index=RELATED_KINDS.index(kind) if kind in RELATED_KINDS else 0,
+                format_func=lambda k: k.capitalize() or "Not sure",
+                key=key("related_kind"),
+            )
+        st.form_submit_button(
+            "Save changes",
+            type="primary",
+            icon=":material/save:",
+            on_click=save_package_edits,
+            args=(str(entry["path"]), entry_key, indexes),
+        )
+
+
+def save_package_edits(path_text: str, entry_key: str, indexes: list[int]) -> None:
+    """Write the edited items back to the package file (validated, atomic, same id), then close the editor."""
+    path = Path(path_text)
+    if not path.is_file():
+        st.session_state["actions_notice"] = f"`{path.name}` has moved (a connector may have picked it up); nothing saved."
+        return
+    package = json.loads(path.read_text())
+    problems = []
+    for index in indexes:
+        item = package["items"][index]
+        value = lambda field, default: st.session_state.get(package_edit_key(entry_key, index, field), default)  # noqa: E731
+        related = item.get("related_to") or {}
+        edited = {
+            **item,
+            "related_to": {
+                "name": value("related_name", related.get("name", "")),
+                "kind": value("related_kind", related.get("kind", "")),
+            },
+        }
+        for field in ("title", "body", "subject", "description", "priority", "owner"):
+            if field in item:
+                edited[field] = value(field, item[field])
+        if "due_date" in item:
+            due = value("due_date", None)
+            edited["due_date"] = due.isoformat() if isinstance(due, datetime.date) else ""
+        if "to" in item:
+            to = value("to", ", ".join(item["to"]))
+            edited["to"] = to.split(",") if isinstance(to, str) else to
+        cleaned = normalise_draft_item(item["type"], edited)
+        if not (cleaned.get("subject") or cleaned.get("title")):
+            problems.append(f"Item {index + 1} needs a {'title' if item['type'] == 'note' else 'subject'}.")
+        package["items"][index] = cleaned
+    if problems:
+        st.session_state["actions_notice"] = "Not saved: " + " ".join(problems)
+        return
+    try:
+        validate_handoff_package(package)
+    except Exception as exc:
+        st.session_state["actions_notice"] = f"Not saved: the package wouldn't be valid ({exc})."
+        return
+    temp = path.with_name(f".{path.name}.tmp")  # connectors skip dotfiles, so they never see a half-written file
+    temp.write_text(json.dumps(package, indent=2, ensure_ascii=False))
+    if not path.is_file():  # picked up while we were writing: don't recreate it
+        temp.unlink()
+        st.session_state["actions_notice"] = f"`{path.name}` has moved (a connector may have picked it up); nothing saved."
+        return
+    temp.replace(path)
+    for widget_key in [k for k in st.session_state if str(k).startswith(f"actions_edit_{entry_key}_")]:
+        del st.session_state[widget_key]
+    st.session_state[f"actions_editing_{entry_key}"] = False
+    st.session_state["actions_notice"] = f"Saved changes to `{path.name}`."
 
 
 def render_actions_page() -> None:
@@ -1927,7 +2066,8 @@ def render_actions_page() -> None:
     outbox = get_outbox_dir()
     st.caption(
         f"Everything Agents have sent to the outbox (`{outbox}`) and what the connector did with it. "
-        "Withdraw a package to stop a connector acting on it, or retry one after a temporary error."
+        "Edit a package's text before a connector acts on it, withdraw it to stop a connector acting on it, "
+        "or retry one after a temporary error."
     )
     if notice := st.session_state.pop("actions_notice", None):
         st.toast(notice)
