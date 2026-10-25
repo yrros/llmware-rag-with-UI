@@ -716,8 +716,20 @@ def persist_gpu_for_embeddings_setting() -> None:
 set_embedding_acceleration(load_app_settings().get("use_gpu_for_embeddings", False))
 
 
-def persist_exact_text_only_setting() -> None:
-    save_app_settings({"exact_text_only": bool(st.session_state.get("exact_text_only", False))})
+SEARCH_ROUTES = {"semantic": "Semantic (meaning)", "literal": "Literal (exact text)"}
+
+
+def saved_search_route() -> str:
+    """The route last chosen; stored as `exact_text_only` so older settings carry over."""
+    return "literal" if load_app_settings().get("exact_text_only", False) else "semantic"
+
+
+def persist_search_route() -> None:
+    route = st.session_state.get("search_route")
+    if route is None:  # clicking the selected option again clears it: keep the route instead
+        st.session_state["search_route"] = saved_search_route()
+        return
+    save_app_settings({"exact_text_only": route == "literal"})
 
 
 DISTANCE_SLIDER_MIN = 0.30
@@ -6296,6 +6308,25 @@ with filter_box_col:
             use_container_width=True,
             help="Remove all filter terms and note exclusions.",
         )
+        # Two routes into the notes: semantic (vector) search or literal text matching. The controls below
+        # follow the route; the Ask box's Search button uses it too.
+        if "search_route" not in st.session_state:
+            st.session_state["search_route"] = saved_search_route()
+        st.segmented_control(
+            "Search route",
+            options=list(SEARCH_ROUTES),
+            format_func=SEARCH_ROUTES.get,
+            key="search_route",
+            on_change=persist_search_route,
+            width="stretch",
+            help=(
+                "**Semantic** ranks passages by meaning (embeddings); filter terms narrow which notes it "
+                "looks in, and **Distance cutoff** sets how close a match must be.\n\n"
+                "**Literal** returns the notes that match the filter terms, in full. Much faster, works "
+                "across libraries, and the question is only used for the LLM answer."
+            ),
+        )
+        exact_text_only = st.session_state.get("search_route") == "literal"
         _saved_filter = load_app_settings().get("search_filter") or {}
         FILTER_WIDGETS = {
             "all": (
@@ -6326,7 +6357,11 @@ with filter_box_col:
                     f"{field_help}\n\n"
                     "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
                     "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
-                    "With a question, semantic search ranks passages **only within** the matching notes."
+                    + (
+                        "On the **Literal** route, **Search** returns the matching notes in full."
+                        if exact_text_only
+                        else "On the **Semantic** route, passages are ranked **only within** the matching notes."
+                    )
                 ),
             )
         install_filter_commit_on_blur()
@@ -6339,99 +6374,92 @@ with filter_box_col:
             clear_col.button("Clear exclusions", on_click=clear_excluded_notes, use_container_width=True)
 
         with st.container(border=True):
-            st.markdown("**Advanced search settings**")
-            exact_col, all_libs_col, filter_btn_col = st.columns([1, 1, 1.2], vertical_alignment="center")
-            with exact_col:
-                exact_text_only = st.checkbox(
-                    "Exact text only",
-                    value=bool(load_app_settings().get("exact_text_only", False)),
-                    key="exact_text_only",
-                    on_change=persist_exact_text_only_setting,
-                    help=(
-                        "Makes **Search** skip vector search and return the notes that match the filter, "
-                        "in full. Much faster than semantic search. The question is then only used for "
-                        "the LLM answer."
-                    ),
-                )
-            with all_libs_col:
-                search_all_libraries = st.checkbox(
-                    "Search all libraries",
-                    value=bool(load_app_settings().get("search_all_libraries", False)),
-                    key="search_all_libraries",
-                    on_change=persist_search_all_libraries_setting,
-                    disabled=is_single_corpus_mode(),
-                    help=(
-                        "For **Filter search only** and **Exact text only** searches: looks in every visible "
-                        "library and shows how many matching notes each one has, so you can switch to the "
-                        "right library for a semantic search. Uses literal text matching only — no "
-                        "embeddings are needed. Semantic searches always use the selected library."
-                    ),
-                )
-            with filter_btn_col:
-                filter_only_clicked = st.button(
-                    "🔎 Filter search only",
-                    help=(
-                        "Lists the notes that match the filter below this box, without vector search or "
-                        "an LLM answer. Your question is kept but not sent. **Max results** limits the "
-                        "number of notes."
-                    ),
+            st.markdown(
+                "**Advanced search settings** · "
+                + ("literal: whole notes that match the filter" if exact_text_only else "semantic: passages ranked by meaning")
+            )
+            if exact_text_only:
+                all_libs_col, filter_btn_col = st.columns([1, 1.2], vertical_alignment="center")
+                with all_libs_col:
+                    search_all_libraries = st.checkbox(
+                        "Search all libraries",
+                        value=bool(load_app_settings().get("search_all_libraries", False)),
+                        key="search_all_libraries",
+                        on_change=persist_search_all_libraries_setting,
+                        disabled=is_single_corpus_mode(),
+                        help=(
+                            "Looks in every visible library and shows how many matching notes each one has, so "
+                            "you can switch to the right library for a semantic search. Literal matching only: "
+                            "no embeddings are needed."
+                        ),
+                    )
+                with filter_btn_col:
+                    filter_only_clicked = st.button(
+                        "🔎 Filter search only",
+                        help=(
+                            "Lists the notes that match the filter below this box, without an LLM answer. Your "
+                            "question is kept but not sent. **Max results** limits the number of notes."
+                        ),
+                        use_container_width=True,
+                    )
+
+                rescan_all = search_all_libraries and not is_single_corpus_mode()
+                rescan_libraries = scan_libraries if rescan_all else [selected_lib]
+                rescan_note_col, rescan_btn_col = st.columns([2, 1.2], vertical_alignment="center")
+                rescan_note_slot = rescan_note_col.empty()
+                if rescan_btn_col.button(
+                    "🔄 Rescan → Filter search",
                     use_container_width=True,
+                    help=(
+                        "Picks up new, edited and deleted notes in the text index — of every visible library "
+                        "when **Search all libraries** is ticked, otherwise this one — then runs "
+                        "**Filter search only**. Text only: embeddings wait for **⚡ Rescan** in the left panel."
+                    ),
+                ):
+                    with st.spinner("Rescanning notes…"):
+                        with get_text_rescan_scheduler().lock:
+                            rescan = run_text_rescan(
+                                [
+                                    (
+                                        library,
+                                        resolve_library_registry_name(library),
+                                        resolve_library_content_path(corpus_root_path, library),
+                                    )
+                                    for library in rescan_libraries
+                                ],
+                                "button",
+                            )
+                    for message in rescan["errors"]:
+                        st.warning(f"Rescan failed for {message}")
+                    filter_only_clicked = True
+                rescan_note_slot.caption(
+                    describe_last_text_rescan([resolve_library_registry_name(lib) for lib in rescan_libraries])
                 )
-
-            rescan_all = search_all_libraries and not is_single_corpus_mode()
-            rescan_libraries = scan_libraries if rescan_all else [selected_lib]
-            rescan_note_col, rescan_btn_col = st.columns([2, 1.2], vertical_alignment="center")
-            rescan_note_slot = rescan_note_col.empty()
-            if rescan_btn_col.button(
-                "🔄 Rescan → Filter search",
-                use_container_width=True,
-                help=(
-                    "Picks up new, edited and deleted notes in the text index — of every visible library "
-                    "when **Search all libraries** is ticked, otherwise this one — then runs "
-                    "**Filter search only**. Text only: embeddings wait for **⚡ Rescan** in the left panel."
-                ),
-            ):
-                with st.spinner("Rescanning notes…"):
-                    with get_text_rescan_scheduler().lock:
-                        rescan = run_text_rescan(
-                            [
-                                (
-                                    library,
-                                    resolve_library_registry_name(library),
-                                    resolve_library_content_path(corpus_root_path, library),
-                                )
-                                for library in rescan_libraries
-                            ],
-                            "button",
-                        )
-                for message in rescan["errors"]:
-                    st.warning(f"Rescan failed for {message}")
-                filter_only_clicked = True
-            rescan_note_slot.caption(
-                describe_last_text_rescan([resolve_library_registry_name(lib) for lib in rescan_libraries])
-            )
-
-            # Distance cutoff is a search setting (which passages count as matches), so it lives here, not in Ask.
-            _cutoff_key = f"search_distance_threshold_{safe_lib}"
-            if _cutoff_key not in st.session_state:
-                st.session_state[_cutoff_key] = float(distance_threshold)
-            st.slider(
-                "Distance cutoff",
-                min_value=DISTANCE_SLIDER_MIN,
-                max_value=DISTANCE_SLIDER_MAX,
-                step=DISTANCE_SLIDER_STEP,
-                key=_cutoff_key,
-                on_change=sync_cutoff_from_search,
-                args=(safe_lib,),
-                help=(
-                    "Semantic matches must be closer than this distance. Lower = stricter, higher = more lax. "
-                    "Same setting as **Relevance cutoff** in the left panel; changes here are saved for this corpus.\n\n"
-                    "After a semantic search the bar below shows where passages were found: "
-                    "**green** is within the cutoff, **amber** is where to raise it to include more."
-                ),
-            )
-            distance_threshold = float(st.session_state[_cutoff_key])
-            distance_map_slot = st.container()
+                distance_map_slot = None  # literal results have no distances to show
+            else:
+                search_all_libraries = False  # semantic searches always use the selected library
+                filter_only_clicked = False
+                # Which passages count as semantic matches: a search setting, so it lives here, not in Ask.
+                _cutoff_key = f"search_distance_threshold_{safe_lib}"
+                if _cutoff_key not in st.session_state:
+                    st.session_state[_cutoff_key] = float(distance_threshold)
+                st.slider(
+                    "Distance cutoff",
+                    min_value=DISTANCE_SLIDER_MIN,
+                    max_value=DISTANCE_SLIDER_MAX,
+                    step=DISTANCE_SLIDER_STEP,
+                    key=_cutoff_key,
+                    on_change=sync_cutoff_from_search,
+                    args=(safe_lib,),
+                    help=(
+                        "Semantic matches must be closer than this distance. Lower = stricter, higher = more lax. "
+                        "Same setting as **Relevance cutoff** in the left panel; changes here are saved for this corpus.\n\n"
+                        "After a semantic search the bar below shows where passages were found: "
+                        "**green** is within the cutoff, **amber** is where to raise it to include more."
+                    ),
+                )
+                distance_threshold = float(st.session_state[_cutoff_key])
+                distance_map_slot = st.container()
 
     # Filter-only results are listed here, under the Filter box.
     filter_results_slot = st.container()
@@ -6539,7 +6567,13 @@ with ask_box_col:
 
         search_col, limit_col = st.columns([2, 1], vertical_alignment="bottom")
         with search_col:
-            search_clicked = st.button("🔍 Search", type="primary", use_container_width=True)
+            search_clicked = st.button(
+                "🔍 Search exact text" if exact_text_only else "🔍 Search",
+                type="primary",
+                use_container_width=True,
+                help="Uses the route chosen in the Filter box: "
+                + ("**Literal**, the notes matching the filter terms." if exact_text_only else "**Semantic**, by meaning."),
+            )
         with limit_col:
             result_limit = st.number_input("Max results", min_value=1, max_value=50, value=15)
         # Searching and answering show their progress here, right under the button that started them.
@@ -6698,7 +6732,7 @@ elif new_search and (prompt_text or run_filter_only):
 
 # Results are kept in session state so they survive reruns (follow-ups, downloads, expanders).
 last_search = st.session_state.get(LAST_SEARCH_KEY)
-if last_search and last_search["library"] == safe_lib and last_search.get("distances"):
+if last_search and last_search["library"] == safe_lib and last_search.get("distances") and distance_map_slot:
     with distance_map_slot:
         render_distance_map(distance_threshold, last_search["distances"])
         target = cutoff_to_include(min(last_search["distances"]))
