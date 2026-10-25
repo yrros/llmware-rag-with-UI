@@ -9,7 +9,9 @@ import time
 import threading
 import datetime
 import uuid
+from contextlib import contextmanager
 from functools import lru_cache
+from urllib.parse import quote_plus, urlparse
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
@@ -33,6 +35,7 @@ LEGACY_APP_DATA_DIR = Path.home() / "llmware_data"
 LANCEDB_PATH = APP_DATA_DIR / "lancedb"
 LEGACY_LANCEDB_PATH = Path("/tmp/lancedb")
 EMBEDDING_POLL_SECONDS = 5
+AUTO_RESCAN_SECONDS = 180
 INGEST_EXTENSIONS = {".md", ".txt", ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".json"}
 
 RECOMMENDED_EMBEDDING_MODELS = [
@@ -105,13 +108,36 @@ SUGGESTED_OLLAMA_MODELS = [
 LLM_CONTEXT_MAX_CHARS = 12000
 # Follow-up conversations resend the notes plus history, so give Ollama a larger window.
 FOLLOW_UP_NUM_CTX = 8192
+# Ollama's context window must hold the prompt and the whole answer. These sizes are used in steps, so
+# the model isn't reloaded for every small change; bigger windows use more memory.
+OLLAMA_CONTEXT_SIZES = (8192, 16384, 32768, 65536)
+LLM_PROGRESS_SECONDS = 3  # how often the tokens-per-second count refreshes while an answer streams
+# Max tokens: up to roughly a short novel. English runs at about 0.75 words per token.
+WORDS_PER_TOKEN = 0.75
+LLM_MAX_TOKENS_LIMIT = 50000
+BOOK_LENGTHS = (  # (title, approximate word count): markers on the Max tokens slider
+    ("The Very Hungry Caterpillar", 225),
+    ("Where the Wild Things Are", 340),
+    ("The Tale of Peter Rabbit", 950),
+    ("Dr. Seuss, The Cat in the Hat", 1600),
+    ("The Little Prince", 17000),
+    ("Winnie-the-Pooh", 23000),
+    ("The Old Man and the Sea", 27000),
+    ("Animal Farm", 30000),
+    ("The Lion, the Witch and the Wardrobe", 37000),
+)
+BOOKS_BEYOND_LIMIT = (("The Hobbit", 95000), ("War and Peace", 587000))
+TOKEN_STEPS = (128, 256, 512, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768, 40960, LLM_MAX_TOKENS_LIMIT)
 DISCUSSION_HEIGHT = 520
 DISCUSSION_EXPANDED_HEIGHT = 1100
+FOLLOW_UP_BOX_HEIGHT = 90
+FOLLOW_UP_BOX_EXPANDED_HEIGHT = 320
 LAST_SEARCH_KEY = "last_search"
 CORPUS_SETTINGS_PATH = APP_DATA_DIR / "corpus_settings.json"
 JOB_STATUS_PATH = APP_DATA_DIR / "job_status.json"
 APP_SETTINGS_PATH = APP_DATA_DIR / "app_settings.json"
 PROMPT_LIBRARY_PATH = APP_DATA_DIR / "prompt_library.json"
+TEXT_RESCAN_STATUS_PATH = APP_DATA_DIR / "text_rescan_status.json"
 PROMPT_STACK_SIZE = 5
 
 DEFAULT_APP_SETTINGS = {
@@ -119,6 +145,8 @@ DEFAULT_APP_SETTINGS = {
     "hide_corpora_enabled": False,
     "corpus_mode": "multi",
     "last_selected_library": None,
+    "auto_rescan_enabled": False,
+    "auto_rescan_all_corpora": False,
 }
 
 CORPUS_MODE_MULTI = "multi"
@@ -689,8 +717,20 @@ def persist_gpu_for_embeddings_setting() -> None:
 set_embedding_acceleration(load_app_settings().get("use_gpu_for_embeddings", False))
 
 
-def persist_exact_text_only_setting() -> None:
-    save_app_settings({"exact_text_only": bool(st.session_state.get("exact_text_only", False))})
+SEARCH_ROUTES = {"semantic": "Semantic (meaning)", "literal": "Literal (exact text)"}
+
+
+def saved_search_route() -> str:
+    """The route last chosen; stored as `exact_text_only` so older settings carry over."""
+    return "literal" if load_app_settings().get("exact_text_only", False) else "semantic"
+
+
+def persist_search_route() -> None:
+    route = st.session_state.get("search_route")
+    if route is None:  # clicking the selected option again clears it: keep the route instead
+        st.session_state["search_route"] = saved_search_route()
+        return
+    save_app_settings({"exact_text_only": route == "literal"})
 
 
 DISTANCE_SLIDER_MIN = 0.30
@@ -1251,6 +1291,8 @@ DEFAULT_TASK_PROMPTS = (
         ),
         "tags": ["email", "meeting"],
         "starred": True,
+        "agent": True,
+        "output": "email",
     },
     {
         "name": "Action items",
@@ -1260,6 +1302,8 @@ DEFAULT_TASK_PROMPTS = (
         ),
         "tags": ["tasks"],
         "starred": True,
+        "agent": True,
+        "output": "task",
     },
     {
         "name": "Client status update",
@@ -1268,6 +1312,8 @@ DEFAULT_TASK_PROMPTS = (
             "risks or blockers, and the next step. Plain language, no more than 150 words."
         ),
         "tags": ["client", "update"],
+        "agent": True,
+        "output": "note",
     },
     {
         "name": "Key decisions",
@@ -1277,12 +1323,27 @@ DEFAULT_TASK_PROMPTS = (
 )
 
 
-def new_prompt_record(name: str, text: str, *, global_prompt: bool = False, tags=None, starred: bool = False) -> dict:
+def new_prompt_record(
+    name: str,
+    text: str,
+    *,
+    global_prompt: bool = False,
+    tags=None,
+    starred: bool = False,
+    agent: bool = False,
+    output: str = "text",
+    model: str = "",
+) -> dict:
     return {
         "id": uuid.uuid4().hex[:12],
         "name": name.strip(),
         "text": text.strip(),
         "global": bool(global_prompt),
+        "agent": bool(agent),
+        "output": output,
+        "steps": [],  # Agent workflow steps between the collection prompt (text) and the command
+        "command": DEFAULT_AGENT_COMMANDS.get(output, "") if agent else "",
+        "model": model,  # empty: use whichever model is selected
         "tags": clean_filter_terms(tags or []),
         "starred": bool(starred),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1305,13 +1366,27 @@ def load_prompt_library() -> dict:
             library = {}
         library.setdefault("profile", {"text": "", "enabled": True})
         library.setdefault("prompts", [])
+        library.setdefault("links", [])  # common links: [{"id", "title", "url"}]; prompts pick theirs by id
+        for prompt in library["prompts"]:
+            # Libraries saved before Agent existed: prompts that already drafted output become Agents.
+            prompt.setdefault("agent", prompt.get("output", "text") in DRAFT_OUTPUT_TYPES and not prompt.get("global"))
+            # ...and before Agent workflows: no middle steps, a default Action Command, no model of its own.
+            prompt.setdefault("steps", [])
+            prompt.setdefault("command", DEFAULT_AGENT_COMMANDS.get(prompt.get("output", ""), ""))
+            prompt.setdefault("model", "")
+            prompt.setdefault("links", [])
         return library
     return save_prompt_library(
         {
             "profile": {"text": "", "enabled": True},
             "prompts": [
                 new_prompt_record(
-                    p["name"], p["text"], tags=p.get("tags"), starred=p.get("starred", False)
+                    p["name"],
+                    p["text"],
+                    tags=p.get("tags"),
+                    starred=p.get("starred", False),
+                    agent=p.get("agent", False),
+                    output=p.get("output", "text"),
                 )
                 for p in DEFAULT_TASK_PROMPTS
             ],
@@ -1388,7 +1463,854 @@ def build_prompt_context(corpus_prompt: str = "", profile_text: str = "", global
     return "\n\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# HANDOFF — structured drafts written to an outbox for another system to act on
+# ---------------------------------------------------------------------------
+
+OUTPUT_TYPES = {"text": "Text answer", "note": "Note", "task": "Tasks", "email": "Email"}
+DRAFT_OUTPUT_TYPES = [t for t in OUTPUT_TYPES if t != "text"]  # what an Agent prompt can send to the outbox
+DEFAULT_AGENT_OUTPUT = "task"
+DEFAULT_AGENT_COMMANDS = {"task": "Create these as tasks", "note": "Save this as a note", "email": "Draft this as an email"}
+AGENT_BORDER_COLOR = "#1c83e1"
+HANDOFF_SCHEMA_ID = "llm-notes-handoff/v1"
+HANDOFF_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "handoff.v1.schema.json"
+DEFAULT_OUTBOX_DIR = PROJECT_DIR / "outbox"
+HANDOFF_RESULT_DIRS = ("processed", "failed")  # where connectors move packages, with a receipt beside each
+RELATED_KINDS = ["", "opportunity", "account", "contact"]
+TASK_PRIORITIES = ["", "low", "normal", "high"]
+STRUCTURED_OUTPUT_GUIDES = {
+    "note": "Return JSON with a one-paragraph `summary` and `items` holding exactly one note: a short `title` and the note `body`.",
+    "task": (
+        "Return JSON with a one-paragraph `summary` and `items` holding one entry per task: a short `subject`, "
+        "a `description`, `due_date` as YYYY-MM-DD worked out from today's date (or \"\" if the notes give none), "
+        "`priority` (low, normal, high or \"\") and the `owner` named in the notes (or \"\")."
+    ),
+    "email": (
+        "Return JSON with a one-paragraph `summary` and `items` holding exactly one email: `to` (names or "
+        "addresses given in the notes — never invent addresses), `subject` and `body`."
+    ),
+}
+STRUCTURED_RELATED_GUIDE = (
+    "Set `related_to.name` to the client, deal or person the item is about when the notes name one, else \"\". "
+    "Set `related_to.kind` to opportunity, account or contact when that is clear, else \"\". "
+    "Use \"\" for anything the notes don't say; don't guess."
+)
+
+
+def is_agent_prompt(prompt: dict | None) -> bool:
+    return bool(prompt and prompt.get("agent") and not prompt.get("global"))
+
+
+def add_agent_border_style(*selectors: str) -> None:
+    """Blue border on the elements matched by the CSS selectors (usually st-key-* classes from widget keys)."""
+    st.html(f"<style>{', '.join(selectors)} {{ border: 1px solid {AGENT_BORDER_COLOR} !important; }}</style>")
+
+
+def agent_prompt_label(prompt: dict) -> str:
+    """Prompt name as shown in the Ask area: Agents read 'Agent:SF_Tasks'."""
+    return f"Agent:{prompt['name']}" if is_agent_prompt(prompt) else prompt["name"]
+
+
+def get_prompt_output_type(prompt: dict | None) -> str:
+    """Only Agent prompts draft output for the outbox; every other prompt gets a text answer."""
+    if not is_agent_prompt(prompt):
+        return "text"
+    output = prompt.get("output", "")
+    return output if output in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
+
+
+def structured_output_schema(item_type: str) -> dict:
+    """JSON schema passed to Ollama's `format` so the model can only return valid drafts."""
+    related = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "kind": {"enum": RELATED_KINDS}},
+        "required": ["name", "kind"],
+    }
+    fields = {
+        "note": {"title": {"type": "string"}, "body": {"type": "string"}},
+        "task": {
+            "subject": {"type": "string"},
+            "description": {"type": "string"},
+            "due_date": {"type": "string"},
+            "priority": {"enum": TASK_PRIORITIES},
+            "owner": {"type": "string"},
+        },
+        "email": {"to": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}},
+    }[item_type]
+    item = {"type": "object", "properties": {**fields, "related_to": related}, "required": [*fields, "related_to"]}
+    return {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}, "items": {"type": "array", "items": item}},
+        "required": ["summary", "items"],
+    }
+
+
+def normalise_related_to(value) -> dict:
+    value = value if isinstance(value, dict) else {}
+    kind = str(value.get("kind", "")).strip().lower()
+    return {"name": str(value.get("name", "")).strip(), "kind": kind if kind in RELATED_KINDS else ""}
+
+
+def normalise_draft_item(item_type: str, item) -> dict:
+    """Coerce one model-produced item into the handoff schema shape (empty strings for unknowns)."""
+    item = item if isinstance(item, dict) else {}
+    text = lambda key: str(item.get(key, "") or "").strip()  # noqa: E731
+    draft = {"type": item_type}
+    if item_type == "note":
+        draft.update(title=text("title"), body=text("body"))
+    elif item_type == "task":
+        due = text("due_date")
+        priority = text("priority").lower()
+        draft.update(
+            subject=text("subject"),
+            description=text("description"),
+            due_date=due if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due) else "",
+            priority=priority if priority in TASK_PRIORITIES else "",
+            owner=text("owner"),
+        )
+    else:
+        recipients = item.get("to", [])
+        if isinstance(recipients, str):
+            recipients = recipients.split(",")
+        draft.update(
+            to=[str(r).strip() for r in recipients if str(r).strip()],
+            subject=text("subject"),
+            body=text("body"),
+        )
+    draft["related_to"] = normalise_related_to(item.get("related_to"))
+    return draft
+
+
+def agent_command(prompt: dict) -> str:
+    """The Agent's Action Command, or the default for its output type."""
+    return str(prompt.get("command", "")).strip() or DEFAULT_AGENT_COMMANDS[get_prompt_output_type(prompt)]
+
+
+def build_agent_task_prompt(prompt: dict) -> str:
+    """Task for an Agent's first answer: its collection prompt, plus how to list items and where it's heading."""
+    return (
+        f"{prompt['text'].strip()}\n\n"
+        "Number every item you list (1, 2, 3…) so I can pick them by number, e.g. \"Yes:1,3 ignore 2\". "
+        f"We will finish with this action: \"{agent_command(prompt)}\" "
+        f"({OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()}). Ask me the questions you need answered "
+        "to do that well, and don't guess anything the notes don't say."
+    )
+
+
+# --- Common links: attached to prompts, shown under the question while a prompt is injected -------------
+
+BEST_GUESS = "{best_guess}"  # in a link's address: replaced by the app's best guess at what you're looking for
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+GUESS_STOPWORDS = {
+    "I", "A", "An", "The", "What", "Who", "Whom", "When", "Where", "Why", "How", "Which", "Can", "Could", "Would",
+    "Should", "Do", "Does", "Did", "Is", "Are", "Was", "Were", "Please", "List", "Show", "Give", "Tell", "Find",
+}
+CAPITALISED_WORDS = re.compile(r"\b[A-Z][\w&'.-]*(?:\s+[A-Z][\w&'.-]*)*")
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def local_service_up(url: str) -> bool:
+    """Whether something answers at a localhost address (checked at most every 15 seconds)."""
+    import requests
+
+    try:
+        requests.get(url, timeout=0.5)
+        return True
+    except requests.RequestException:
+        return False
+
+
+def link_status_dot(url: str) -> str:
+    """🟢 / 🔴 for links to this computer, nothing for anything else."""
+    if urlparse(url).hostname not in LOCAL_HOSTS:
+        return ""
+    return "🟢 " if local_service_up(url.replace(BEST_GUESS, "")) else "🔴 "
+
+
+def best_guess(question: str, search_filter: dict | None, search_state: dict | None) -> str:
+    """What the user is probably looking for, for best guess search links (no LLM involved).
+
+    In order: the Related to names of the Agent's staged or sent records, the first Must include filter
+    term, then capitalised names in the question (skipping the question's first word when there's another).
+    """
+    agent = (search_state or {}).get("agent") or {}
+    for batch in [agent.get("staged"), *reversed(agent.get("sent") or [])]:
+        for item in (batch or {}).get("items", []):
+            name = str((item.get("related_to") or {}).get("name", "")).strip()
+            if name:
+                return name
+    must_include = (search_filter or {}).get("all") or []
+    if must_include:
+        return str(must_include[0])
+    candidates = []
+    for match in CAPITALISED_WORDS.finditer(question or ""):
+        words = [w.strip(".,;:!?") for w in match.group().split() if w.strip(".,;:!?") not in GUESS_STOPWORDS]
+        if words:
+            starts_sentence = match.start() == 0 or (question or "")[: match.start()].rstrip()[-1:] in ".?!"
+            candidates.append((starts_sentence, " ".join(words)))
+    later = [text for starts_sentence, text in candidates if not starts_sentence]
+    return (later or [text for _, text in candidates] or [""])[0]
+
+
+def render_page_title(title: str) -> None:
+    """Title for every page except the main one; its 🧠 goes back to the main screen in the same tab."""
+    st.markdown(
+        f'<h1><a href="./" target="_self" title="Back to RAG Workspace Manager" '
+        f'style="text-decoration:none">🧠</a> {title}</h1>',
+        unsafe_allow_html=True,
+    )
+
+
+# The task executor is the one special link: the service that processes the outbox (e.g. the Salesforce
+# Connector app). It's defined first in Common links, listed first everywhere, and shown on the Actions page.
+EXECUTOR_ROLE = "executor"
+
+
+def ordered_links(library: dict) -> list[dict]:
+    """Common links with the task executor first."""
+    return sorted(library.get("links", []), key=lambda link: link.get("role") != EXECUTOR_ROLE)
+
+
+def executor_link(library: dict) -> dict | None:
+    return next((link for link in library.get("links", []) if link.get("role") == EXECUTOR_ROLE), None)
+
+
+def link_markdown(link: dict, guess: str = "") -> str:
+    """One link as Markdown (opens in a new tab), with its status dot and any best guess filled in."""
+    title, url = link.get("title") or link["url"], link["url"]
+    if BEST_GUESS in url:
+        url = url.replace(BEST_GUESS, quote_plus(guess))
+        title = f"{title}: {guess}" if guess else title
+    title = title.replace("[", "\\[").replace("]", "\\]")
+    return f"{link_status_dot(link['url'])}[{title}]({url.replace(' ', '%20').replace(')', '%29')})"
+
+
+def render_prompt_links(prompt: dict | None, library: dict, guess: str) -> None:
+    """The injected prompt's links, inline (task executor first), each opening in a new tab."""
+    if not prompt:
+        return
+    chosen = set(prompt.get("links", []))
+    parts = [link_markdown(link, guess) for link in ordered_links(library) if link["id"] in chosen and link.get("url")]
+    if parts:
+        st.markdown(" · ".join(parts))
+
+
+def save_executor_field(field: str) -> None:
+    """Save the task executor's title or address, creating the executor link the first time."""
+    library = load_prompt_library()
+    link = executor_link(library)
+    if link is None:
+        link = {"id": uuid.uuid4().hex[:8], "title": "", "url": "", "role": EXECUTOR_ROLE}
+        library["links"].insert(0, link)
+    link[field] = str(st.session_state.get(f"executor_{field}", "")).strip()
+    save_prompt_library(library)
+
+
+def update_links(change) -> None:
+    library = load_prompt_library()
+    library["links"] = change(list(library.get("links", [])))
+    save_prompt_library(library)
+
+
+def add_link() -> None:
+    update_links(lambda links: links + [{"id": uuid.uuid4().hex[:8], "title": "", "url": ""}])
+
+
+def delete_link(link_id: str) -> None:
+    library = load_prompt_library()
+    library["links"] = [link for link in library.get("links", []) if link["id"] != link_id]
+    for prompt in library["prompts"]:
+        prompt["links"] = [i for i in prompt.get("links", []) if i != link_id]
+    save_prompt_library(library)
+
+
+def save_link_field(link_id: str, field: str) -> None:
+    value = str(st.session_state.get(f"link_{field}_{link_id}", "")).strip()
+    update_links(lambda links: [{**link, field: value} if link["id"] == link_id else link for link in links])
+
+
+TITLE_MARKER_POSITIONS = {"prefix": "Before the title", "suffix": "After the title"}
+
+
+def get_title_marker(library: dict) -> dict:
+    """The prompt library's marker for Agent-created titles: {"text": "", "position": "prefix"|"suffix"}."""
+    marker = library.get("title_marker") or {}
+    position = marker.get("position") if marker.get("position") in TITLE_MARKER_POSITIONS else "prefix"
+    return {"text": str(marker.get("text", "")).strip(), "position": position}
+
+
+def marked_title(title: str, marker: dict) -> str:
+    text, title = marker["text"], title.strip()
+    if not text or not title or text.lower() in title.lower():  # none set, nothing to mark, or already there
+        return title
+    return f"{text} {title}" if marker["position"] == "prefix" else f"{title} {text}"
+
+
+def apply_title_marker(item: dict, marker: dict) -> dict:
+    """Add the marker to a staged task's subject, note's title or email's subject."""
+    field = "title" if item.get("type") == "note" else "subject"
+    return {**item, field: marked_title(item.get(field, ""), marker)} if field in item else item
+
+
+def stage_agent_items(
+    search_state: dict,
+    prompt: dict,
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+    corpus_prompt: str,
+) -> dict:
+    """Turn the discussion so far into exact records for the Agent's Action Command. Nothing is sent."""
+    item_type = get_prompt_output_type(prompt)
+    messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
+    messages.append({
+        "role": "user",
+        "content": (
+            f"{agent_command(prompt)}\n\nTurn what we have agreed in this conversation into records now. "
+            "Include only the items I selected or agreed, with the details we agreed, and leave out anything "
+            f"I said to ignore. {STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
+        ),
+    })
+    reply, _usage = chat_with_ollama(
+        messages,
+        model_name,
+        max_tokens=max(max_tokens, 1024),  # several records in JSON need more room than a short answer
+        temperature=temperature,
+        num_ctx=FOLLOW_UP_NUM_CTX,
+        response_format=structured_output_schema(item_type),
+    )
+    try:
+        data = json.loads(reply)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"`{model_name}` didn't return complete JSON — usually it ran out of tokens. "
+            "Raise **Max tokens** and try again."
+        ) from exc
+    marker = get_title_marker(load_prompt_library())
+    items = [
+        apply_title_marker(normalise_draft_item(item_type, item), marker)
+        for item in data.get("items", []) if isinstance(item, dict)
+    ]
+    return {
+        "id": uuid.uuid4().hex,  # the package id if this is sent; each staging is a new package
+        "type": item_type,
+        "summary": str(data.get("summary", "")).strip(),
+        "items": items,
+        "model": model_name,
+    }
+
+
+def get_outbox_dir() -> Path:
+    raw = str(load_app_settings().get("outbox_path", "") or "").strip()
+    return Path(raw).expanduser() if raw else DEFAULT_OUTBOX_DIR
+
+
+def persist_outbox_path() -> None:
+    save_app_settings({"outbox_path": str(st.session_state.get("outbox_path_input", "")).strip()})
+
+
+def validate_handoff_package(package: dict) -> None:
+    """Check a package against schemas/handoff.v1.schema.json before it is written."""
+    import jsonschema
+
+    schema = json.loads(HANDOFF_SCHEMA_PATH.read_text())
+    jsonschema.validate(package, schema)
+
+
+def write_handoff_package(package: dict, outbox: Path) -> Path:
+    """Validate, then write atomically so a connector never reads a half-written file."""
+    validate_handoff_package(package)
+    outbox.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.fromisoformat(package["created"]).strftime("%Y%m%d-%H%M%S")
+    target = outbox / f"{stamp}-{package['item_type']}-{package['id'][:8]}.json"
+    temp = outbox / f".{target.name}.tmp"
+    temp.write_text(json.dumps(package, indent=2, ensure_ascii=False))
+    temp.replace(target)
+    return target
+
+
+def build_handoff_package(
+    search_state: dict, prompt: dict, staged: dict, source_notes: list[tuple[str, Path | None]]
+) -> dict:
+    return {
+        "schema": HANDOFF_SCHEMA_ID,
+        "id": staged["id"],
+        "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "item_type": staged["type"],
+        "source": {
+            "library": search_state.get("library_display") or search_state["library"],
+            "library_key": search_state["library"],
+            "question": search_state["question"],
+            "prompt": {"id": prompt["id"], "name": prompt["name"]},
+            "model": staged["model"],
+            "notes": [{"file": file, **({"path": str(path)} if path else {})} for file, path in source_notes],
+        },
+        "items": staged["items"],
+    }
+
+
+def read_handoff_receipt(package_file: Path) -> dict | None:
+    """The receipt a connector left beside the package in processed/ or failed/, if there is one yet."""
+    for folder in HANDOFF_RESULT_DIRS:
+        receipt = package_file.parent / folder / f"{package_file.stem}.receipt.json"
+        if receipt.is_file():
+            try:
+                return json.loads(receipt.read_text())
+            except ValueError:
+                return None
+    return None
+
+
+def pending_outbox_files(outbox: Path) -> list[Path]:
+    """Packages waiting in the outbox (connectors move them to processed/ or failed/ when done)."""
+    if not outbox.is_dir():
+        return []
+    return [p for p in outbox.glob("*.json") if not p.name.startswith(".")]
+
+
+def latest_receipt_time(folder: Path) -> datetime.datetime | None:
+    times = []
+    for path in folder.glob("*.receipt.json"):
+        try:
+            when = datetime.datetime.fromisoformat(json.loads(path.read_text())["processed_at"])
+        except (OSError, ValueError, KeyError, TypeError):
+            when = datetime.datetime.fromtimestamp(path.stat().st_mtime)
+        times.append(when if when.tzinfo else when.astimezone())
+    return max(times) if times else None
+
+
+def format_when(when: datetime.datetime | None) -> str:
+    return when.strftime("%d %b %H:%M") if when else "never"
+
+
+def render_outbox_status(link: bool = True) -> None:
+    """One line at the top of every page: what's waiting in the outbox, what needs attention, and when a
+    connector last processed it, with a link to the Actions page."""
+    outbox = get_outbox_dir()
+    waiting = pending_outbox_files(outbox)
+    items = 0
+    for path in waiting:
+        try:
+            items += len(json.loads(path.read_text()).get("items", []))
+        except (OSError, ValueError, AttributeError):
+            pass
+    attention = len(list((outbox / "failed").glob("*.receipt.json")))
+
+    st.caption(
+        f":material/outbox: **Outbox:** {len(waiting)} waiting ({items} item{'' if items == 1 else 's'})"
+        + (f" · :orange[**{attention} need{'s' if attention == 1 else ''} attention**]" if attention else "")
+        + f" · Last processed {format_when(latest_receipt_time(outbox / 'processed'))}"
+        + f" · Last error {format_when(latest_receipt_time(outbox / 'failed'))}"
+        + (f" · [Open Actions]({ACTIONS_PAGE_URL})" if link else ""),
+        help=(
+            f"Folder: `{outbox}`. A connector (e.g. Salesforce) processes what's waiting. Errors and "
+            "\"need attention\" include items held for you to choose a record. **Open Actions** lists everything."
+        ),
+    )
+
+
+ACTIONS_PAGE_URL = "?page=actions"
+OUTBOX_STATES = {  # tab order on the Actions page: what needs attention first
+    "failed": ("Needs attention", "Nothing needs attention."),
+    "waiting": ("Waiting", "Nothing is waiting for a connector."),
+    "processed": ("Processed", "Nothing has been processed yet."),
+    "withdrawn": ("Withdrawn", "Nothing has been withdrawn."),
+}
+# Withdrawn packages are moved here, out of connectors' reach (they only read the outbox's top level).
+WITHDRAWN_DIR = "withdrawn"
+PACKAGE_STATUS = {
+    "done": ("✅", "done"),
+    "partial": ("⚠️", "partly done"),
+    "needs_review": ("⚠️", "needs review"),
+    "failed": ("❌", "failed"),
+    "waiting": ("⏳", "waiting"),
+    "withdrawn": ("🚫", "withdrawn"),
+    "": ("❔", "no receipt"),
+}
+RECEIPT_ITEM_ICONS = {"created": "✅", "exists": "✅", "needs_match": "⚠️", "invalid": "⚠️", "skipped": "⏭️", "error": "❌"}
+
+
+def receipt_beside(package_file: Path) -> Path:
+    return package_file.with_name(f"{package_file.stem}.receipt.json")
+
+
+def load_outbox_entries(outbox: Path) -> dict[str, list[dict]]:
+    """Every package by state (see OUTBOX_STATES), newest first, with its receipt if it has one."""
+    entries: dict[str, list[dict]] = {state: [] for state in OUTBOX_STATES}
+    files = [("waiting", path) for path in pending_outbox_files(outbox)]
+    for folder in (*HANDOFF_RESULT_DIRS, WITHDRAWN_DIR):
+        files += [
+            (folder, path) for path in (outbox / folder).glob("*.json")
+            if not path.name.startswith(".") and not path.name.endswith(".receipt.json")
+        ]
+    for state, path in files:
+        entry = {"path": path, "package": None, "error": "", "receipt": None}
+        try:
+            entry["package"] = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            entry["error"] = f"This file can't be read as a package: {exc}"
+        if state != "waiting" and receipt_beside(path).is_file():
+            try:
+                entry["receipt"] = json.loads(receipt_beside(path).read_text())
+            except (OSError, ValueError):
+                pass
+        stamp = (entry["receipt"] or {}).get("processed_at") or (entry["package"] or {}).get("created")
+        try:
+            when = datetime.datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            when = datetime.datetime.fromtimestamp(path.stat().st_mtime)
+        entry["when"] = when if when.tzinfo else when.astimezone()
+        entries[state].append(entry)
+    for group in entries.values():
+        group.sort(key=lambda entry: entry["when"], reverse=True)
+    return entries
+
+
+def move_outbox_package(path_text: str, destination: str, action: str) -> None:
+    """Move a package (and its receipt) for the Actions page buttons; `destination` is '' for the outbox itself.
+
+    Going back to the outbox drops the old receipt first, so a connector that picks the package up at once
+    can't have its fresh receipt removed. Withdrawing keeps the receipt beside the package for the record.
+    """
+    path = Path(path_text)
+    if not path.is_file():
+        st.session_state["actions_notice"] = f"`{path.name}` has already moved; the list is refreshed."
+        return
+    target_dir = get_outbox_dir() / destination if destination else get_outbox_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    receipt = receipt_beside(path)
+    if receipt.is_file():
+        if destination:
+            receipt.replace(target_dir / receipt.name)
+        else:
+            receipt.unlink()
+    path.replace(target_dir / path.name)
+    st.session_state["actions_notice"] = f"{action} `{path.name}`."
+
+
+def outbox_entry_matches(entry: dict, query: str) -> bool:
+    words = query.lower().split()
+    text = json.dumps([entry["package"], entry["receipt"], entry["path"].name, entry["error"]]).lower()
+    return all(word in text for word in words)
+
+
+def render_outbox_entry(entry: dict, state: str) -> None:
+    """One package on the Actions page: what it holds, where it came from, and the connector's result per item."""
+    package = entry["package"] if isinstance(entry["package"], dict) else {}
+    receipt = entry["receipt"] or {}
+    items = [item for item in package.get("items", []) if isinstance(item, dict)]
+    source = package.get("source") or {}
+    prompt_name = (source.get("prompt") or {}).get("name", "")
+    status = state if state in ("waiting", "withdrawn") else receipt.get("status", "")
+    icon, status_text = PACKAGE_STATUS.get(status, PACKAGE_STATUS[""])
+    kind = {"note": "note", "task": "task", "email": "email"}.get(package.get("item_type"), "item")
+    label = (
+        f"{icon} {format_when(entry['when'])} · {len(items)} {kind}{'' if len(items) == 1 else 's'}"
+        + (f" · Agent:{prompt_name}" if prompt_name else "")
+        + f" · {status_text}"
+    )
+    with st.expander(label, expanded=state == "failed"):
+        details = [f"File `{entry['path'].name}`"]
+        if package.get("id"):
+            details.append(f"package id `{package['id']}`")
+        if source.get("library"):
+            details.append(f"from **{source['library']}**")
+        if source.get("model"):
+            details.append(f"model `{source['model']}`")
+        st.caption(" · ".join(details))
+        if source.get("question"):
+            st.caption(f"Question: {source['question']}")
+        notes = [note.get("file", "") for note in source.get("notes", []) if isinstance(note, dict)]
+        if notes:
+            st.caption("Source notes: " + ", ".join(f"`{Path(note).name}`" for note in notes))
+
+        if entry["error"] and not receipt.get("error"):  # the connector's receipt usually says the same thing
+            st.error(entry["error"])
+        if state == "withdrawn":
+            st.info("Withdrawn: connectors won't see it. **Restore** sends it back to the outbox.")
+        if receipt:
+            receipt_status = receipt.get("status", "")
+            message = (
+                f"**{str(receipt.get('connector', 'Connector')).capitalize()}** ({receipt.get('target', '?')}): "
+                f"{RECEIPT_STATUS_TEXT.get(receipt_status, receipt_status)}."
+            )
+            if receipt.get("error"):
+                message += f" {receipt['error']}"
+            (st.success if receipt_status == "done" else st.warning)(message)
+        elif state == "withdrawn":
+            pass
+        elif state == "waiting":
+            st.info("Waiting for a connector to pick this up.")
+        else:
+            st.info("No receipt yet.")
+
+        results = {r.get("index"): r for r in receipt.get("items", []) if isinstance(r, dict)}
+        for index, item in enumerate(items):
+            result = results.get(index) or {}
+            try:
+                line = describe_staged_item(item)
+            except (KeyError, TypeError):
+                line = f"**{staged_item_title(item)}**"
+            st.markdown(f"{RECEIPT_ITEM_ICONS.get(result.get('status'), '⏳' if state == 'waiting' else '')} {line}")
+            notes_line = []
+            if result.get("record_id"):
+                notes_line.append(f"{result.get('object', 'Record')} `{result['record_id']}`")
+            if result.get("message"):
+                notes_line.append(result["message"])
+            candidates = ", ".join(
+                f"{c.get('name', '?')} (`{c.get('id', '?')}`)" for c in result.get("candidates", []) if isinstance(c, dict)
+            )
+            if candidates:
+                notes_line.append(f"Possible matches: {candidates}")
+            if notes_line:
+                st.caption(" · ".join(notes_line))
+        if state == "failed":
+            st.caption(
+                "If a record needs choosing, choose it in the connector (it then retries by itself). After a "
+                "temporary error, **Retry** sends the package back for the connector's next run; anything already "
+                "created isn't created twice."
+            )
+        render_outbox_entry_actions(entry, state)
+
+
+def render_outbox_entry_actions(entry: dict, state: str) -> None:
+    """Withdraw (waiting, failed), Retry (failed) and Restore (withdrawn) buttons for one package."""
+    path, key = str(entry["path"]), f"{state}_{entry['path'].name}"
+    unreadable = bool(entry["error"] or (entry["receipt"] or {}).get("error"))
+    with st.container(horizontal=True):
+        if state == "failed":
+            st.button(
+                "Retry",
+                icon=":material/replay:",
+                key=f"actions_retry_{key}",
+                on_click=move_outbox_package,
+                args=(path, "", "Sent back to the outbox:"),
+                disabled=unreadable,
+                help=(
+                    "This file itself is invalid, so retrying won't help. Withdraw it and send the drafts again."
+                    if unreadable else "Move it back to the outbox for the connector's next run."
+                ),
+            )
+        if state in ("waiting", "failed"):
+            with st.popover("Withdraw", icon=":material/block:", help="Take it out of the outbox so no connector acts on it"):
+                st.markdown(
+                    "Withdraw this package? Connectors won't see it. Nothing already created in the other system "
+                    "is undone. You can restore it from the **Withdrawn** tab."
+                )
+                st.button(
+                    "Withdraw",
+                    key=f"actions_withdraw_{key}",
+                    type="primary",
+                    on_click=move_outbox_package,
+                    args=(path, WITHDRAWN_DIR, "Withdrew"),
+                )
+        if state == "withdrawn":
+            st.button(
+                "Restore",
+                icon=":material/undo:",
+                key=f"actions_restore_{key}",
+                on_click=move_outbox_package,
+                args=(path, "", "Restored to the outbox:"),
+                help="Send it back to the outbox for a connector to process.",
+            )
+        editable = editable_item_indexes(entry, state)
+        if editable:
+            editing = st.toggle(
+                "Edit",
+                key=f"actions_editing_{key}",
+                help="Change the text before a connector acts on it, e.g. add a marker like [TEST] to find it easily.",
+            )
+    if editable and editing:
+        render_package_editor(entry, key, editable, state)
+
+
+EDITABLE_OUTBOX_STATES = ("waiting", "failed", "withdrawn")
+
+
+def editable_item_indexes(entry: dict, state: str) -> list[int]:
+    """Items that can still be edited: not processed yet, or (for failed packages) not created yet."""
+    package = entry["package"]
+    if state not in EDITABLE_OUTBOX_STATES or entry["error"] or not isinstance(package, dict):
+        return []
+    created = {
+        r.get("index") for r in (entry["receipt"] or {}).get("items", [])
+        if isinstance(r, dict) and r.get("status") in ("created", "exists")
+    }
+    return [i for i, item in enumerate(package.get("items", [])) if isinstance(item, dict) and i not in created]
+
+
+def package_edit_key(entry_key: str, index: int, field: str) -> str:
+    return f"actions_edit_{entry_key}_{index}_{field}"
+
+
+def render_package_editor(entry: dict, entry_key: str, indexes: list[int], state: str) -> None:
+    """Form to edit a package's items in place; saving rewrites the file atomically with the same package id."""
+    items = entry["package"]["items"]
+    if state == "failed" and len(indexes) < len(items):
+        st.caption("Records already created aren't shown: editing them wouldn't change what's in the other system.")
+    with st.form(f"actions_edit_form_{entry_key}", border=True):
+        for index in indexes:
+            item = items[index]
+            key = lambda field: package_edit_key(entry_key, index, field)  # noqa: E731
+            item_type = item.get("type", "")
+            st.markdown(f"**{ {'note': 'Note', 'task': 'Task', 'email': 'Email'}.get(item_type, 'Item') } {index + 1}**")
+            if item_type == "note":
+                st.text_input("Title", value=item.get("title", ""), key=key("title"))
+                st.text_area("Body", value=item.get("body", ""), key=key("body"), height=140)
+            elif item_type == "task":
+                st.text_input("Subject", value=item.get("subject", ""), key=key("subject"))
+                st.text_area("Description", value=item.get("description", ""), key=key("description"), height=80)
+                due_col, priority_col, owner_col = st.columns(3)
+                due = item.get("due_date", "")
+                due_col.date_input(
+                    "Due date",
+                    value=datetime.date.fromisoformat(due) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due) else None,
+                    key=key("due_date"),
+                    format="YYYY-MM-DD",
+                )
+                priority = item.get("priority", "")
+                priority_col.selectbox(
+                    "Priority",
+                    TASK_PRIORITIES,
+                    index=TASK_PRIORITIES.index(priority) if priority in TASK_PRIORITIES else 0,
+                    format_func=lambda p: p.capitalize() or "Not set",
+                    key=key("priority"),
+                )
+                owner_col.text_input("Owner", value=item.get("owner", ""), key=key("owner"), placeholder="Not given")
+            else:
+                st.text_input("To", value=", ".join(item.get("to", [])), key=key("to"), help="Comma-separated.")
+                st.text_input("Subject", value=item.get("subject", ""), key=key("subject"))
+                st.text_area("Body", value=item.get("body", ""), key=key("body"), height=140)
+            related = item.get("related_to") or {}
+            name_col, kind_col = st.columns([2, 1])
+            name_col.text_input("Related to", value=related.get("name", ""), key=key("related_name"))
+            kind = related.get("kind", "")
+            kind_col.selectbox(
+                "Kind",
+                RELATED_KINDS,
+                index=RELATED_KINDS.index(kind) if kind in RELATED_KINDS else 0,
+                format_func=lambda k: k.capitalize() or "Not sure",
+                key=key("related_kind"),
+            )
+        st.form_submit_button(
+            "Save changes",
+            type="primary",
+            icon=":material/save:",
+            on_click=save_package_edits,
+            args=(str(entry["path"]), entry_key, indexes),
+        )
+
+
+def save_package_edits(path_text: str, entry_key: str, indexes: list[int]) -> None:
+    """Write the edited items back to the package file (validated, atomic, same id), then close the editor."""
+    path = Path(path_text)
+    if not path.is_file():
+        st.session_state["actions_notice"] = f"`{path.name}` has moved (a connector may have picked it up); nothing saved."
+        return
+    package = json.loads(path.read_text())
+    problems = []
+    for index in indexes:
+        item = package["items"][index]
+        value = lambda field, default: st.session_state.get(package_edit_key(entry_key, index, field), default)  # noqa: E731
+        related = item.get("related_to") or {}
+        edited = {
+            **item,
+            "related_to": {
+                "name": value("related_name", related.get("name", "")),
+                "kind": value("related_kind", related.get("kind", "")),
+            },
+        }
+        for field in ("title", "body", "subject", "description", "priority", "owner"):
+            if field in item:
+                edited[field] = value(field, item[field])
+        if "due_date" in item:
+            due = value("due_date", None)
+            edited["due_date"] = due.isoformat() if isinstance(due, datetime.date) else ""
+        if "to" in item:
+            to = value("to", ", ".join(item["to"]))
+            edited["to"] = to.split(",") if isinstance(to, str) else to
+        cleaned = normalise_draft_item(item["type"], edited)
+        if not (cleaned.get("subject") or cleaned.get("title")):
+            problems.append(f"Item {index + 1} needs a {'title' if item['type'] == 'note' else 'subject'}.")
+        package["items"][index] = cleaned
+    if problems:
+        st.session_state["actions_notice"] = "Not saved: " + " ".join(problems)
+        return
+    try:
+        validate_handoff_package(package)
+    except Exception as exc:
+        st.session_state["actions_notice"] = f"Not saved: the package wouldn't be valid ({exc})."
+        return
+    temp = path.with_name(f".{path.name}.tmp")  # connectors skip dotfiles, so they never see a half-written file
+    temp.write_text(json.dumps(package, indent=2, ensure_ascii=False))
+    if not path.is_file():  # picked up while we were writing: don't recreate it
+        temp.unlink()
+        st.session_state["actions_notice"] = f"`{path.name}` has moved (a connector may have picked it up); nothing saved."
+        return
+    temp.replace(path)
+    for widget_key in [k for k in st.session_state if str(k).startswith(f"actions_edit_{entry_key}_")]:
+        del st.session_state[widget_key]
+    st.session_state[f"actions_editing_{entry_key}"] = False
+    st.session_state["actions_notice"] = f"Saved changes to `{path.name}`."
+
+
+def render_actions_page() -> None:
+    """Actions page (?page=actions): everything Agents sent to the outbox and what the connector did with it."""
+    render_outbox_status(link=False)
+    render_page_title("Actions")
+    outbox = get_outbox_dir()
+    # The task executor (defined in the prompt library's Common links) processes what's listed here.
+    executor = executor_link(load_prompt_library())
+    if executor and executor.get("url"):
+        st.markdown(
+            f"**Task executor:** {link_markdown(executor)} — processes the outbox; open it to run now or change "
+            "the schedule."
+        )
+    else:
+        st.caption("Set the **Task executor** link in the prompt library's **Common links** to open it from here.")
+    st.caption(
+        f"Everything Agents have sent to the outbox (`{outbox}`) and what the connector did with it. "
+        "Edit a package's text before a connector acts on it, withdraw it to stop a connector acting on it, "
+        "or retry one after a temporary error."
+    )
+    if notice := st.session_state.pop("actions_notice", None):
+        st.toast(notice)
+    entries = load_outbox_entries(outbox)
+    # "View in outbox" in the Agent box links here with ?package=<file name>: start filtered to it.
+    if (linked := st.query_params.get("package")) and "actions_query" not in st.session_state:
+        st.session_state["actions_query"] = Path(linked).stem
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        query = st.text_input(
+            "Filter",
+            key="actions_query",
+            placeholder="Search subjects, titles, prompts, owners and messages",
+            icon=":material/search:",
+        )
+        st.button("Refresh", icon=":material/refresh:", key="actions_refresh")
+    tabs = st.tabs([f"{OUTBOX_STATES[state][0]} ({len(entries[state])})" for state in OUTBOX_STATES])
+    for tab, state in zip(tabs, OUTBOX_STATES):
+        with tab:
+            shown = [entry for entry in entries[state] if outbox_entry_matches(entry, query)]
+            if query.strip() and entries[state]:
+                st.caption(f"{len(shown)} of {len(entries[state])} match.")
+            if not shown:
+                st.caption(OUTBOX_STATES[state][1] if not entries[state] else "Nothing matches the filter.")
+            for entry in shown:
+                render_outbox_entry(entry, state)
+
+
 PROMPT_LIBRARY_PAGE_URL = "?page=prompts"
+
+
+def save_title_marker() -> None:
+    library = load_prompt_library()
+    current = get_title_marker(library)
+    position = st.session_state.get("title_marker_position") or current["position"]  # deselecting keeps it
+    library["title_marker"] = {
+        "text": str(st.session_state.get("title_marker_text", current["text"])).strip(),
+        "position": position,
+    }
+    save_prompt_library(library)
 
 
 def save_profile_from_widgets() -> None:
@@ -1409,15 +2331,62 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
     value = st.session_state.get(f"prompt_{field}_{prompt_id}")
     if field == "tags":
         value = clean_filter_terms(value)
-    elif field in ("global", "starred"):
+    elif field in ("global", "starred", "agent"):
         value = bool(value)
+    elif field == "output":
+        value = value if value in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
+    elif field == "model":
+        value = str(value or "")
+    elif field == "links":
+        value = [str(link_id) for link_id in (value or [])]
     else:
         value = str(value or "").strip()
         if not value:
-            return  # keep the old name/text rather than saving an empty prompt
+            return  # keep the old name/text/command rather than saving an empty one
+    before = find_prompt(load_prompt_library(), prompt_id) or {}
     update_prompt(prompt_id, **{field: value})
-    if field in ("name", "text"):
+    if field == "agent" and value:
+        output = before.get("output") if before.get("output") in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
+        update_prompt(prompt_id, output=output, command=before.get("command") or DEFAULT_AGENT_COMMANDS[output])
+    if field == "output" and before.get("command", "") in ("", *DEFAULT_AGENT_COMMANDS.values()):
+        update_prompt(prompt_id, command=DEFAULT_AGENT_COMMANDS[value])  # keep a default command in step with the output
+    if field in ("name", "text", "command"):
         mark_text_saved(f"prompt_{prompt_id}")
+
+
+def update_prompt_steps(prompt_id: str, change) -> None:
+    """Apply `change(steps)` to an Agent prompt's middle steps and save."""
+    library = load_prompt_library()
+    prompt = find_prompt(library, prompt_id)
+    if prompt:
+        prompt["steps"] = change(list(prompt.get("steps", [])))
+        save_prompt_library(library)
+
+
+def add_prompt_step(prompt_id: str) -> None:
+    update_prompt_steps(prompt_id, lambda steps: steps + [{"id": uuid.uuid4().hex[:8], "name": "New step", "text": ""}])
+
+
+def delete_prompt_step(prompt_id: str, step_id: str) -> None:
+    update_prompt_steps(prompt_id, lambda steps: [s for s in steps if s["id"] != step_id])
+
+
+def move_prompt_step(prompt_id: str, step_id: str, offset: int) -> None:
+    def move(steps: list[dict]) -> list[dict]:
+        index = next(i for i, s in enumerate(steps) if s["id"] == step_id)
+        target = min(max(index + offset, 0), len(steps) - 1)
+        steps.insert(target, steps.pop(index))
+        return steps
+
+    update_prompt_steps(prompt_id, move)
+
+
+def save_prompt_step(prompt_id: str, step_id: str, field: str) -> None:
+    value = str(st.session_state.get(f"prompt_step_{field}_{step_id}", "")).strip()
+    if field == "name" and not value:
+        return  # a step always keeps a name for its button
+    update_prompt_steps(prompt_id, lambda steps: [{**s, field: value} if s["id"] == step_id else s for s in steps])
+    mark_text_saved(f"prompt_step_{step_id}")
 
 
 def add_prompt_from_form() -> None:
@@ -1426,14 +2395,22 @@ def add_prompt_from_form() -> None:
     if not name or not text:
         st.session_state["add_prompt_error"] = "Give the prompt a name and some text."
         return
+    global_prompt = bool(st.session_state.get("new_prompt_global", False))
+    agent = bool(st.session_state.get("new_prompt_agent", False))
+    if global_prompt and agent:
+        st.session_state["add_prompt_error"] = "A prompt can be Global or Agent, not both."
+        return
     library = load_prompt_library()
     library["prompts"].append(
         new_prompt_record(
             name,
             text,
-            global_prompt=bool(st.session_state.get("new_prompt_global", False)),
+            global_prompt=global_prompt,
             tags=st.session_state.get("new_prompt_tags", []),
             starred=bool(st.session_state.get("new_prompt_starred", False)),
+            agent=agent,
+            output=st.session_state.get("new_prompt_output", DEFAULT_AGENT_OUTPUT) if agent else "text",
+            model=st.session_state.get("new_prompt_model") or "",
         )
     )
     save_prompt_library(library)
@@ -1442,6 +2419,23 @@ def add_prompt_from_form() -> None:
 
 def set_prompt_page_query(text: str) -> None:
     st.session_state["prompt_page_query"] = text
+
+
+def prompt_model_options(current: str = "") -> list[str]:
+    """Choices for a prompt's Model box: '' (use the selected model), then the installed Ollama models."""
+    ok, installed = discover_ollama_models()
+    models = list(installed if ok and installed else SUGGESTED_OLLAMA_MODELS)
+    if current and current not in models:
+        models.insert(0, current)  # keep a saved model that isn't installed right now
+    return ["", *models]
+
+
+def format_prompt_model(model: str) -> str:
+    return model or "Model: as selected"
+
+
+def show_all_prompts() -> None:
+    st.query_params.pop("prompt", None)
 
 
 def common_prompt_tags(library: dict, limit: int = 8) -> list[str]:
@@ -1459,9 +2453,69 @@ def common_prompt_tags(library: dict, limit: int = 8) -> list[str]:
     return tags[:limit]
 
 
-def render_prompt_card(prompt: dict) -> None:
+def render_agent_workflow_editor(prompt: dict) -> None:
+    """Middle steps and the Action Command of an Agent prompt; step 1 is the prompt text above."""
     prompt_id = prompt["id"]
-    with st.container(border=True):
+    steps = prompt.get("steps", [])
+    for number, step in enumerate(steps, 2):
+        step_id = step["id"]
+        with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
+            st.caption(f"**Step {number}**", width="content")
+            st.text_input(
+                "Step name",
+                value=step["name"],
+                key=f"prompt_step_name_{step_id}",
+                on_change=save_prompt_step,
+                args=(prompt_id, step_id, "name"),
+                label_visibility="collapsed",
+                help="Shown on the step's button in the Discussion panel.",
+            )
+            st.button(":material/arrow_upward:", key=f"prompt_step_up_{step_id}", type="tertiary",
+                      disabled=number == 2, on_click=move_prompt_step, args=(prompt_id, step_id, -1), help="Move up")
+            st.button(":material/arrow_downward:", key=f"prompt_step_down_{step_id}", type="tertiary",
+                      disabled=number == len(steps) + 1, on_click=move_prompt_step, args=(prompt_id, step_id, 1),
+                      help="Move down")
+            st.button(":material/close:", key=f"prompt_step_delete_{step_id}", type="tertiary",
+                      on_click=delete_prompt_step, args=(prompt_id, step_id), help="Remove this step")
+        st.text_area(
+            "Step prompt",
+            value=step["text"],
+            key=f"prompt_step_text_{step_id}",
+            on_change=save_prompt_step,
+            args=(prompt_id, step_id, "text"),
+            height=68,
+            placeholder="e.g. Ask me for a due date and an owner for each task I selected.",
+            label_visibility="collapsed",
+        )
+        render_saved_note(f"prompt_step_{step_id}")
+    st.button(
+        "Add step",
+        icon=":material/add:",
+        key=f"prompt_step_add_{prompt_id}",
+        on_click=add_prompt_step,
+        args=(prompt_id,),
+        help="A step is a prompt you can send with one click while refining, e.g. 'Select tasks' or 'Set due dates'.",
+    )
+    st.text_input(
+        "Action Command",
+        value=prompt.get("command", ""),
+        key=f"prompt_command_{prompt_id}",
+        on_change=save_prompt_field,
+        args=(prompt_id, "command"),
+        placeholder="e.g. Send to tasks in Salesforce",
+        help=(
+            "The last step. Its button in the Discussion panel stages what you agreed as "
+            f"{OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()}; you confirm with **That's right** "
+            "before anything goes to the outbox."
+        ),
+    )
+
+
+def render_prompt_card(prompt: dict, model_options: list[str], links: list[dict] = ()) -> None:
+    prompt_id = prompt["id"]
+    agent = is_agent_prompt(prompt)
+    # The key gives the card a CSS class; Agent cards get a blue border (see render_prompt_library_page).
+    with st.container(border=True, key=f"{'agent' if agent else 'task'}_prompt_card_{prompt_id}"):
         with st.container(horizontal=True, vertical_alignment="center"):
             st.text_input(
                 "Name",
@@ -1481,6 +2535,8 @@ def render_prompt_card(prompt: dict) -> None:
                     on_click=delete_prompt,
                     args=(prompt_id,),
                 )
+        if agent:
+            st.caption("**Step 1 · Collection** — what to find in the notes, list and ask about.")
         st.text_area(
             "Prompt",
             value=prompt["text"],
@@ -1498,9 +2554,11 @@ def render_prompt_card(prompt: dict) -> None:
                 key=f"prompt_global_{prompt_id}",
                 on_change=save_prompt_field,
                 args=(prompt_id, "global"),
+                disabled=agent,
                 help=(
                     "Send this with **every** LLM request in **every** corpus, like About me — for standing "
-                    "instructions. It can still be left out of a single run in the Ask panel."
+                    "instructions. It can still be left out of a single run in the Ask panel. "
+                    "Not available for Agent prompts."
                 ),
             )
             st.checkbox(
@@ -1510,6 +2568,49 @@ def render_prompt_card(prompt: dict) -> None:
                 on_change=save_prompt_field,
                 args=(prompt_id, "starred"),
                 help="Starred prompts fill the Ask panel's Starred row.",
+            )
+            st.checkbox(
+                "Agent",
+                value=agent,
+                key=f"prompt_agent_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "agent"),
+                disabled=bool(prompt.get("global")),
+                help=(
+                    "Agent prompts are a workflow: step 1 collects and lists what's in the notes, optional steps "
+                    "refine it with you, and the **Action Command** stages a **Note**, **Tasks** or an **Email** "
+                    "for you to confirm and send to the outbox for another system (e.g. Salesforce). Only Agent "
+                    "prompts send to the outbox. Not available for Global prompts."
+                ),
+            )
+            if agent:
+                st.selectbox(
+                    "Output",
+                    options=DRAFT_OUTPUT_TYPES,
+                    index=DRAFT_OUTPUT_TYPES.index(get_prompt_output_type(prompt)),
+                    format_func=OUTPUT_TYPES.get,
+                    key=f"prompt_output_{prompt_id}",
+                    on_change=save_prompt_field,
+                    args=(prompt_id, "output"),
+                    width=150,
+                    label_visibility="collapsed",
+                    help="What this Agent drafts for the outbox.",
+                )
+            options = model_options if prompt.get("model", "") in model_options else [*model_options, prompt["model"]]
+            st.selectbox(
+                "Model",
+                options=options,
+                index=options.index(prompt.get("model", "")),
+                format_func=format_prompt_model,
+                key=f"prompt_model_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "model"),
+                width=200,
+                label_visibility="collapsed",
+                help=(
+                    "Model to use when you pick this prompt, for the answer and the discussion. You can still "
+                    "change either model in the Ask panel. **Model: as selected** keeps whatever is selected."
+                ),
             )
             st.multiselect(
                 "Tags",
@@ -1522,6 +2623,26 @@ def render_prompt_card(prompt: dict) -> None:
                 placeholder="Add a tag, press Enter",
                 label_visibility="collapsed",
             )
+        if links:
+            titles = {
+                link["id"]: ("⚙️ " if link.get("role") == EXECUTOR_ROLE else "🔗 ") + (link["title"] or link["url"])
+                for link in links
+            }
+            st.multiselect(
+                "Links",
+                options=list(titles),
+                default=[link_id for link_id in prompt.get("links", []) if link_id in titles],
+                format_func=lambda link_id: titles.get(link_id, link_id),
+                key=f"prompt_links_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "links"),
+                placeholder="Links to show when this prompt is used",
+                label_visibility="collapsed",
+                help="Shown as links under the question in the Ask box while this prompt is injected. "
+                "Add links in **Common links** at the top of this page.",
+            )
+        if agent:
+            render_agent_workflow_editor(prompt)
         if prompt.get("last_used"):
             st.caption(f"Last used {prompt['last_used'].replace('T', ' ')}")
 
@@ -1529,11 +2650,122 @@ def render_prompt_card(prompt: dict) -> None:
 def render_prompt_library_page() -> None:
     """Prompt library page (opened in its own tab): About me, corpus prompt, task prompts."""
     library = load_prompt_library()
-    st.title("Prompt library")
+    add_agent_border_style("[class*='st-key-agent_prompt_card_']")
+    render_outbox_status()
+    render_page_title("Prompt library")
     st.caption(
         "Shape what the LLM is told when it answers from your notes. Each request is built in this order: "
         "today's date → About me → corpus prompt → global prompts → your notes and question → the task you pick."
     )
+
+    links = library.get("links", [])
+    with st.expander(f"Common links · {len(links)}", expanded=False, key="prompt_page_links_open",
+                     icon=":material/link:"):
+        # The task executor comes first and is defined here; it can't be removed, only cleared.
+        executor = executor_link(library) or {}
+        st.markdown("**⚙️ Task executor**")
+        st.caption(
+            "The service that processes the outbox, e.g. the **Salesforce Connector** app "
+            "(`http://localhost:8503`), where you run it now or set its schedule. It's shown at the top of the "
+            "**Actions** page with 🟢 running / 🔴 not running, and you can attach it to prompts like any link."
+        )
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+            st.text_input("Title", value=executor.get("title", ""), key="executor_title", on_change=save_executor_field,
+                          args=("title",), max_chars=24, width=170, placeholder="Connector",
+                          help="A word or two.")
+            st.text_input("Address", value=executor.get("url", ""), key="executor_url", on_change=save_executor_field,
+                          args=("url",), placeholder="http://localhost:8503")
+            st.markdown(link_status_dot(executor.get("url", "")).strip() or " ", width="content",
+                        help="🟢 running · 🔴 not running (local links only)")
+
+        st.markdown("**🔗 Other links**")
+        st.caption(
+            "Links you attach to prompts with **Links** on each prompt card. While that prompt is injected they "
+            "show under the question in the Ask box and open in a new tab. **Keep titles to a word or two** "
+            "(e.g. *SF Tasks*): they sit inline. Put `{best_guess}` in an address for a **best guess search**: "
+            "it's replaced by the app's best guess at what you're looking for (the Agent's *Related to* names, "
+            "else the first **Must include** filter term, else names in your question). Links to this computer "
+            "(localhost) show 🟢 when the service is running and 🔴 when it isn't."
+        )
+        for link in [link for link in links if link.get("role") != EXECUTOR_ROLE]:
+            with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+                st.text_input(
+                    "Title",
+                    value=link.get("title", ""),
+                    key=f"link_title_{link['id']}",
+                    on_change=save_link_field,
+                    args=(link["id"], "title"),
+                    max_chars=24,
+                    width=170,
+                    placeholder="SF Tasks",
+                    help="A word or two. It's shown inline under the question.",
+                )
+                st.text_input(
+                    "Address",
+                    value=link.get("url", ""),
+                    key=f"link_url_{link['id']}",
+                    on_change=save_link_field,
+                    args=(link["id"], "url"),
+                    placeholder="https://…  (may include {best_guess})",
+                )
+                st.markdown(link_status_dot(link.get("url", "")).strip() or " ", width="content",
+                            help="🟢 running · 🔴 not running (local links only)")
+                st.button(":material/close:", key=f"link_delete_{link['id']}", type="tertiary",
+                          on_click=delete_link, args=(link["id"],), help="Remove this link, from every prompt too")
+        st.button("Add link", icon=":material/add:", key="link_add", on_click=add_link)
+
+    outbox = get_outbox_dir()
+    waiting = len(pending_outbox_files(outbox))
+    with st.expander(
+        f"Outbox · {waiting} waiting",
+        expanded=False,
+        key="prompt_page_outbox_open",
+        icon=":material/outbox:",
+    ):
+        st.caption(
+            "Drafts you send from an **Agent** prompt are written here as JSON files. A separate connector "
+            "(e.g. Salesforce) picks them up and moves each to processed/ or failed/ with a receipt."
+        )
+        st.text_input(
+            "Outbox folder",
+            value=str(outbox),
+            key="outbox_path_input",
+            on_change=persist_outbox_path,
+            help="Must match the folder your connector reads. Leave empty for the default.",
+        )
+        counts = {folder: len(list((outbox / folder).glob("*.receipt.json"))) for folder in HANDOFF_RESULT_DIRS}
+        st.caption(f"Waiting: **{waiting}** · Processed: **{counts['processed']}** · Failed: **{counts['failed']}**")
+
+    marker = get_title_marker(library)
+    with st.expander(
+        "Task title marker · " + (f"“{marker['text']}”" if marker["text"] else "off"),
+        expanded=False,
+        key="prompt_page_title_marker_open",
+        icon=":material/label:",
+    ):
+        st.caption(
+            "Added to the title of everything an **Agent** stages (task subjects, note titles, email subjects), "
+            "so you can find those records easily, e.g. in Salesforce. It's added when the Agent stages, so you "
+            "see it before **That's right**; a title that already contains it is left alone. Empty means off."
+        )
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            st.text_input(
+                "Marker",
+                value=marker["text"],
+                key="title_marker_text",
+                on_change=save_title_marker,
+                placeholder="e.g. RAG_TEST: or [AI]",
+            )
+            st.segmented_control(
+                "Where",
+                options=list(TITLE_MARKER_POSITIONS),
+                default=marker["position"],
+                format_func=TITLE_MARKER_POSITIONS.get,
+                key="title_marker_position",
+                on_change=save_title_marker,
+            )
+        if marker["text"]:
+            st.caption(f"Example: **{marked_title('Follow up with Acme on the pilot', marker)}**")
 
     profile = library["profile"]
     profile_on = bool(profile.get("enabled", True) and str(profile.get("text", "")).strip())
@@ -1593,7 +2825,9 @@ def render_prompt_library_page() -> None:
         st.subheader("Task prompts")
         st.caption(
             "Pick a task in the Ask panel to tell the LLM what to write from the notes. Tick **Global** to "
-            "send a prompt with every request instead. Tags help you find prompts; tick **Starred** for the ones you use most."
+            "send a prompt with every request instead. Tick **Agent** to make it a workflow that ends by sending "
+            "a note, tasks or an email to the outbox; Agent prompts have a blue border. **Model** picks the model "
+            "used with the prompt. Tags help you find prompts; tick **Starred** for the ones you use most."
         )
         with st.container(horizontal=True, vertical_alignment="bottom"):
             query = st.text_input(
@@ -1610,6 +2844,11 @@ def render_prompt_library_page() -> None:
                 disabled=not query,
                 key="prompt_page_clear_search",
             )
+            agents_only = st.toggle(
+                "Agents only",
+                key="prompt_page_agents_only",
+                help="Show only Agent prompts, the ones that send drafts to the outbox.",
+            )
         keywords = common_prompt_tags(library)
         if keywords:
             with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
@@ -1622,13 +2861,24 @@ def render_prompt_library_page() -> None:
                         on_click=set_prompt_page_query,
                         args=(keyword,),
                     )
-        shown = [p for p in library["prompts"] if prompt_matches_query(p, query)]
-        if query.strip():
+        shown = [
+            p for p in library["prompts"]
+            if prompt_matches_query(p, query) and (is_agent_prompt(p) or not agents_only)
+        ]
+        # "Edit prompt workflow" in the Discussion panel opens this page with ?prompt=<id>.
+        focused = find_prompt(library, st.query_params.get("prompt"))
+        if focused:
+            shown = [focused]
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.caption(f"Showing the workflow you opened: **{focused['name']}**.")
+                st.button("Show all prompts", key="prompt_page_show_all", on_click=show_all_prompts)
+        elif query.strip() or agents_only:
             st.caption(f"{len(shown)} of {len(library['prompts'])} prompts match.")
         if not shown:
             st.caption("No prompts match." if library["prompts"] else "No prompts yet — add one below.")
+        model_options = prompt_model_options()
         for prompt in shown:
-            render_prompt_card(prompt)
+            render_prompt_card(prompt, model_options, ordered_links(library))
 
     with st.container(border=True):
         st.subheader("Add a prompt")
@@ -1643,6 +2893,30 @@ def render_prompt_library_page() -> None:
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.checkbox("Global", key="new_prompt_global", help="Send with every LLM request in every corpus.")
                 st.checkbox("Starred", key="new_prompt_starred", help="Show it in the Ask panel's Starred row.")
+                st.checkbox(
+                    "Agent",
+                    key="new_prompt_agent",
+                    help="Draft a note, tasks or an email to review and send to the outbox, instead of a text answer.",
+                )
+                st.selectbox(
+                    "Output",
+                    options=DRAFT_OUTPUT_TYPES,
+                    index=DRAFT_OUTPUT_TYPES.index(DEFAULT_AGENT_OUTPUT),
+                    format_func=OUTPUT_TYPES.get,
+                    key="new_prompt_output",
+                    width=150,
+                    label_visibility="collapsed",
+                    help="What an Agent prompt drafts. Ignored unless **Agent** is ticked.",
+                )
+                st.selectbox(
+                    "Model",
+                    options=model_options,
+                    format_func=format_prompt_model,
+                    key="new_prompt_model",
+                    width=200,
+                    label_visibility="collapsed",
+                    help="Model to use when you pick this prompt. You can still change it in the Ask panel.",
+                )
                 st.multiselect(
                     "Tags",
                     options=[],
@@ -1655,7 +2929,7 @@ def render_prompt_library_page() -> None:
         if error := st.session_state.pop("add_prompt_error", None):
             st.warning(error)
         if added := st.session_state.pop("add_prompt_added", None):
-            st.success(f"Added **{added}**.")
+            st.success(f"Added **{added}**. Agent prompts get their steps and Action Command on their card above.")
 
     install_filter_commit_on_blur()
 
@@ -1679,10 +2953,12 @@ def render_injected_prompt_token(library: dict) -> None:
     if not task or task.get("global"):
         return
     st.session_state["question_task_token"] = [task["id"]]
+    if is_agent_prompt(task):
+        add_agent_border_style(".st-key-question_task_token [data-tag]")
     st.multiselect(
         "Injected prompt",
         options=[task["id"]],
-        format_func=lambda _: f"Prompt: {task['name']}",
+        format_func=lambda _: f"Prompt: {agent_prompt_label(task)}",
         key="question_task_token",
         on_change=sync_injected_prompt_token,
         label_visibility="collapsed",
@@ -1722,7 +2998,7 @@ def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
         parts.append("corpus prompt")
     parts.extend(f"Global: {p['name']}" for p in run_prompts["globals"])
     if run_prompts["task"]:
-        parts.append(f"Task: {run_prompts['task']['name']}")
+        parts.append(f"Task: {agent_prompt_label(run_prompts['task'])}")
     return parts
 
 
@@ -1734,6 +3010,8 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
     global_prompts = [p for p in library["prompts"] if p.get("global") and p.get("text", "").strip()]
     task_prompts = [p for p in library["prompts"] if not p.get("global")]
     active = resolve_run_prompts(library, corpus_config)["task"]
+    add_agent_border_style("[class*='st-key-use_agent_prompt_'] button", ".st-key-active_agent_task")
+    st.html("<style>.st-key-active_agent_task { padding: 0.1rem 0.25rem 0.1rem 0.75rem !important; }</style>")
 
     with st.container(border=True, gap="xsmall"):
         with st.container(horizontal=True, vertical_alignment="center"):
@@ -1766,10 +3044,13 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
                 st.caption(f"{title}:")
                 for prompt in prompts:
                     is_active = bool(active and active["id"] == prompt["id"])
+                    agent = is_agent_prompt(prompt)
                     st.button(
-                        truncate_text(prompt["name"], 28),
-                        key=f"use_prompt_{title}_{prompt['id']}",
-                        help=prompt["text"],
+                        truncate_text(agent_prompt_label(prompt), 34 if agent else 28),
+                        # Agent keys pick up the blue border style above.
+                        key=f"use_{'agent_' if agent else ''}prompt_{title}_{prompt['id']}",
+                        help=(f"**Agent** — ends by sending {OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()} "
+                              f"to the outbox: *{agent_command(prompt)}*\n\n" if agent else "") + prompt["text"],
                         type="primary" if is_active else "secondary",
                         on_click=clear_active_task_prompt if is_active else set_active_task_prompt,
                         args=() if is_active else (prompt["id"],),
@@ -1777,16 +3058,26 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
 
         with st.container(horizontal=True, vertical_alignment="center", gap="small"):
             if active:
-                st.markdown(f"**Task:** {active['name']}", help=active["text"], width="content")
-                st.button(
-                    ":material/close:",
-                    type="tertiary",
-                    key="clear_task_prompt",
-                    on_click=clear_active_task_prompt,
-                    help="Remove the task",
-                )
+                agent = is_agent_prompt(active)
+                with st.container(
+                    horizontal=True,
+                    vertical_alignment="center",
+                    gap="xsmall",
+                    width="content",
+                    border=agent,
+                    key="active_agent_task" if agent else "active_task",
+                ):
+                    st.markdown(f"**Task:** {agent_prompt_label(active)}", help=active["text"], width="content")
+                    st.button(
+                        ":material/close:",
+                        type="tertiary",
+                        key="clear_task_prompt",
+                        on_click=clear_active_task_prompt,
+                        help="Remove the task",
+                    )
             if task_prompts:
-                labels = {p["id"]: p["name"] for p in task_prompts}
+                # A dropdown can't style single options, so Agents show what they draft instead.
+                labels = {p["id"]: agent_prompt_label(p) for p in task_prompts}
                 st.selectbox(
                     "Find a prompt",
                     options=list(labels),
@@ -1802,24 +3093,24 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
 
 
 def render_prompt_library_sidebar(corpus_config: dict) -> None:
-    """Sidebar summary of what is sent to the LLM, with a link to the Prompt library page."""
+    """Sidebar button that opens the Prompt library page; hover it for a summary of what is sent to the LLM."""
     library = load_prompt_library()
     profile = library["profile"]
     global_count = sum(1 for p in library["prompts"] if p.get("global"))
     task_count = len(library["prompts"]) - global_count
-    with st.sidebar.expander("Prompt Library", expanded=False):
-        st.caption(
+    agent_count = sum(1 for p in library["prompts"] if is_agent_prompt(p))
+    st.sidebar.link_button(
+        "Prompt library",
+        PROMPT_LIBRARY_PAGE_URL,
+        icon=":material/library_books:",
+        width="stretch",
+        help=(
             f"About me: **{'on' if profile.get('enabled') and profile.get('text', '').strip() else 'off'}** · "
-            f"Corpus prompt: **{'applied' if get_active_corpus_prompt(corpus_config) else 'off'}**"
-        )
-        st.caption(f"Global prompts: **{global_count}** · Task prompts: **{task_count}**")
-        st.link_button(
-            "Open prompt library",
-            PROMPT_LIBRARY_PAGE_URL,
-            icon=":material/open_in_new:",
-            width="stretch",
-            help="Opens in a new tab.",
-        )
+            f"Corpus prompt: **{'applied' if get_active_corpus_prompt(corpus_config) else 'off'}**  \n"
+            f"Global prompts: **{global_count}** · Task prompts: **{task_count}** (Agents: **{agent_count}**)  \n"
+            "Opens in a new tab."
+        ),
+    )
 
 
 def is_hide_corpora_enabled() -> bool:
@@ -1861,10 +3152,17 @@ def render_corpus_visibility_controls(all_libraries: list[str]) -> None:
             value=bool(load_app_settings().get("hide_corpora_enabled", False)),
             key="hide_corpora_enabled_global",
             on_change=persist_hide_corpora_enabled,
-            help="When enabled, corpora marked hidden below are removed from the library dropdown.",
+            help=(
+                "When enabled, corpora marked hidden below are removed from the library dropdown and "
+                "skipped by all-corpora scans and rebuilds."
+            ),
         )
         if is_hide_corpora_enabled():
-            st.caption("Hidden corpora stay indexed — they are only removed from the selector.")
+            st.caption(
+                "Hidden corpora are removed from the selector and skipped by every all-corpora scan "
+                "and rebuild (including auto-rescan). Their index is kept as it was; select one to "
+                "rescan it on its own."
+            )
             for lib_name in all_libraries:
                 safe_name = sanitize_library_name(lib_name)
                 st.checkbox(
@@ -2100,6 +3398,45 @@ def describe_prompt_parts(search_state: dict) -> str:
     return f" with {', '.join(parts)}." if parts else "."
 
 
+def discussion_note_key(result: dict) -> tuple[str, str]:
+    return (result.get("_library", ""), str(result.get("file_source", "")))
+
+
+def discussion_results(search_state: dict) -> list:
+    """The search's results minus notes the user unticked under Sources ('use in this discussion')."""
+    left_out = {tuple(key) for key in search_state.get("left_out_notes", [])}
+    return [r for r in search_state["results"] if discussion_note_key(r) not in left_out]
+
+
+def toggle_discussion_note(search_state: dict, note_key: tuple[str, str], widget_key: str) -> None:
+    left_out = [tuple(key) for key in search_state.get("left_out_notes", []) if tuple(key) != note_key]
+    if not st.session_state.get(widget_key, True):
+        left_out.append(note_key)
+    search_state["left_out_notes"] = left_out
+
+
+def build_discussion_messages(search_state: dict, max_tokens: int, temperature: float, corpus_prompt: str) -> list[dict]:
+    """The conversation so far, opening with the notes still in use (rebuilt each time, so unticking applies)."""
+    messages = [{
+        "role": "user",
+        "content": build_llm_prompt(
+            search_state["question"],
+            discussion_results(search_state),
+            max_tokens,
+            temperature,
+            corpus_prompt,
+            search_state.get("task_prompt", ""),
+        ),
+    }]
+    if search_state.get("answer"):
+        messages.append({"role": "assistant", "content": search_state["answer"]})
+    messages.extend(
+        {"role": turn["role"], "content": turn.get("prompt", turn["content"])}
+        for turn in search_state["discussion"]
+    )
+    return messages
+
+
 def follow_up_with_ollama(
     search_state: dict,
     question: str,
@@ -2107,41 +3444,17 @@ def follow_up_with_ollama(
     max_tokens: int,
     temperature: float,
     corpus_prompt: str = "",
+    sent_text: str | None = None,
 ) -> dict:
-    """Answer a follow-up using the search's notes plus the conversation so far.
+    """Answer a follow-up using the notes in use plus the conversation so far.
 
-    Returns the new user turn; `prompt` holds the full text sent when it differs from `content`.
+    `sent_text` is sent instead of `question` when they differ (e.g. a step's full prompt); it is kept
+    as the turn's `prompt` so later requests repeat what the model actually saw.
     """
-    messages: list[dict] = []
-    if search_state.get("answer"):
-        messages.append({
-            "role": "user",
-            "content": build_llm_prompt(
-                search_state["question"],
-                search_state["results"],
-                max_tokens,
-                temperature,
-                corpus_prompt,
-                search_state.get("task_prompt", ""),
-            ),
-        })
-        messages.append({"role": "assistant", "content": search_state["answer"]})
-    messages.extend(
-        {"role": turn["role"], "content": turn.get("prompt", turn["content"])}
-        for turn in search_state["discussion"]
-    )
-
+    messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
     user_turn = {"role": "user", "content": question}
-    if not messages:
-        # No answer yet — this turn carries the notes as context.
-        user_turn["prompt"] = build_llm_prompt(
-            question,
-            search_state["results"],
-            max_tokens,
-            temperature,
-            corpus_prompt,
-            search_state.get("task_prompt", ""),
-        )
+    if sent_text and sent_text != question:
+        user_turn["prompt"] = sent_text
     messages.append({"role": "user", "content": user_turn.get("prompt", question)})
 
     reply, _usage = chat_with_ollama(
@@ -2152,6 +3465,29 @@ def follow_up_with_ollama(
         num_ctx=FOLLOW_UP_NUM_CTX,
     )
     return {"user": user_turn, "assistant": {"role": "assistant", "content": reply}}
+
+
+def add_discussion_turn(
+    search_state: dict,
+    question: str,
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+    corpus_prompt: str,
+    sent_text: str | None = None,
+) -> bool:
+    """Ask the follow-up and add both turns to the discussion; False (with an error shown) if it failed."""
+    with st.spinner(f"Asking `{model_name}`…"):
+        try:
+            turns = follow_up_with_ollama(
+                search_state, question, model_name, max_tokens, temperature, corpus_prompt, sent_text
+            )
+        except Exception as exc:
+            st.error(f"Follow-up failed: {exc}")
+            return False
+    turns["assistant"]["model"] = model_name
+    search_state["discussion"].extend([turns["user"], turns["assistant"]])
+    return True
 
 
 def persist_llm_tuning(safe_lib: str) -> None:
@@ -2171,28 +3507,43 @@ def persist_follow_up_model(safe_lib: str) -> None:
 
 def render_copy_button(text: str, label: str = "Copy") -> None:
     """Small button that copies `text` to the clipboard (component iframes may write to it)."""
-    payload = json.dumps(text).replace("</", "<\\/")
+    render_copy_buttons([(label, text)])
+
+
+def render_copy_buttons(buttons: list[tuple[str, str]]) -> None:
+    """A row of small copy buttons, one per (label, text), in a single component iframe."""
+    buttons = [(label, text) for label, text in buttons if text and text.strip()]
+    if not buttons:
+        return
+    payload = json.dumps([text for _label, text in buttons]).replace("</", "<\\/")
+    labels = json.dumps([label for label, _text in buttons]).replace("</", "<\\/")
     components.html(
         f"""
-<button id="copy" style="font:12px -apple-system,BlinkMacSystemFont,sans-serif;color:#888;
-  background:transparent;border:1px solid rgba(136,136,136,.45);border-radius:6px;
-  padding:2px 10px;cursor:pointer">📋 {label}</button>
+<div id="row" style="display:flex;gap:6px"></div>
 <script>
-const text = {payload};
-const button = document.getElementById("copy");
-button.addEventListener("click", async () => {{
-  try {{
-    await navigator.clipboard.writeText(text);
-  }} catch (err) {{
-    const area = document.createElement("textarea");
-    area.value = text;
-    document.body.appendChild(area);
-    area.select();
-    document.execCommand("copy");
-    area.remove();
-  }}
-  button.textContent = "✓ Copied";
-  setTimeout(() => (button.textContent = "📋 {label}"), 1500);
+const texts = {payload};
+const labels = {labels};
+const row = document.getElementById("row");
+labels.forEach((label, i) => {{
+  const button = document.createElement("button");
+  button.style.cssText = "font:12px -apple-system,BlinkMacSystemFont,sans-serif;color:#888;" +
+    "background:transparent;border:1px solid rgba(136,136,136,.45);border-radius:6px;padding:2px 10px;cursor:pointer";
+  button.textContent = "📋 " + label;
+  button.addEventListener("click", async () => {{
+    try {{
+      await navigator.clipboard.writeText(texts[i]);
+    }} catch (err) {{
+      const area = document.createElement("textarea");
+      area.value = texts[i];
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }}
+    button.textContent = "✓ Copied";
+    setTimeout(() => (button.textContent = "📋 " + label), 1500);
+  }});
+  row.appendChild(button);
 }});
 </script>
 """,
@@ -2280,8 +3631,8 @@ def render_follow_up_discussion(
     corpus_prompt: str = "",
     model_options: list[str] | None = None,
     safe_lib: str = "",
-) -> None:
-    """Chat panel for follow-up questions about the notes from the last search."""
+) -> str:
+    """Chat panel for follow-up questions about the notes from the last search; returns the follow-up model."""
     st.subheader("Discussion")
 
     # Follow-ups can use a different (e.g. larger) model than the main answer.
@@ -2289,11 +3640,18 @@ def render_follow_up_discussion(
     saved_model = get_corpus_config(safe_lib).get("follow_up_model") or model_name
     if saved_model not in options:
         saved_model = model_name if model_name in options else options[0]
+    # A prompt with its own model sets the follow-up model once per search; changing it afterwards overrides it.
+    prompt_model = search_state.get("prompt_model")
+    if prompt_model in options and not search_state.get("prompt_model_applied"):
+        st.session_state[f"follow_up_model_{safe_lib}"] = prompt_model
+        search_state["prompt_model_applied"] = True
+    model_key = f"follow_up_model_{safe_lib}"
+    if st.session_state.get(model_key) not in options:
+        st.session_state[model_key] = saved_model  # set here, not via index, so a prompt's model can replace it
     model_name = st.selectbox(
         "Follow-up model",
         options=options,
-        index=options.index(saved_model),
-        key=f"follow_up_model_{safe_lib}",
+        key=model_key,
         on_change=persist_follow_up_model,
         args=(safe_lib,),
         help=(
@@ -2301,8 +3659,14 @@ def render_follow_up_discussion(
             "e.g. a larger model for deeper discussion. Saved per corpus."
         ),
     )
-    caption = f"Follow-ups are answered from the notes in this search using `{model_name}`"
+    in_use = len({discussion_note_key(r) for r in discussion_results(search_state)})
+    total = len({discussion_note_key(r) for r in search_state["results"]})
+    notes = "the notes in this search" if in_use == total else f"{in_use} of {total} notes from this search"
+    caption = f"Follow-ups are answered from {notes} using `{model_name}`"
     st.caption(caption + describe_prompt_parts(search_state))
+    # The task the model was given (for an Agent: its collection prompt plus how to list and where it's
+    # heading), ready to paste into a flow or a test.
+    render_copy_buttons([("Copy task prompt", search_state.get("task_prompt", ""))])
 
     view_col, popout_col = st.columns(2)
     with view_col:
@@ -2325,6 +3689,7 @@ def render_follow_up_discussion(
         # A content-sized panel can be shorter than the default box, so expanding uses a fixed taller height.
         height=DISCUSSION_EXPANDED_HEIGHT if expanded else DISCUSSION_HEIGHT,
     )
+    return model_name
 
 
 def render_discussion_body(
@@ -2348,16 +3713,31 @@ def render_discussion_body(
                 st.markdown(turn["content"])
                 if turn.get("model"):
                     st.caption(f"`{turn['model']}`")
-                if turn["role"] == "assistant":
-                    render_copy_button(turn["content"])
+                # Every turn can be copied. When the model was sent more than is shown (a step's prompt, or
+                # Needs work with the rejected list), that full prompt can be copied too, to reuse in flows.
+                buttons = [("Copy", turn["content"])]
+                if turn.get("prompt") and turn["prompt"] != turn["content"]:
+                    buttons.append(("Copy prompt sent", turn["prompt"]))
+                render_copy_buttons(buttons)
 
-    with st.form(f"{key_prefix}_follow_up_form", clear_on_submit=True):
-        follow_up = st.text_area(
-            "Ask a follow-up",
-            height=90,
-            placeholder="e.g. Who owns each of those requirements?",
-        )
-        submitted = st.form_submit_button("Send", type="primary", use_container_width=True)
+    with st.container(border=True):
+        # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown("Ask a follow-up", width="stretch")
+            big_box = st.toggle(
+                "Expand",
+                key=f"{key_prefix}_follow_up_expanded",
+                help="Make the follow-up box bigger for longer replies.",
+            )
+        with st.form(f"{key_prefix}_follow_up_form", clear_on_submit=True, border=False):
+            follow_up = st.text_area(
+                "Ask a follow-up",
+                key=f"{key_prefix}_follow_up_text",  # a fixed key keeps typed text when the box resizes
+                height=FOLLOW_UP_BOX_EXPANDED_HEIGHT if big_box else FOLLOW_UP_BOX_HEIGHT,
+                placeholder="e.g. Who owns each of those requirements?",
+                label_visibility="collapsed",
+            )
+            submitted = st.form_submit_button("Send", type="primary", use_container_width=True)
 
     # Inside the pop-out, rerun only the dialog so it stays open.
     rerun_scope = "fragment" if in_dialog else "app"
@@ -2367,17 +3747,8 @@ def render_discussion_body(
         st.rerun(scope=rerun_scope)
 
     if submitted and follow_up.strip():
-        with st.spinner(f"Asking `{model_name}`…"):
-            try:
-                turns = follow_up_with_ollama(
-                    search_state, follow_up.strip(), model_name, max_tokens, temperature, corpus_prompt
-                )
-            except Exception as exc:
-                st.error(f"Follow-up failed: {exc}")
-                return
-        turns["assistant"]["model"] = model_name
-        discussion.extend([turns["user"], turns["assistant"]])
-        st.rerun(scope=rerun_scope)
+        if add_discussion_turn(search_state, follow_up.strip(), model_name, max_tokens, temperature, corpus_prompt):
+            st.rerun(scope=rerun_scope)
 
 
 @st.dialog("Discussion", width="large", on_dismiss="rerun")
@@ -2496,6 +3867,226 @@ def render_filter_results(search_state: dict, library_folder: Path, safe_lib: st
                 render_full_document(file_source, path, note_lib)
 
 
+RECEIPT_STATUS_TEXT = {
+    "done": "everything was created",
+    "partial": "some items were created; the rest need attention",
+    "needs_review": "nothing was created yet; a record or field needs choosing",
+    "failed": "it couldn't be processed",
+}
+
+
+def staged_item_title(item: dict) -> str:
+    return item.get("subject") or item.get("title") or "(untitled)"
+
+
+def describe_staged_item(item: dict) -> str:
+    """One readable line (plus a short body) for a staged note, task or email."""
+    details = []
+    if item["type"] == "task":
+        details += [
+            f"due {item['due_date'] or 'not set'}",
+            f"priority {item['priority'] or 'not set'}",
+            f"owner {item['owner'] or 'not given'}",
+        ]
+    elif item["type"] == "email":
+        details.append("to " + (", ".join(item["to"]) or "nobody given"))
+    related = item["related_to"]
+    if related["name"]:
+        details.append(f"related to {related['name']}" + (f" ({related['kind']})" if related["kind"] else ""))
+    text = f"**{staged_item_title(item)}** — " + " · ".join(details) if details else f"**{staged_item_title(item)}**"
+    body = item.get("description") or item.get("body") or ""
+    return text + (f"  \n{truncate_text(body, 200)}" if body else "")
+
+
+def unstage_item(agent: dict, index: int) -> None:
+    agent["staged"]["items"].pop(index)
+
+
+def start_needs_work(agent: dict) -> None:
+    agent["rejected"], agent["staged"], agent["needs_work"] = agent["staged"], None, True
+
+
+def send_staged_to_outbox(search_state: dict, prompt: dict, source_notes: list[tuple[str, Path | None]]) -> None:
+    agent = search_state["agent"]
+    staged = agent["staged"]
+    try:
+        path = write_handoff_package(build_handoff_package(search_state, prompt, staged, source_notes), get_outbox_dir())
+    except Exception as exc:
+        agent["send_error"] = f"Couldn't write to the outbox: {exc}"
+        return
+    agent["sent"].append({
+        "file": str(path),
+        "type": staged["type"],
+        "items": staged["items"],
+        "at": datetime.datetime.now().strftime("%H:%M"),
+    })
+    agent["staged"] = None
+
+
+def render_sent_batch(batch: dict) -> bool:
+    """One sent package: what happened to it, and a link to it on the Actions page.
+    Returns True while it's still waiting for a connector."""
+    waiting = render_sent_status(batch)
+    package_name = Path(batch["file"]).name
+    st.link_button(
+        "View in outbox",
+        f"{ACTIONS_PAGE_URL}&package={package_name}",
+        icon=":material/outbox:",
+        type="tertiary",
+        help=f"Opens the Actions page in a new tab, showing {package_name}: what it holds and what happened to it.",
+    )
+    return waiting
+
+
+def render_sent_status(batch: dict) -> bool:
+    """What happened to one sent package; returns True while it's still waiting for a connector."""
+    count = f"{len(batch['items'])} {OUTPUT_TYPES[batch['type']].lower()}"
+    package_file = Path(batch["file"])
+    if (package_file.parent / WITHDRAWN_DIR / package_file.name).is_file():
+        st.info(f"Sent {count} at {batch['at']}, then withdrawn on the Actions page.")
+        return False
+    receipt = read_handoff_receipt(package_file)
+    if not receipt:
+        st.info(f"Sent {count} to the outbox at {batch['at']}. Waiting for a connector to pick it up.")
+        return True
+    message = (
+        f"Sent {count} at {batch['at']}. **{receipt.get('connector', 'Connector').capitalize()}:** "
+        f"{RECEIPT_STATUS_TEXT.get(receipt['status'], receipt['status'])}."
+    )
+    if receipt.get("error"):
+        message += f" {receipt['error']}"
+    (st.success if receipt["status"] == "done" else st.warning)(message)
+    for result in receipt.get("items", []):
+        if result["status"] in ("created", "exists"):
+            continue
+        index = result["index"]
+        title = staged_item_title(batch["items"][index]) if index < len(batch["items"]) else f"Item {index + 1}"
+        candidates = ", ".join(c["name"] for c in result.get("candidates", []))
+        st.caption(f"{title}: {result['message']}" + (f" Possible matches: {candidates}." if candidates else ""))
+    return False
+
+
+def render_agent_panel(
+    search_state: dict,
+    source_notes: list[tuple[str, Path | None]],
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+    corpus_prompt: str,
+) -> None:
+    """Agent workflow under the discussion: step buttons, Agent:<name> to stage, That's right / Needs work."""
+    agent = search_state["agent"]
+    # Read the prompt live, so edits made in the prompt library apply on the next click.
+    prompt = find_prompt(load_prompt_library(), agent["prompt"]["id"]) or agent["prompt"]
+    label = agent_prompt_label(prompt)
+    item_kind = OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()
+    add_agent_border_style(".st-key-agent_panel", ".st-key-agent_run button", ".st-key-agent_staging")
+
+    with st.container(border=True, key="agent_panel"):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(f"**{label}**", width="content")
+            st.link_button(
+                "Edit prompt workflow",
+                f"{PROMPT_LIBRARY_PAGE_URL}&prompt={prompt['id']}",
+                icon=":material/open_in_new:",
+                type="tertiary",
+                help="Opens this Agent's steps and Action Command in the prompt library, in a new tab.",
+            )
+        steps = [s for s in prompt.get("steps", []) if s.get("text", "").strip()]
+        if steps:
+            with st.container(horizontal=True, gap="xsmall"):
+                for number, step in enumerate(steps, 2):
+                    if st.button(f"{number} · {step['name']}", key=f"agent_step_{step['id']}", help=step["text"]):
+                        if add_discussion_turn(
+                            search_state, f"*{step['name']}* — {step['text']}", model_name, max_tokens,
+                            temperature, corpus_prompt, sent_text=step["text"],
+                        ):
+                            st.rerun()
+        st.caption(
+            "Reply in the discussion to pick items (e.g. *Yes:1,2,3 ignore 4,5,6*), set dates and answer questions. "
+            f"When it's right, stage the {item_kind}. Untick notes under Sources to narrow what the LLM uses."
+        )
+        if st.button(
+            label,
+            key="agent_run",
+            icon=":material/smart_toy:",
+            use_container_width=True,
+            help=f"**Action Command:** {agent_command(prompt)}\n\nStages what you've agreed so you can check it first.",
+        ):
+            with st.spinner(f"`{model_name}` is staging the {item_kind}…"):
+                try:
+                    agent["staged"] = stage_agent_items(
+                        search_state, prompt, model_name, max_tokens, temperature, corpus_prompt
+                    )
+                    agent["needs_work"] = False
+                except Exception as exc:
+                    st.error(f"Couldn't stage the {item_kind}: {exc}")
+                else:
+                    st.rerun()
+
+        staged = agent.get("staged")
+        if staged:
+            with st.container(border=True, key="agent_staging"):
+                st.markdown(f"**Staged — check before it goes to the outbox**  \n{staged['summary']}")
+                if not staged["items"]:
+                    st.info("Nothing to send: no agreed items were found. Choose **Needs work** and say what you want.")
+                for index, item in enumerate(staged["items"]):
+                    item_col, remove_col = st.columns([0.92, 0.08])
+                    item_col.markdown(describe_staged_item(item))
+                    with remove_col:
+                        st.button(
+                            ":material/close:",
+                            key=f"agent_unstage_{staged['id']}_{index}",
+                            type="tertiary",
+                            on_click=unstage_item,
+                            args=(agent, index),
+                            help="Leave this one out",
+                        )
+                right_col, needs_col = st.columns(2)
+                right_col.button(
+                    "That's right",
+                    key=f"agent_confirm_{staged['id']}",
+                    type="primary",
+                    icon=":material/check:",
+                    on_click=send_staged_to_outbox,
+                    args=(search_state, prompt, source_notes),
+                    disabled=not staged["items"],
+                    use_container_width=True,
+                    help=f"Write these to the outbox ({get_outbox_dir()}).",
+                )
+                needs_col.button(
+                    "Needs work",
+                    key=f"agent_reject_{staged['id']}",
+                    icon=":material/edit:",
+                    on_click=start_needs_work,
+                    args=(agent,),
+                    use_container_width=True,
+                    help="Discard this and say what's wrong; then keep refining and stage again.",
+                )
+        if error := agent.pop("send_error", None):
+            st.warning(error)
+
+        if agent.get("needs_work"):
+            with st.form("agent_needs_work_form", clear_on_submit=True):
+                issue = st.text_area(
+                    "What needs work?", placeholder="e.g. Task 2 is Jo's, not mine, and drop the last one."
+                )
+                submitted = st.form_submit_button("Send", type="primary")
+            if submitted and issue.strip():
+                rejected = agent.get("rejected") or {"items": []}
+                proposal = "\n".join(f"- {describe_staged_item(item)}" for item in rejected["items"]) or "- (nothing)"
+                if add_discussion_turn(
+                    search_state, f"**Needs work:** {issue.strip()}", model_name, max_tokens, temperature,
+                    corpus_prompt, sent_text=f"You proposed:\n{proposal}\n\nThat needs work: {issue.strip()}",
+                ):
+                    agent["needs_work"], agent["rejected"] = False, None
+                    st.rerun()
+
+        waiting = [render_sent_batch(batch) for batch in reversed(agent["sent"])]
+        if any(waiting):
+            st.button("Check again", icon=":material/refresh:", key="agent_check_sent")
+
+
 def render_search_results(
     search_state: dict,
     library_folder: Path,
@@ -2525,26 +4116,35 @@ def render_search_results(
             hit.get("_uploads_dirs", search_state["uploads_dirs"]),
         )
 
+    # Each source note once, in rank order, with its local path when it can be found.
+    source_notes: list[tuple[str, Path | None]] = []
+    notes_in_use: list[tuple[str, Path | None]] = []  # minus notes unticked for the discussion
+    in_use_keys = {discussion_note_key(r) for r in discussion_results(search_state)}
+    seen_sources: set[tuple[str, str]] = set()
+    for result in results:
+        file_source = str(result.get("file_source", ""))
+        source_key = discussion_note_key(result)
+        if file_source and source_key not in seen_sources:
+            seen_sources.add(source_key)
+            result_folder, _result_lib, result_uploads = hit_location(result)
+            note = (file_source, resolve_source_path(file_source, result_folder, result_uploads))
+            source_notes.append(note)
+            if source_key in in_use_keys:
+                notes_in_use.append(note)
+
     main_col, chat_col = st.columns([3, 2], gap="large")
 
     with main_col:
         if search_state["answer"]:
             st.subheader("Answer")
             st.markdown(search_state["answer"])
-            render_copy_button(search_state["answer"], "Copy answer")
+            render_copy_buttons([
+                ("Copy answer", search_state["answer"]),
+                ("Copy question", search_state.get("question", "")),
+                ("Copy task prompt", search_state.get("task_prompt", "")),
+            ])
 
-            cited_paths: list[Path] = []
-            seen_paths: set[str] = set()
-            for result in results:
-                result_folder, _result_lib, result_uploads = hit_location(result)
-                path = resolve_source_path(
-                    str(result.get("file_source", "")),
-                    result_folder,
-                    result_uploads,
-                )
-                if path and str(path) not in seen_paths:
-                    seen_paths.add(str(path))
-                    cited_paths.append(path)
+            cited_paths = list(dict.fromkeys(path for _file, path in source_notes if path))
             if cited_paths:
                 st.caption(
                     "Sources used (expand below to read them): "
@@ -2558,6 +4158,7 @@ def render_search_results(
                     f"Model: `{search_state['model']}` · "
                     f"{usage.get('total', '?')} tokens · "
                     f"{processing_time:.1f}s"
+                    + (f" · {usage['tokens_per_second']:.1f} tokens/s" if usage.get("tokens_per_second") else "")
                     + "".join(f" · {part}" for part in search_state.get("prompt_parts", []))
                 )
         elif search_state["answer_error"]:
@@ -2566,6 +4167,7 @@ def render_search_results(
             st.info("No question was asked — use the discussion panel to ask about these notes.")
 
         st.subheader("Sources")
+        st.caption("Untick a note to leave it out of the discussion's next replies (and of what an Agent sends).")
         # Group hits by document, keeping the order of each document's best hit.
         hits_by_source: dict[tuple[str, str], list[dict]] = {}
         for i, res in enumerate(results, 1):
@@ -2585,7 +4187,20 @@ def render_search_results(
             if best is not None:
                 label += f" (distance: {best:.3f})"
             hit_folder, hit_lib, hit_uploads = hit_location(hits[0])
-            with st.expander(label):
+            note_key = (library, file_source)
+            use_key = f"use_note_{search_state.get('id', '')}_{library}_{file_source}"
+            if use_key not in st.session_state:
+                st.session_state[use_key] = note_key in in_use_keys
+            use_col, note_col = st.columns([0.05, 0.95])
+            use_col.checkbox(
+                "Use in discussion",
+                key=use_key,
+                on_change=toggle_discussion_note,
+                args=(search_state, note_key, use_key),
+                label_visibility="collapsed",
+                help="Use this note in the discussion and for the Agent. Untick to leave it out of the next replies.",
+            )
+            with note_col.expander(label if note_key in in_use_keys else f"~~{label}~~ · left out"):
                 render_source_document(
                     file_source,
                     hits,
@@ -2595,7 +4210,7 @@ def render_search_results(
                 )
 
     with chat_col:
-        render_follow_up_discussion(
+        follow_up_model = render_follow_up_discussion(
             search_state,
             model_name,
             max_tokens,
@@ -2604,6 +4219,8 @@ def render_search_results(
             model_options,
             safe_lib,
         )
+        if search_state.get("agent"):
+            render_agent_panel(search_state, notes_in_use, follow_up_model, max_tokens, temperature, corpus_prompt)
 
 
 def get_pending_index_settings(safe_lib: str, corpus_config: dict) -> tuple[str, float, bool]:
@@ -2876,8 +4493,109 @@ def get_ingest_directories(folder_path: Path) -> list[Path]:
     )
 
 
+def list_ingest_files(folder_path: Path) -> dict[str, tuple[Path, float]]:
+    """Ingestible files under folder_path as {file name: (path, modified time)}.
+
+    LLMWare keys a library's files by bare file name, so when two notes in one corpus share a
+    name only the first in ingest order (shallowest folder first) is indexed.
+    """
+    paths = sorted(
+        (
+            path
+            for path in folder_path.rglob("*")
+            if path.suffix.lower() in INGEST_EXTENSIONS and not should_skip_ingest_path(path)
+        ),
+        key=lambda path: (len(path.parts), str(path)),
+    )
+    files: dict[str, tuple[Path, float]] = {}
+    for path in paths:
+        if path.name in files:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path.is_file():
+            files[path.name] = (path, stat.st_mtime)
+    return files
+
+
+def plan_text_rescan(lib: Library, folder_path: Path) -> dict[str, list]:
+    """Compare folder_path with the library: notes that are new, changed or removed.
+
+    LLMWare copies each file into the library's uploads folder when it indexes it, so the copy's
+    modified time is when the note was indexed. A note whose file is newer has been edited since.
+    Costs two stats per note; no file is read.
+    """
+    indexed: dict[str, float] = {}
+    uploads = Path(lib.file_copy_path)
+    if uploads.is_dir():
+        for copy in uploads.iterdir():
+            if copy.suffix.lower() in INGEST_EXTENSIONS and copy.is_file():
+                indexed[copy.name] = copy.stat().st_mtime
+
+    on_disk = list_ingest_files(folder_path)
+    new = [path for name, (path, _mtime) in on_disk.items() if name not in indexed]
+    changed = [path for name, (path, mtime) in on_disk.items() if name in indexed and mtime > indexed[name]]
+    # An empty or missing folder (unmounted drive, renamed root) must not wipe the index.
+    removed = [name for name in indexed if name not in on_disk] if on_disk else []
+    return {"new": new, "changed": changed, "removed": removed}
+
+
+def delete_block_vectors(safe_lib: str, rowids: list[int]) -> None:
+    """Drop the vectors of deleted blocks — SQLite can hand their row ids to new blocks."""
+    if not rowids:
+        return
+    card = get_fresh_library_card(safe_lib) or {}
+    models = {
+        emb.get("embedding_model")
+        for emb in card.get("embedding") or []
+        if emb.get("embedding_db") == VECTOR_DB and emb.get("embedding_model") not in {None, "", "none"}
+    }
+    for model in models:
+        name = get_collection_name(safe_lib, model)
+        if not (LANCEDB_PATH / f"{name}.lance").is_dir():
+            continue
+        table = get_lancedb_connection().open_table(name)
+        for start in range(0, len(rowids), 500):
+            ids = ", ".join(f"'{rowid}'" for rowid in rowids[start:start + 500])
+            table.delete(f"id IN ({ids})")
+
+
+def remove_indexed_notes(lib: Library, file_names: list[str]) -> None:
+    """Delete notes' blocks, vectors and uploads copies, so they can be re-ingested or dropped."""
+    if not file_names:
+        return
+    safe_lib = lib.library_name
+    table = safe_lib.replace('"', '""')
+    rowids: list[int] = []
+    with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+        for start in range(0, len(file_names), 500):
+            chunk = file_names[start:start + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            rowids += [
+                row[0]
+                for row in conn.execute(f'SELECT rowid FROM "{table}" WHERE file_source IN ({placeholders})', chunk)
+            ]
+            conn.execute(f'DELETE FROM "{table}" WHERE file_source IN ({placeholders})', chunk)
+        # add_files reports what it added from changes in these card counts.
+        blocks, documents = conn.execute(f'SELECT COUNT(*), COUNT(DISTINCT doc_ID) FROM "{table}"').fetchone()
+        conn.execute(
+            "UPDATE library SET blocks = ?, documents = ? WHERE library_name = ?", (blocks, documents, safe_lib)
+        )
+    delete_block_vectors(safe_lib, rowids)
+    uploads = Path(lib.file_copy_path)
+    for name in file_names:
+        (uploads / name).unlink(missing_ok=True)
+
+
 def ingest_all_files(lib: Library, folder_path: Path) -> dict:
-    """Ingest files from all subfolders — LLMWare only scans one directory level at a time."""
+    """Bring the text index in line with folder_path: add new notes, re-ingest edited ones and
+    drop removed ones. Embeddings are not touched; new blocks wait for the next embedding run.
+
+    LLMWare's add_files skips any file name it has seen, so on its own it never picks up edits,
+    and it only scans one directory level at a time.
+    """
     totals = {
         "docs_added": 0,
         "blocks_added": 0,
@@ -2890,7 +4608,15 @@ def ingest_all_files(lib: Library, folder_path: Path) -> dict:
     if load_app_settings().get("corpus_mode") == CORPUS_MODE_SINGLE:
         add_files_kwargs = {"get_images": False, "verbose_level": 0}
 
-    directories = get_ingest_directories(folder_path)
+    plan = plan_text_rescan(lib, folder_path)
+    totals.update(
+        notes_new=len(plan["new"]), notes_changed=len(plan["changed"]), notes_removed=len(plan["removed"])
+    )
+    remove_indexed_notes(lib, [path.name for path in plan["changed"]] + plan["removed"])
+
+    directories = sorted(
+        {path.parent for path in plan["new"] + plan["changed"]}, key=lambda d: (len(d.parts), str(d))
+    )
     for index, directory in enumerate(directories):
         try:
             result = lib.add_files(str(directory), **add_files_kwargs)
@@ -2945,6 +4671,7 @@ def sync_library(lib: Library, folder_path: Path, embedding_model: str) -> dict:
     """Ingest all files recursively, then build embeddings."""
     repair_library_index_state(lib, embedding_model)
     ingest_stats = ingest_all_files(lib, folder_path)
+    record_text_rescan({lib.library_name: ingest_stats}, "manual")
     prepare_embeddings(lib, embedding_model)
     lib.install_new_embedding(
         embedding_model,
@@ -2961,6 +4688,152 @@ def sync_library(lib: Library, folder_path: Path, embedding_model: str) -> dict:
             "switch to a smaller model (e.g. mini-lm-sbert) to confirm the pipeline."
         )
     return ingest_stats
+
+
+def load_text_rescan_status() -> dict:
+    try:
+        return json.loads(TEXT_RESCAN_STATUS_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def record_text_rescan(results: dict[str, dict], trigger: str, errors: list[str] | None = None) -> None:
+    """Save when each library's text index was last brought up to date. Call with the index lock held."""
+    status = load_text_rescan_status()
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    libraries = status.setdefault("libraries", {})
+    totals = {"new": 0, "changed": 0, "removed": 0}
+    for safe_lib, stats in results.items():
+        counts = {key: int(stats.get(f"notes_{key}", 0)) for key in totals}
+        libraries[safe_lib] = {"at": now, "trigger": trigger, **counts}
+        for key, value in counts.items():
+            totals[key] += value
+    status["last_run"] = {"at": now, "trigger": trigger, "libraries": len(results), **totals, "errors": errors or []}
+    tmp_path = TEXT_RESCAN_STATUS_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(status, indent=2))
+    tmp_path.replace(TEXT_RESCAN_STATUS_PATH)
+
+
+def resolve_text_rescan_targets(all_corpora: bool) -> list[tuple[str, str, Path]]:
+    """(display name, library key, folder) to rescan, from saved settings — safe off the script thread."""
+    settings = load_app_settings()
+    corpus_root = load_corpus_root_path()
+    if corpus_root is None or not corpus_root.is_dir():
+        return []
+    if settings.get("corpus_mode") == CORPUS_MODE_SINGLE:
+        return [(SINGLE_CORPUS_DISPLAY_NAME, SINGLE_CORPUS_LIBRARY_NAME, corpus_root)]
+    names = sorted(d.name for d in corpus_root.iterdir() if d.is_dir())
+    if all_corpora:
+        names = filter_libraries_for_display(names)
+    else:
+        names = [name for name in names if name == settings.get("last_selected_library")]
+    return [(name, sanitize_library_name(name), corpus_root / name) for name in names]
+
+
+def run_text_rescan(targets: list[tuple[str, str, Path]], trigger: str) -> dict:
+    """Text-only rescan (no embeddings) of each target. Call with the index lock held."""
+    results: dict[str, dict] = {}
+    errors: list[str] = []
+    for display_name, safe_name, folder in targets:
+        try:
+            lib = load_or_create_library(safe_name)
+            results[safe_name] = ingest_all_files(lib, folder)
+        except Exception as exc:
+            errors.append(f"{display_name}: {format_exception_for_user(exc)}")
+        gc.collect()
+    record_text_rescan(results, trigger, errors)
+    return {"results": results, "errors": errors}
+
+
+class TextRescanScheduler:
+    """Background text rescan every AUTO_RESCAN_SECONDS while the Streamlit server runs.
+
+    `lock` is held by every index write (auto rescans, Rescan, Re-index, rebuilds), so an auto
+    rescan skips its turn while a manual scan runs and a manual scan waits for an auto rescan.
+    """
+
+    def __init__(self):
+        # A cleared resource cache builds a new scheduler; retire the old thread but share its lock.
+        previous = [
+            thread.rescan_scheduler for thread in threading.enumerate() if hasattr(thread, "rescan_scheduler")
+        ]
+        for old in previous:
+            old.stop.set()
+            old.wake.set()
+        self.lock = previous[0].lock if previous else threading.Lock()
+        self.wake = threading.Event()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._loop, name="text-rescan", daemon=True)
+        self.thread.rescan_scheduler = self
+        self.thread.start()
+
+    def _loop(self) -> None:
+        while not self.stop.is_set():
+            self.wake.wait(AUTO_RESCAN_SECONDS)
+            self.wake.clear()
+            settings = load_app_settings()
+            if self.stop.is_set() or not settings.get("auto_rescan_enabled"):
+                continue
+            if not self.lock.acquire(blocking=False):
+                continue
+            try:
+                run_text_rescan(resolve_text_rescan_targets(bool(settings.get("auto_rescan_all_corpora"))), "auto")
+            except Exception as exc:
+                record_text_rescan({}, "auto", [format_exception_for_user(exc)])
+            finally:
+                self.lock.release()
+
+
+@st.cache_resource
+def get_text_rescan_scheduler() -> TextRescanScheduler:
+    return TextRescanScheduler()
+
+
+def persist_auto_rescan_settings() -> None:
+    enabled = bool(st.session_state.get("auto_rescan_enabled", False))
+    save_app_settings(
+        {
+            "auto_rescan_enabled": enabled,
+            "auto_rescan_all_corpora": bool(st.session_state.get("auto_rescan_all_corpora", False)),
+        }
+    )
+    if enabled:
+        get_text_rescan_scheduler().wake.set()
+
+
+def format_rescan_time(iso_time: str) -> str:
+    when = datetime.datetime.fromisoformat(iso_time)
+    if when.date() == datetime.date.today():
+        return when.strftime("%H:%M")
+    return when.strftime("%b %d %H:%M")
+
+
+def describe_last_text_rescan(safe_libs: list[str]) -> str:
+    """One line for the search box: when these libraries' text was last rescanned, and auto-rescan state."""
+    status = load_text_rescan_status()
+    entries = [status.get("libraries", {}).get(key) for key in safe_libs]
+    if not entries or not all(entries):
+        text = "Not rescanned since change tracking was added"
+    elif len(entries) == 1:
+        entry = entries[0]
+        text = (
+            f"Last rescan {format_rescan_time(entry['at'])} ({entry.get('trigger', 'manual')}) · "
+            f"{entry.get('new', 0)} new, {entry.get('changed', 0)} changed, {entry.get('removed', 0)} removed"
+        )
+    else:
+        oldest = min(entry["at"] for entry in entries)
+        text = f"All {len(entries)} libraries rescanned since {format_rescan_time(oldest)}"
+
+    settings = load_app_settings()
+    if settings.get("auto_rescan_enabled"):
+        scope = "all visible corpora" if settings.get("auto_rescan_all_corpora") else "this corpus"
+        text += f" · auto every {AUTO_RESCAN_SECONDS // 60} min ({scope})"
+    else:
+        text += " · auto-rescan off"
+    errors = status.get("last_run", {}).get("errors") or []
+    if errors:
+        text += f" · ⚠️ last run: {errors[0]}"
+    return text
 
 
 def get_collection_name(safe_lib: str, embedding_model: str) -> str:
@@ -3123,10 +4996,12 @@ def run_with_embedding_progress(
     container = container or st.sidebar
     error: list[Exception | None] = [None]
     ingest_stats: list[dict] = [{}]
+    index_lock = get_text_rescan_scheduler().lock
 
     def worker() -> None:
         try:
-            ingest_stats[0] = work_fn() or {}
+            with index_lock:
+                ingest_stats[0] = work_fn() or {}
         except Exception as exc:
             error[0] = exc
 
@@ -3199,9 +5074,12 @@ def run_with_embedding_progress(
 
 
 def run_multi_corpus_rebuild(
-    libraries: list[str], corpus_root: Path, embedding_model: str, container=None
+    libraries: list[str], corpus_root: Path, embedding_model: str, container=None, text_only: bool = False
 ) -> dict:
-    """Full hard rebuild of every sub-corpus, one after another, on a single embedding model."""
+    """Full hard rebuild of every sub-corpus, one after another, on a single embedding model.
+
+    With `text_only`, only the text index is rebuilt; embeddings wait for each corpus's next Rescan.
+    """
     container = container or st.sidebar
     total = len(libraries)
     overall_bar = container.progress(0.0, text=f"Multi-corpus rebuild: 0/{total} complete")
@@ -3218,6 +5096,10 @@ def run_multi_corpus_rebuild(
 
         def _sync_rebuild(name: str = safe_name, path: Path = content_path) -> dict:
             lib = load_or_create_library(name, force_create=True, embedding_model=embedding_model)
+            if text_only:
+                stats = ingest_all_files(lib, path)
+                record_text_rescan({name: stats}, "rebuild")
+                return stats
             return sync_library(lib, path, embedding_model)
 
         try:
@@ -3240,6 +5122,51 @@ def run_multi_corpus_rebuild(
     overall_bar.progress(1.0, text=f"Multi-corpus rebuild: {len(succeeded)}/{total} succeeded")
     return {
         "embedding_model": embedding_model,
+        "text_only": text_only,
+        "completed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "succeeded": succeeded,
+        "failed": failed,
+    }
+
+
+def run_multi_corpus_rescan(libraries: list[str], corpus_root: Path, container=None) -> dict:
+    """Incremental rescan of every sub-corpus, one after another, each on its own embedding engine.
+
+    New and edited notes are (re-)ingested and embedded, removed ones dropped; nothing is wiped.
+    """
+    container = container or st.sidebar
+    total = len(libraries)
+    overall_bar = container.progress(0.0, text=f"Multi-corpus rescan: 0/{total} complete")
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    for index, lib_name in enumerate(libraries, start=1):
+        safe_name = sanitize_library_name(lib_name)
+        content_path = corpus_root / lib_name
+        overall_bar.progress(
+            (index - 1) / total,
+            text=f"Multi-corpus rescan: {index - 1}/{total} complete · now '{lib_name}'",
+        )
+        try:
+            lib = load_or_create_library(safe_name)
+            # Keep the engine the corpus is embedded with, so no corpus needs a full re-embed.
+            embedding_model = get_active_library_embedding(lib) or get_corpus_config(safe_name)["embedding_model"]
+            ensure_embedding_dependencies(embedding_model)
+
+            def _sync(lib: Library = lib, path: Path = content_path, model: str = embedding_model) -> dict:
+                return sync_library(lib, path, model)
+
+            job_status = run_with_embedding_progress(
+                f"Rescanning '{lib_name}' ({index}/{total})", safe_name, embedding_model, _sync, container
+            )
+            commit_job_status(job_status, lib_name, safe_name)
+            succeeded.append(lib_name)
+        except Exception as exc:
+            failed.append((lib_name, format_exception_for_user(exc)))
+
+    overall_bar.progress(1.0, text=f"Multi-corpus rescan: {len(succeeded)}/{total} succeeded")
+    return {
+        "operation": "rescan",
         "completed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "succeeded": succeeded,
         "failed": failed,
@@ -3252,10 +5179,18 @@ def render_multi_corpus_rebuild_summary() -> None:
         return
     succeeded, failed = summary["succeeded"], summary["failed"]
     total = len(succeeded) + len(failed)
-    message = (
-        f"Multi-corpus rebuild on `{summary['embedding_model']}`: "
-        f"{len(succeeded)}/{total} corpora rebuilt · {summary['completed_at']}"
-    )
+    if summary.get("operation") == "rescan":
+        message = (
+            f"Multi-corpus rescan: {len(succeeded)}/{total} corpora rescanned · {summary['completed_at']}"
+        )
+    else:
+        engine = "text only" if summary.get("text_only") else f"`{summary['embedding_model']}`"
+        message = (
+            f"Multi-corpus rebuild on {engine}: "
+            f"{len(succeeded)}/{total} corpora rebuilt · {summary['completed_at']}"
+        )
+    if summary.get("text_only"):
+        message += " — use **⚡ Rescan** in a corpus to rebuild its embeddings"
     if failed:
         st.sidebar.warning(message)
         for lib_name, reason in failed:
@@ -3604,6 +5539,7 @@ def answer_with_ollama(
     temperature: float = 0.3,
     corpus_prompt: str = "",
     task_prompt: str = "",
+    on_progress=None,
 ) -> tuple[str, dict]:
     """Generate a natural-language answer from search results using a local Ollama model."""
     full_prompt = build_llm_prompt(question, results, max_tokens, temperature, corpus_prompt, task_prompt)
@@ -3614,6 +5550,7 @@ def answer_with_ollama(
         port=port,
         max_tokens=max_tokens,
         temperature=temperature,
+        on_progress=on_progress,
     )
 
 
@@ -3625,27 +5562,37 @@ def chat_with_ollama(
     max_tokens: int = 512,
     temperature: float = 0.3,
     num_ctx: int | None = None,
+    response_format: dict | None = None,
+    on_progress=None,
 ) -> tuple[str, dict]:
-    """Send a chat conversation to a local Ollama model and return (reply, usage)."""
+    """Send a chat conversation to a local Ollama model and return (reply, usage).
+
+    `response_format` is a JSON schema; Ollama then constrains the reply to match it.
+    The reply is streamed, so long answers have no overall time limit; `on_progress(tokens, seconds)`
+    is called every LLM_PROGRESS_SECONDS with the tokens generated so far and the seconds since the
+    first one (None while the model is still reading the prompt).
+    """
     import requests
 
     options = {
         "temperature": temperature,
         "num_predict": max_tokens,
+        "num_ctx": context_window_for(messages, max_tokens, num_ctx),
     }
-    if num_ctx:
-        options["num_ctx"] = num_ctx
 
     url = f"http://{host}:{port}/api/chat"
     payload = {
         "model": model_name,
         "messages": messages,
-        "stream": False,
+        "stream": True,
         "options": options,
     }
+    if response_format:
+        payload["format"] = response_format
 
     try:
-        response = requests.post(url, json=payload, timeout=300)
+        # (connect, longest wait between streamed pieces): a big prompt can take minutes before the first token.
+        response = requests.post(url, json=payload, stream=True, timeout=(10, 900))
     except requests.RequestException as exc:
         raise RuntimeError(
             f"Could not reach Ollama at `{host}:{port}`. "
@@ -3658,15 +5605,35 @@ def chat_with_ollama(
             f"{response.text[:500]}"
         )
 
+    content, thinking, data = [], [], {}
+    generated, first_token_at = 0, None
+    last_report = time.monotonic()
     try:
-        data = response.json()
-    except ValueError as exc:
-        raise RuntimeError(f"Ollama returned invalid JSON: {response.text[:500]}") from exc
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except ValueError as exc:
+                raise RuntimeError(f"Ollama returned invalid JSON: {line[:500]!r}") from exc
+            if chunk.get("error"):
+                raise RuntimeError(f"Ollama error for model `{model_name}`: {chunk['error']}")
+            piece = chunk.get("message") or {}
+            if piece.get("content") or piece.get("thinking"):
+                content.append(piece.get("content") or "")
+                thinking.append(piece.get("thinking") or "")
+                generated += 1  # Ollama streams about one token per piece
+                first_token_at = first_token_at or time.monotonic()
+            if chunk.get("done"):
+                data = chunk
+                break
+            if on_progress and time.monotonic() - last_report >= LLM_PROGRESS_SECONDS:
+                last_report = time.monotonic()
+                on_progress(generated, last_report - first_token_at if first_token_at else None)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Lost the connection to Ollama while `{model_name}` was answering: {exc}") from exc
 
-    if data.get("error"):
-        raise RuntimeError(f"Ollama error for model `{model_name}`: {data['error']}")
-
-    message = data.get("message") or {}
+    message = {"content": "".join(content), "thinking": "".join(thinking)}
     # Reasoning models (e.g. Qwen3) may inline their thinking; keep only the answer.
     answer = re.sub(r"<think>.*?</think>", "", str(message.get("content", "")), flags=re.DOTALL).strip()
     if not answer and message.get("thinking"):
@@ -3683,14 +5650,136 @@ def chat_with_ollama(
     prompt_tokens = int(data.get("prompt_eval_count") or 0)
     output_tokens = int(data.get("eval_count") or 0)
     total_duration = data.get("total_duration")
+    eval_duration = data.get("eval_duration")
     usage = {
         "input": prompt_tokens,
         "output": output_tokens,
         "total": prompt_tokens + output_tokens,
         "metric": "tokens",
         "processing_time": (total_duration / 1e9) if total_duration else None,
+        "tokens_per_second": (output_tokens / (eval_duration / 1e9)) if eval_duration else None,
     }
     return answer, usage
+
+
+def context_window_for(messages: list[dict], max_tokens: int, minimum: int | None = None) -> int:
+    """A context window that fits the prompt (about 3 characters a token) plus the whole answer."""
+    needed = sum(len(str(m.get("content", ""))) for m in messages) // 3 + max_tokens + 256
+    size = next((s for s in OLLAMA_CONTEXT_SIZES if s >= needed), OLLAMA_CONTEXT_SIZES[-1])
+    return max(size, minimum or 0)
+
+
+def tokens_as_words(tokens: int) -> int:
+    return round(tokens * WORDS_PER_TOKEN)
+
+
+def approximately(number: int) -> str:
+    """'≈1,600', or to the nearest thousand for big numbers: '≈127,000'."""
+    return f"≈{round(number, -3) if number >= 10000 else number:,}"
+
+
+def book_token_markers() -> dict[int, str]:
+    """{token count: book title} for the books that fit under the Max tokens limit."""
+    return {round(words / WORDS_PER_TOKEN): title for title, words in BOOK_LENGTHS}
+
+
+def max_tokens_options(current: int) -> list[int]:
+    """Slider stops: round steps plus the book markers (and the saved value, if it's neither)."""
+    return sorted({*TOKEN_STEPS, *book_token_markers(), min(max(int(current), TOKEN_STEPS[0]), LLM_MAX_TOKENS_LIMIT)})
+
+
+def format_max_tokens(tokens: int) -> str:
+    """Slider label: the book at a marker, otherwise the length in words."""
+    book = book_token_markers().get(tokens)
+    return f"{tokens:,} · {book}" if book else f"{tokens:,} · ≈{tokens_as_words(tokens):,} words"
+
+
+def describe_answer_length(tokens: int) -> str:
+    """How long an answer of `tokens` could be, compared with well-known books."""
+    words = tokens_as_words(tokens)
+    same = [title for title, book_words in BOOK_LENGTHS if abs(book_words - words) <= book_words * 0.01]
+    shorter = [(title, n) for title, n in BOOK_LENGTHS if n < words and title not in same]
+    longer = [(title, n) for title, n in BOOK_LENGTHS if n > words and title not in same]
+    text = f"Up to {approximately(words)} words"
+    if same:
+        text += f": about the length of *{same[0]}*"
+    else:
+        if shorter:
+            text += f": longer than *{shorter[-1][0]}* ({approximately(shorter[-1][1])})"
+        if longer:
+            text += f"{',' if shorter else ':'} shorter than *{longer[0][0]}* ({approximately(longer[0][1])})"
+    beyond = ", ".join(
+        f"*{title}* {approximately(round(book_words / WORDS_PER_TOKEN))}" for title, book_words in BOOKS_BEYOND_LIMIT
+    )
+    return text + f". For scale, in tokens: {beyond}."
+
+
+LLM_SPEED_KEY = "llm_speed"  # app_settings: {model: {"tokens_per_second", "tokens", "at"}} from the last answer
+SPEED_BENCHMARK_TOKENS = 10000
+
+
+def format_duration(seconds: float) -> str:
+    seconds = round(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} min {seconds:02d} s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes:02d} min"
+
+
+def record_llm_speed(model: str, usage: dict | None) -> None:
+    """Keep the generation speed of the model's latest answer, so the next run can show what to expect."""
+    tokens_per_second = (usage or {}).get("tokens_per_second")
+    if not tokens_per_second:
+        return
+    speeds = dict(load_app_settings().get(LLM_SPEED_KEY) or {})
+    speeds[model] = {
+        "tokens_per_second": round(tokens_per_second, 1),
+        "tokens": (usage or {}).get("output"),
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    save_app_settings({LLM_SPEED_KEY: speeds})
+
+
+def last_llm_speed(model: str) -> dict | None:
+    return (load_app_settings().get(LLM_SPEED_KEY) or {}).get(model)
+
+
+def describe_llm_speed(model: str) -> str:
+    """The model's last-run speed and the time it implies for 10,000 tokens, shown under Search."""
+    record = last_llm_speed(model)
+    if not record:
+        return f"No speed measured yet for `{model}`; it's recorded after its next answer."
+    tokens_per_second = record["tokens_per_second"]
+    when = datetime.datetime.fromisoformat(record["at"]).strftime("%d %b %H:%M")
+    return (
+        f"Last run with `{model}` ({when}): {tokens_per_second:.1f} tokens/s · "
+        f"**{SPEED_BENCHMARK_TOKENS:,} tokens ≈ {format_duration(SPEED_BENCHMARK_TOKENS / tokens_per_second)}**"
+    )
+
+
+@contextmanager
+def llm_progress(slot, label: str):
+    """A spinner in `slot` (under the Search button) with a tokens-per-second count beside it.
+
+    Yields the `on_progress` callback for chat_with_ollama; the slot is cleared afterwards.
+    """
+    with slot.container():
+        spin_col, rate_col = st.columns([3, 2], vertical_alignment="center")
+        rate = rate_col.empty()
+        rate.caption("Reading the notes…")
+
+        def report(tokens: int, seconds: float | None) -> None:
+            if seconds:
+                rate.caption(f"**{tokens / seconds:.1f} tokens/s** · {tokens:,} tokens")
+            else:
+                rate.caption("Reading the notes…")
+
+        with spin_col, st.spinner(label, show_time=True):
+            yield report
+    slot.empty()
 
 
 def normalize_text_search_query(query: str) -> str | None:
@@ -4092,10 +6181,16 @@ _migrated_tables = migrate_all_legacy_vectors()
 # PAGE SETUP
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="RAG Workspace Manager", layout="wide")
+# Starts the background auto-rescan thread once per server process.
+get_text_rescan_scheduler()
 if st.query_params.get("page") == "prompts":
     render_prompt_library_page()
     st.stop()
+if st.query_params.get("page") == "actions":
+    render_actions_page()
+    st.stop()
 
+render_outbox_status()
 st.title("🧠 RAG Workspace Manager")
 
 if should_show_setup_wizard():
@@ -4182,6 +6277,8 @@ if not all_libraries:
     else:
         st.sidebar.error(f"No subfolders found in:\n`{corpus_root_path}`")
     st.stop()
+# All-corpora scans and rebuilds skip hidden corpora.
+scan_libraries = filter_libraries_for_display(all_libraries)
 
 if is_single_corpus_mode():
     selected_lib = SINGLE_CORPUS_DISPLAY_NAME
@@ -4247,6 +6344,29 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
         help=(
             "Global setting for all corpus scans. Uses CUDA when available, "
             "or the Apple Silicon GPU (MPS) on Mac. Models marked (g) can use the GPU."
+        ),
+    )
+    auto_rescan_enabled = st.checkbox(
+        f"Auto-rescan every {AUTO_RESCAN_SECONDS // 60} min (text only)",
+        value=bool(_app_settings.get("auto_rescan_enabled", False)),
+        key="auto_rescan_enabled",
+        on_change=persist_auto_rescan_settings,
+        help=(
+            "While the app's server is running (even with no browser tab open), checks the selected "
+            "corpus for new, edited and deleted notes and updates the text index, so filters and "
+            "literal search find them. Only changed notes are read.\n\n"
+            "Embeddings are not built: semantic search sees the changes after **⚡ Rescan**."
+        ),
+    )
+    st.checkbox(
+        "…in every corpus",
+        value=bool(_app_settings.get("auto_rescan_all_corpora", False)),
+        key="auto_rescan_all_corpora",
+        on_change=persist_auto_rescan_settings,
+        disabled=not auto_rescan_enabled or is_single_corpus_mode(),
+        help=(
+            "Rescan every visible sub-corpus, not just the selected one — so a note added to another "
+            "corpus turns up in **Search all libraries**. Hidden corpora are skipped. Still text only."
         ),
     )
     st.caption(f"Global — saved to `{APP_SETTINGS_PATH}`")
@@ -4338,8 +6458,8 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
         st.divider()
         st.markdown("**Multi-corpus clean rebuild**")
         st.caption(
-            f"Full hard rebuild of all {len(all_libraries)} sub-corpora (including hidden ones), "
-            "in order, using one embedding engine."
+            f"Full hard rebuild of the {len(scan_libraries)} visible sub-corpora (hidden ones are "
+            "skipped), in order, using one embedding engine."
         )
         multi_show_all = st.checkbox(
             "Show all local embedding models",
@@ -4361,23 +6481,39 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
         multi_deps_missing = get_missing_embedding_dependencies(multi_rebuild_model)
         if multi_deps_missing:
             render_embedding_dependency_install_help(multi_deps_missing, multi_rebuild_model)
-        st.caption("Order: " + " → ".join(all_libraries))
+        st.caption("Order: " + " → ".join(scan_libraries))
         multi_rebuild_ack = st.checkbox(
-            "I understand this deletes and rebuilds the index for **every** sub-corpus.",
+            "I understand this deletes and rebuilds the index for **every** visible sub-corpus.",
             value=False,
             key="multi_rebuild_ack",
         )
         if st.button(
             "🔨 Rebuild all corpora",
-            disabled=not multi_rebuild_ack or bool(multi_deps_missing),
+            disabled=not multi_rebuild_ack or bool(multi_deps_missing) or not scan_libraries,
             key="multi_rebuild_start",
         ):
             st.session_state["multi_rebuild_request"] = multi_rebuild_model
+        if st.button(
+            "🔨 Rebuild all corpora — text only",
+            disabled=not multi_rebuild_ack or not scan_libraries,
+            key="multi_rebuild_text_only_start",
+            help=(
+                "Deletes every visible sub-corpus's index (hidden ones are skipped), **embeddings included**, and rebuilds only the text, "
+                "so filters and literal search work again straight away. Semantic search in a corpus then "
+                "needs **⚡ Rescan**, which re-embeds every note in it.\n\n"
+                "Rescans (auto or manual) already pick up new, edited and deleted notes, so you rarely "
+                "need this — use it when the text index seems out of step with your notes, for example "
+                "after a scan was interrupted."
+            ),
+        ):
+            st.session_state["multi_rebuild_request"] = multi_rebuild_model
+            st.session_state["multi_rebuild_text_only"] = True
 
 with st.sidebar.expander("Debug details", expanded=False):
     render_debug_panel(selected_lib, safe_lib, _status_lib, corpus_config)
 
 st.sidebar.divider()
+st.sidebar.markdown(f"**This corpus** — {selected_lib}")
 
 pending_model, pending_threshold, reembed_ack = get_pending_index_settings(safe_lib, corpus_config)
 first_index = is_first_index_run(active_model)
@@ -4439,14 +6575,34 @@ if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, 
     except Exception as exc:
         handle_embedding_run_error(exc, pending_model, sidebar=True)
 
+if not is_single_corpus_mode():
+    st.sidebar.markdown("**All corpora**")
+    if st.sidebar.button(
+        "⚡ Rescan all corpora",
+        key="multi_rescan_start",
+        disabled=not scan_libraries,
+        help=(
+            f"Rescans the {len(scan_libraries)} visible sub-corpora (hidden ones are skipped) in turn, like the "
+            "Getting started wizard: new and edited notes are indexed and embedded, deleted notes "
+            "dropped. Each corpus keeps its own embedding engine and nothing is wiped — only changes "
+            "are processed, so after the first run this is quick."
+        ),
+    ):
+        ensure_corpus_root_persisted(corpus_root_path)
+        set_embedding_acceleration(get_use_gpu_for_embeddings())
+        st.session_state["multi_rebuild_summary"] = run_multi_corpus_rescan(scan_libraries, corpus_root_path)
+        st.rerun()
+
 multi_rebuild_request = st.session_state.pop("multi_rebuild_request", None)
+multi_rebuild_text_only = st.session_state.pop("multi_rebuild_text_only", False)
 if multi_rebuild_request and not is_single_corpus_mode():
     try:
-        ensure_embedding_dependencies(multi_rebuild_request)
+        if not multi_rebuild_text_only:
+            ensure_embedding_dependencies(multi_rebuild_request)
         ensure_corpus_root_persisted(corpus_root_path)
         set_embedding_acceleration(get_use_gpu_for_embeddings())
         st.session_state["multi_rebuild_summary"] = run_multi_corpus_rebuild(
-            all_libraries, corpus_root_path, multi_rebuild_request
+            scan_libraries, corpus_root_path, multi_rebuild_request, text_only=multi_rebuild_text_only
         )
         st.session_state.pop("multi_rebuild_ack", None)
         st.rerun()
@@ -4485,6 +6641,25 @@ with filter_box_col:
             use_container_width=True,
             help="Remove all filter terms and note exclusions.",
         )
+        # Two routes into the notes: semantic (vector) search or literal text matching. The controls below
+        # follow the route; the Ask box's Search button uses it too.
+        if "search_route" not in st.session_state:
+            st.session_state["search_route"] = saved_search_route()
+        st.segmented_control(
+            "Search route",
+            options=list(SEARCH_ROUTES),
+            format_func=SEARCH_ROUTES.get,
+            key="search_route",
+            on_change=persist_search_route,
+            width="stretch",
+            help=(
+                "**Semantic** ranks passages by meaning (embeddings); filter terms narrow which notes it "
+                "looks in, and **Distance cutoff** sets how close a match must be.\n\n"
+                "**Literal** returns the notes that match the filter terms, in full. Much faster, works "
+                "across libraries, and the question is only used for the LLM answer."
+            ),
+        )
+        exact_text_only = st.session_state.get("search_route") == "literal"
         _saved_filter = load_app_settings().get("search_filter") or {}
         FILTER_WIDGETS = {
             "all": (
@@ -4515,7 +6690,11 @@ with filter_box_col:
                     f"{field_help}\n\n"
                     "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
                     "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
-                    "With a question, semantic search ranks passages **only within** the matching notes."
+                    + (
+                        "On the **Literal** route, **Search** returns the matching notes in full."
+                        if exact_text_only
+                        else "On the **Semantic** route, passages are ranked **only within** the matching notes."
+                    )
                 ),
             )
         install_filter_commit_on_blur()
@@ -4528,44 +6707,92 @@ with filter_box_col:
             clear_col.button("Clear exclusions", on_click=clear_excluded_notes, use_container_width=True)
 
         with st.container(border=True):
-            st.markdown("**Advanced search settings**")
-            exact_col, all_libs_col, filter_btn_col = st.columns([1, 1, 1.2], vertical_alignment="center")
-            with exact_col:
-                exact_text_only = st.checkbox(
-                    "Exact text only",
-                    value=bool(load_app_settings().get("exact_text_only", False)),
-                    key="exact_text_only",
-                    on_change=persist_exact_text_only_setting,
-                    help=(
-                        "Makes **Search** skip vector search and return the notes that match the filter, "
-                        "in full. Much faster than semantic search. The question is then only used for "
-                        "the LLM answer."
-                    ),
-                )
-            with all_libs_col:
-                search_all_libraries = st.checkbox(
-                    "Search all libraries",
-                    value=bool(load_app_settings().get("search_all_libraries", False)),
-                    key="search_all_libraries",
-                    on_change=persist_search_all_libraries_setting,
-                    disabled=is_single_corpus_mode(),
-                    help=(
-                        "For **Filter search only** and **Exact text only** searches: looks in every visible "
-                        "library and shows how many matching notes each one has, so you can switch to the "
-                        "right library for a semantic search. Uses literal text matching only — no "
-                        "embeddings are needed. Semantic searches always use the selected library."
-                    ),
-                )
-            with filter_btn_col:
-                filter_only_clicked = st.button(
-                    "🔎 Filter search only",
-                    help=(
-                        "Lists the notes that match the filter below this box, without vector search or "
-                        "an LLM answer. Your question is kept but not sent. **Max results** limits the "
-                        "number of notes."
-                    ),
+            st.markdown(
+                "**Advanced search settings** · "
+                + ("literal: whole notes that match the filter" if exact_text_only else "semantic: passages ranked by meaning")
+            )
+            if exact_text_only:
+                all_libs_col, filter_btn_col = st.columns([1, 1.2], vertical_alignment="center")
+                with all_libs_col:
+                    search_all_libraries = st.checkbox(
+                        "Search all libraries",
+                        value=bool(load_app_settings().get("search_all_libraries", False)),
+                        key="search_all_libraries",
+                        on_change=persist_search_all_libraries_setting,
+                        disabled=is_single_corpus_mode(),
+                        help=(
+                            "Looks in every visible library and shows how many matching notes each one has, so "
+                            "you can switch to the right library for a semantic search. Literal matching only: "
+                            "no embeddings are needed."
+                        ),
+                    )
+                with filter_btn_col:
+                    filter_only_clicked = st.button(
+                        "🔎 Filter search only",
+                        help=(
+                            "Lists the notes that match the filter below this box, without an LLM answer. Your "
+                            "question is kept but not sent. **Max results** limits the number of notes."
+                        ),
+                        use_container_width=True,
+                    )
+
+                rescan_all = search_all_libraries and not is_single_corpus_mode()
+                rescan_libraries = scan_libraries if rescan_all else [selected_lib]
+                rescan_note_col, rescan_btn_col = st.columns([2, 1.2], vertical_alignment="center")
+                rescan_note_slot = rescan_note_col.empty()
+                if rescan_btn_col.button(
+                    "🔄 Rescan → Filter search",
                     use_container_width=True,
+                    help=(
+                        "Picks up new, edited and deleted notes in the text index — of every visible library "
+                        "when **Search all libraries** is ticked, otherwise this one — then runs "
+                        "**Filter search only**. Text only: embeddings wait for **⚡ Rescan** in the left panel."
+                    ),
+                ):
+                    with st.spinner("Rescanning notes…"):
+                        with get_text_rescan_scheduler().lock:
+                            rescan = run_text_rescan(
+                                [
+                                    (
+                                        library,
+                                        resolve_library_registry_name(library),
+                                        resolve_library_content_path(corpus_root_path, library),
+                                    )
+                                    for library in rescan_libraries
+                                ],
+                                "button",
+                            )
+                    for message in rescan["errors"]:
+                        st.warning(f"Rescan failed for {message}")
+                    filter_only_clicked = True
+                rescan_note_slot.caption(
+                    describe_last_text_rescan([resolve_library_registry_name(lib) for lib in rescan_libraries])
                 )
+                distance_map_slot = None  # literal results have no distances to show
+            else:
+                search_all_libraries = False  # semantic searches always use the selected library
+                filter_only_clicked = False
+                # Which passages count as semantic matches: a search setting, so it lives here, not in Ask.
+                _cutoff_key = f"search_distance_threshold_{safe_lib}"
+                if _cutoff_key not in st.session_state:
+                    st.session_state[_cutoff_key] = float(distance_threshold)
+                st.slider(
+                    "Distance cutoff",
+                    min_value=DISTANCE_SLIDER_MIN,
+                    max_value=DISTANCE_SLIDER_MAX,
+                    step=DISTANCE_SLIDER_STEP,
+                    key=_cutoff_key,
+                    on_change=sync_cutoff_from_search,
+                    args=(safe_lib,),
+                    help=(
+                        "Semantic matches must be closer than this distance. Lower = stricter, higher = more lax. "
+                        "Same setting as **Relevance cutoff** in the left panel; changes here are saved for this corpus.\n\n"
+                        "After a semantic search the bar below shows where passages were found: "
+                        "**green** is within the cutoff, **amber** is where to raise it to include more."
+                    ),
+                )
+                distance_threshold = float(st.session_state[_cutoff_key])
+                distance_map_slot = st.container()
 
     # Filter-only results are listed here, under the Filter box.
     filter_results_slot = st.container()
@@ -4591,49 +6818,57 @@ with ask_box_col:
             on_change=persist_question,
             help="Saved locally and restored when the page is reloaded.",
         )
+        # The injected prompt's links (e.g. Salesforce, the connector app), between the question and its token.
+        last_search_state = st.session_state.get(LAST_SEARCH_KEY)
+        render_prompt_links(
+            resolve_run_prompts(prompt_library, corpus_config)["task"],
+            prompt_library,
+            best_guess(prompt_text, search_filter, last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
+        )
         render_injected_prompt_token(prompt_library)
-
-        search_col, llm_col, limit_col = st.columns([1.2, 1.6, 1.2], vertical_alignment="bottom")
-        with limit_col:
-            result_limit = st.number_input("Max results", min_value=1, max_value=50, value=15)
-        with llm_col:
-            use_llm_answer = st.checkbox(
-                "Answer with LLM",
-                value=True,
-                help=(
-                    "**Semantic search** finds relevant note chunks using embedding vectors. "
-                    "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
-                    "Search still runs first; the LLM does not replace retrieval."
-                ),
-            )
-        with search_col:
-            search_clicked = st.button("🔍 Search", type="primary", use_container_width=True)
+        # Top to bottom: question → Answer with LLM → prompt library → model details → cutoff → Search → progress.
+        use_llm_answer = st.checkbox(
+            "Answer with LLM",
+            value=True,
+            key="use_llm_answer",
+            help=(
+                "**Semantic search** finds relevant note chunks using embedding vectors. "
+                "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
+                "Search still runs first; the LLM does not replace retrieval."
+            ),
+        )
 
         if use_llm_answer:
             render_ask_prompt_panel(prompt_library, corpus_config)
-            selected_ollama_model = st.selectbox(
-                "Ollama model",
-                options=ollama_model_options,
-                index=ollama_model_options.index(default_ollama),
-                help="Generative model that writes the final answer.",
-            )
-            tokens_col, temperature_col = st.columns(2)
-            with tokens_col:
-                llm_max_tokens = st.slider(
+            # A task prompt with its own model preselects it. The box has no key, so its default changes with
+            # the prompt; picking another model here overrides it for this run.
+            prompt_model = (resolve_run_prompts(prompt_library, corpus_config)["task"] or {}).get("model")
+            answer_model = prompt_model if prompt_model in ollama_model_options else default_ollama
+            tokens_key = f"llm_max_tokens_{safe_lib}"
+            saved_tokens = int(st.session_state.get(tokens_key, corpus_config["llm_max_tokens"]))
+            with st.expander("Ollama model details", expanded=False, key="ask_model_details", icon=":material/tune:"):
+                selected_ollama_model = st.selectbox(
+                    "Ollama model",
+                    options=ollama_model_options,
+                    index=ollama_model_options.index(answer_model),
+                    help="Generative model that writes the final answer.",
+                )
+                llm_max_tokens = st.select_slider(
                     "Max tokens",
-                    min_value=128,
-                    max_value=2048,
-                    value=int(corpus_config["llm_max_tokens"]),
-                    step=64,
-                    key=f"llm_max_tokens_{safe_lib}",
+                    options=max_tokens_options(saved_tokens),
+                    value=min(max(saved_tokens, TOKEN_STEPS[0]), LLM_MAX_TOKENS_LIMIT),
+                    format_func=format_max_tokens,
+                    key=tokens_key,
                     on_change=persist_llm_tuning,
                     args=(safe_lib,),
                     help=(
-                        "Maximum length of the generated answer. Higher values allow longer responses but "
-                        "take more time. Saved for this corpus."
+                        "Maximum length of the answer, including a reasoning model's thinking. The stops include "
+                        "book lengths for scale. Long answers take a while (at 20 tokens/s, 50,000 tokens is about "
+                        "40 minutes) and use more memory, because Ollama's context window grows to fit them. "
+                        "Saved for this corpus."
                     ),
                 )
-            with temperature_col:
+                st.caption(describe_answer_length(llm_max_tokens))
                 llm_temperature = st.slider(
                     "Temperature",
                     min_value=0.0,
@@ -4648,6 +6883,13 @@ with ask_box_col:
                         "are more varied. Saved for this corpus."
                     ),
                 )
+            speed = last_llm_speed(selected_ollama_model)
+            st.caption(
+                f"`{selected_ollama_model}` · up to {llm_max_tokens:,} tokens"
+                + (f" (≈{format_duration(llm_max_tokens / speed['tokens_per_second'])} at the last run's speed)"
+                   if speed else "")
+                + f" · temperature {llm_temperature:.2f}"
+            )
             if not ollama_ok:
                 st.warning(
                     f"Ollama is not reachable at `{OLLAMA_HOST}:{OLLAMA_PORT}`. "
@@ -4663,26 +6905,22 @@ with ask_box_col:
             llm_max_tokens = int(corpus_config["llm_max_tokens"])
             llm_temperature = float(corpus_config["llm_temperature"])
 
-        _cutoff_key = f"search_distance_threshold_{safe_lib}"
-        if _cutoff_key not in st.session_state:
-            st.session_state[_cutoff_key] = float(distance_threshold)
-        st.slider(
-            "Distance cutoff",
-            min_value=DISTANCE_SLIDER_MIN,
-            max_value=DISTANCE_SLIDER_MAX,
-            step=DISTANCE_SLIDER_STEP,
-            key=_cutoff_key,
-            on_change=sync_cutoff_from_search,
-            args=(safe_lib,),
-            help=(
-                "Semantic matches must be closer than this distance. Lower = stricter, higher = more lax. "
-                "Same setting as **Relevance cutoff** in the left panel; changes here are saved for this corpus.\n\n"
-                "After a semantic search the bar below shows where passages were found: "
-                "**green** is within the cutoff, **amber** is where to raise it to include more."
-            ),
-        )
-        distance_threshold = float(st.session_state[_cutoff_key])
-        distance_map_slot = st.container()
+        search_col, limit_col = st.columns([2, 1], vertical_alignment="bottom")
+        with search_col:
+            search_clicked = st.button(
+                "🔍 Search exact text" if exact_text_only else "🔍 Search",
+                type="primary",
+                use_container_width=True,
+                help="Uses the route chosen in the Filter box: "
+                + ("**Literal**, the notes matching the filter terms." if exact_text_only else "**Semantic**, by meaning."),
+            )
+        with limit_col:
+            result_limit = st.number_input("Max results", min_value=1, max_value=50, value=15)
+        # Searching and answering show their progress here, right under the button that started them.
+        # Between runs it shows the selected model's last speed.
+        search_progress_slot = st.empty()
+        if use_llm_answer:
+            search_progress_slot.caption(describe_llm_speed(selected_ollama_model))
 
 run_prompts = resolve_run_prompts(prompt_library, corpus_config)
 
@@ -4709,7 +6947,7 @@ elif new_search and (prompt_text or run_filter_only):
     try:
         if search_all_libraries:
             state_library = ALL_LIBRARIES_KEY
-            with st.spinner("Searching all libraries for exact text…"):
+            with search_progress_slot.container(), st.spinner("Searching all libraries for exact text…", show_time=True):
                 final_results, library_counts = exact_text_search_all_libraries(
                     filter_libraries_for_display(all_libraries),
                     search_filter,
@@ -4729,7 +6967,7 @@ elif new_search and (prompt_text or run_filter_only):
                 st.error("Library not found. Use **Rescan** or **Re-index** in the left panel first.")
             elif run_filter_only:
                 uploads_dirs = get_library_uploads_dirs(search_lib)
-                with st.spinner("Searching for exact text…"):
+                with search_progress_slot.container(), st.spinner("Searching for exact text…", show_time=True):
                     # Filter search only lists excluded notes too, so they can be un-ticked.
                     run_filter = search_filter if filter_only_clicked else with_exclusions(search_filter, safe_lib)
                     final_results = exact_text_search(safe_lib, run_filter, result_limit)
@@ -4744,7 +6982,7 @@ elif new_search and (prompt_text or run_filter_only):
                 if not emb_ready:
                     st.error(f"Semantic index not ready: {emb_message}")
                 else:
-                    with st.spinner("Searching…"):
+                    with search_progress_slot.container(), st.spinner("Searching…", show_time=True):
                         final_results, notice, nearest_distance = perform_search(
                             search_lib,
                             prompt_text,
@@ -4782,14 +7020,27 @@ elif new_search and (prompt_text or run_filter_only):
                     run_prompts["profile"],
                     [p["text"] for p in run_prompts["globals"]],
                 ),
-                "task_prompt": task_prompt["text"] if task_prompt else "",
+                # An Agent's first answer comes from its collection prompt (step 1), told where it's heading.
+                "task_prompt": (
+                    build_agent_task_prompt(task_prompt) if is_agent_prompt(task_prompt)
+                    else task_prompt["text"] if task_prompt else ""
+                ),
                 "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt),
+                "library_display": selected_lib if state_library == safe_lib else "All libraries",
+                "id": uuid.uuid4().hex[:8],  # keys this search's per-note widgets
+                "left_out_notes": [],
+                "prompt_model": (task_prompt or {}).get("model") or None,
+                # The Agent workflow (step buttons, staging, sent batches) lives under the discussion.
+                "agent": (
+                    {"prompt": dict(task_prompt), "staged": None, "rejected": None, "needs_work": False, "sent": []}
+                    if use_llm_answer and is_agent_prompt(task_prompt) else None
+                ),
             }
             # A chosen task can drive the answer on its own, e.g. after an exact-text search.
             if final_results and use_llm_answer and (
                 search_state["question"] or (task_prompt and not filter_only_clicked)
             ):
-                with st.spinner(f"Generating answer with `{selected_ollama_model}`…"):
+                with llm_progress(search_progress_slot, f"Generating answer with `{selected_ollama_model}`…") as report:
                     try:
                         search_state["answer"], search_state["usage"] = answer_with_ollama(
                             question=search_state["question"],
@@ -4799,28 +7050,29 @@ elif new_search and (prompt_text or run_filter_only):
                             temperature=llm_temperature,
                             corpus_prompt=search_state["prompt_context"],
                             task_prompt=search_state["task_prompt"],
+                            on_progress=report,
                         )
                         if task_prompt:
                             mark_prompt_used(task_prompt["id"])
                     except Exception as llm_exc:
                         search_state["answer_error"] = str(llm_exc)
+                # Keep this run's speed for the model, and show it under Search now the spinner has gone.
+                record_llm_speed(selected_ollama_model, search_state["usage"])
+                search_progress_slot.caption(describe_llm_speed(selected_ollama_model))
             st.session_state[LAST_SEARCH_KEY] = search_state
 
             if final_results and use_llm_answer and not filter_only_clicked:
-                save_corpus_config(
-                    safe_lib,
-                    {
-                        "ollama_model": selected_ollama_model,
-                        "llm_max_tokens": llm_max_tokens,
-                        "llm_temperature": llm_temperature,
-                    },
-                )
+                tuning = {"llm_max_tokens": llm_max_tokens, "llm_temperature": llm_temperature}
+                # A model picked by the prompt is for that prompt; don't make it the corpus default.
+                if selected_ollama_model != search_state["prompt_model"]:
+                    tuning["ollama_model"] = selected_ollama_model
+                save_corpus_config(safe_lib, tuning)
     except Exception as exc:
         st.error(f"Search failed: {exc}")
 
 # Results are kept in session state so they survive reruns (follow-ups, downloads, expanders).
 last_search = st.session_state.get(LAST_SEARCH_KEY)
-if last_search and last_search["library"] == safe_lib and last_search.get("distances"):
+if last_search and last_search["library"] == safe_lib and last_search.get("distances") and distance_map_slot:
     with distance_map_slot:
         render_distance_map(distance_threshold, last_search["distances"])
         target = cutoff_to_include(min(last_search["distances"]))

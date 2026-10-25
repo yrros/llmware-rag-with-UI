@@ -4,3 +4,5 @@ llmware_data/
 venv/
 .agents/
 .claude/
+
+outbox/
