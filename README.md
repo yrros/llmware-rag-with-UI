@@ -315,7 +315,15 @@ The app never contacts another system. A separate connector (for example [rag-ac
 
 **Outbox status line.** The top of every page shows, e.g., *Outbox: 2 waiting (7 items) · 1 needs attention · Last processed 25 Oct 10:42 · Last error 24 Oct 18:03 · Open Actions*. "Waiting" counts packages not yet picked up and the records in them; "needs attention" counts packages in `failed/`, including items held for you to choose a record; the dates come from the connector's receipts.
 
-**Actions page.** **Open Actions** at the end of the status line opens `?page=actions` in a new tab: everything in the outbox, newest first, in three tabs — **Needs attention** (packages in `failed/`, opened up), **Waiting** and **Processed**. Each package shows the Agent that sent it, its library, question, model and source notes, the connector's overall result, and every record with its outcome: the record ID it created, or why it didn't (with possible matches when a name was ambiguous). Filter by any text, e.g. a subject, owner or client name; **Refresh** re-reads the folder. The page only reads the outbox: fix held or failed items in the connector (e.g. choose the record it should use), which retries them and moves them on.
+**Actions page.** **Open Actions** at the end of the status line opens `?page=actions` in a new tab: everything in the outbox, newest first, in four tabs — **Needs attention** (packages in `failed/`, opened up), **Waiting**, **Processed** and **Withdrawn**. Each package shows the Agent that sent it, its library, question, model and source notes, the connector's overall result, and every record with its outcome: the record ID it created, or why it didn't (with possible matches when a name was ambiguous). Filter by any text, e.g. a subject, owner or client name; **Refresh** re-reads the folder.
+
+| Button | On | What it does |
+|--------|----|--------------|
+| **Withdraw** | Waiting, Needs attention | Asks to confirm, then moves the package (and its receipt) to `outbox/withdrawn/`, where connectors don't look. Nothing already created in the other system is undone. |
+| **Retry** | Needs attention | Removes the receipt and moves the package back to the outbox for the connector's next run, e.g. after a temporary error. Records already created aren't created twice. Disabled when the file itself is invalid. |
+| **Restore** | Withdrawn | Moves the package back to the outbox for a connector to process. |
+
+When a record needs choosing (an ambiguous or missing name), choose it in the connector; it retries the package by itself. A package you withdraw also shows as withdrawn in the Agent box of the discussion that sent it.
 
 **Default location:** `outbox/` in the project folder, i.e. the folder you run Streamlit from, which is the project folder when you start with `start_app.sh` or the Desktop launcher. Change it under **Outbox** on the Prompt library page (saved as `outbox_path` in `app_settings.json`); the connector must read the same folder. The outbox is gitignored because sent drafts contain your notes, and `reset_rag.sh` leaves it alone.
 

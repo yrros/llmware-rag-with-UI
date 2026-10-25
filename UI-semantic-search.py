@@ -1719,23 +1719,31 @@ OUTBOX_STATES = {  # tab order on the Actions page: what needs attention first
     "failed": ("Needs attention", "Nothing needs attention."),
     "waiting": ("Waiting", "Nothing is waiting for a connector."),
     "processed": ("Processed", "Nothing has been processed yet."),
+    "withdrawn": ("Withdrawn", "Nothing has been withdrawn."),
 }
+# Withdrawn packages are moved here, out of connectors' reach (they only read the outbox's top level).
+WITHDRAWN_DIR = "withdrawn"
 PACKAGE_STATUS = {
     "done": ("✅", "done"),
     "partial": ("⚠️", "partly done"),
     "needs_review": ("⚠️", "needs review"),
     "failed": ("❌", "failed"),
     "waiting": ("⏳", "waiting"),
+    "withdrawn": ("🚫", "withdrawn"),
     "": ("❔", "no receipt"),
 }
 RECEIPT_ITEM_ICONS = {"created": "✅", "exists": "✅", "needs_match": "⚠️", "invalid": "⚠️", "skipped": "⏭️", "error": "❌"}
 
 
+def receipt_beside(package_file: Path) -> Path:
+    return package_file.with_name(f"{package_file.stem}.receipt.json")
+
+
 def load_outbox_entries(outbox: Path) -> dict[str, list[dict]]:
-    """Every package by state ('failed', 'waiting', 'processed'), newest first, with its receipt if it has one."""
+    """Every package by state (see OUTBOX_STATES), newest first, with its receipt if it has one."""
     entries: dict[str, list[dict]] = {state: [] for state in OUTBOX_STATES}
     files = [("waiting", path) for path in pending_outbox_files(outbox)]
-    for folder in HANDOFF_RESULT_DIRS:
+    for folder in (*HANDOFF_RESULT_DIRS, WITHDRAWN_DIR):
         files += [
             (folder, path) for path in (outbox / folder).glob("*.json")
             if not path.name.startswith(".") and not path.name.endswith(".receipt.json")
@@ -1746,8 +1754,11 @@ def load_outbox_entries(outbox: Path) -> dict[str, list[dict]]:
             entry["package"] = json.loads(path.read_text())
         except (OSError, ValueError) as exc:
             entry["error"] = f"This file can't be read as a package: {exc}"
-        if state != "waiting":
-            entry["receipt"] = read_handoff_receipt(outbox / path.name)
+        if state != "waiting" and receipt_beside(path).is_file():
+            try:
+                entry["receipt"] = json.loads(receipt_beside(path).read_text())
+            except (OSError, ValueError):
+                pass
         stamp = (entry["receipt"] or {}).get("processed_at") or (entry["package"] or {}).get("created")
         try:
             when = datetime.datetime.fromisoformat(stamp)
@@ -1758,6 +1769,28 @@ def load_outbox_entries(outbox: Path) -> dict[str, list[dict]]:
     for group in entries.values():
         group.sort(key=lambda entry: entry["when"], reverse=True)
     return entries
+
+
+def move_outbox_package(path_text: str, destination: str, action: str) -> None:
+    """Move a package (and its receipt) for the Actions page buttons; `destination` is '' for the outbox itself.
+
+    Going back to the outbox drops the old receipt first, so a connector that picks the package up at once
+    can't have its fresh receipt removed. Withdrawing keeps the receipt beside the package for the record.
+    """
+    path = Path(path_text)
+    if not path.is_file():
+        st.session_state["actions_notice"] = f"`{path.name}` has already moved; the list is refreshed."
+        return
+    target_dir = get_outbox_dir() / destination if destination else get_outbox_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    receipt = receipt_beside(path)
+    if receipt.is_file():
+        if destination:
+            receipt.replace(target_dir / receipt.name)
+        else:
+            receipt.unlink()
+    path.replace(target_dir / path.name)
+    st.session_state["actions_notice"] = f"{action} `{path.name}`."
 
 
 def outbox_entry_matches(entry: dict, query: str) -> bool:
@@ -1773,7 +1806,7 @@ def render_outbox_entry(entry: dict, state: str) -> None:
     items = [item for item in package.get("items", []) if isinstance(item, dict)]
     source = package.get("source") or {}
     prompt_name = (source.get("prompt") or {}).get("name", "")
-    status = "waiting" if state == "waiting" else receipt.get("status", "")
+    status = state if state in ("waiting", "withdrawn") else receipt.get("status", "")
     icon, status_text = PACKAGE_STATUS.get(status, PACKAGE_STATUS[""])
     kind = {"note": "note", "task": "task", "email": "email"}.get(package.get("item_type"), "item")
     label = (
@@ -1798,14 +1831,19 @@ def render_outbox_entry(entry: dict, state: str) -> None:
 
         if entry["error"] and not receipt.get("error"):  # the connector's receipt usually says the same thing
             st.error(entry["error"])
+        if state == "withdrawn":
+            st.info("Withdrawn: connectors won't see it. **Restore** sends it back to the outbox.")
         if receipt:
+            receipt_status = receipt.get("status", "")
             message = (
                 f"**{str(receipt.get('connector', 'Connector')).capitalize()}** ({receipt.get('target', '?')}): "
-                f"{RECEIPT_STATUS_TEXT.get(status, status)}."
+                f"{RECEIPT_STATUS_TEXT.get(receipt_status, receipt_status)}."
             )
             if receipt.get("error"):
                 message += f" {receipt['error']}"
-            (st.success if status == "done" else st.warning)(message)
+            (st.success if receipt_status == "done" else st.warning)(message)
+        elif state == "withdrawn":
+            pass
         elif state == "waiting":
             st.info("Waiting for a connector to pick this up.")
         else:
@@ -1833,8 +1871,52 @@ def render_outbox_entry(entry: dict, state: str) -> None:
                 st.caption(" · ".join(notes_line))
         if state == "failed":
             st.caption(
-                "Fix this in the connector (for example, choose the record it should use), then have it retry. "
-                "It moves the package on, and this page updates."
+                "If a record needs choosing, choose it in the connector (it then retries by itself). After a "
+                "temporary error, **Retry** sends the package back for the connector's next run; anything already "
+                "created isn't created twice."
+            )
+        render_outbox_entry_actions(entry, state)
+
+
+def render_outbox_entry_actions(entry: dict, state: str) -> None:
+    """Withdraw (waiting, failed), Retry (failed) and Restore (withdrawn) buttons for one package."""
+    path, key = str(entry["path"]), f"{state}_{entry['path'].name}"
+    unreadable = bool(entry["error"] or (entry["receipt"] or {}).get("error"))
+    with st.container(horizontal=True):
+        if state == "failed":
+            st.button(
+                "Retry",
+                icon=":material/replay:",
+                key=f"actions_retry_{key}",
+                on_click=move_outbox_package,
+                args=(path, "", "Sent back to the outbox:"),
+                disabled=unreadable,
+                help=(
+                    "This file itself is invalid, so retrying won't help. Withdraw it and send the drafts again."
+                    if unreadable else "Move it back to the outbox for the connector's next run."
+                ),
+            )
+        if state in ("waiting", "failed"):
+            with st.popover("Withdraw", icon=":material/block:", help="Take it out of the outbox so no connector acts on it"):
+                st.markdown(
+                    "Withdraw this package? Connectors won't see it. Nothing already created in the other system "
+                    "is undone. You can restore it from the **Withdrawn** tab."
+                )
+                st.button(
+                    "Withdraw",
+                    key=f"actions_withdraw_{key}",
+                    type="primary",
+                    on_click=move_outbox_package,
+                    args=(path, WITHDRAWN_DIR, "Withdrew"),
+                )
+        if state == "withdrawn":
+            st.button(
+                "Restore",
+                icon=":material/undo:",
+                key=f"actions_restore_{key}",
+                on_click=move_outbox_package,
+                args=(path, "", "Restored to the outbox:"),
+                help="Send it back to the outbox for a connector to process.",
             )
 
 
@@ -1845,8 +1927,10 @@ def render_actions_page() -> None:
     outbox = get_outbox_dir()
     st.caption(
         f"Everything Agents have sent to the outbox (`{outbox}`) and what the connector did with it. "
-        "This page only reads the outbox."
+        "Withdraw a package to stop a connector acting on it, or retry one after a temporary error."
     )
+    if notice := st.session_state.pop("actions_notice", None):
+        st.toast(notice)
     entries = load_outbox_entries(outbox)
     with st.container(horizontal=True, vertical_alignment="bottom"):
         query = st.text_input(
@@ -3355,7 +3439,11 @@ def send_staged_to_outbox(search_state: dict, prompt: dict, source_notes: list[t
 def render_sent_batch(batch: dict) -> bool:
     """What happened to one sent package; returns True while it's still waiting for a connector."""
     count = f"{len(batch['items'])} {OUTPUT_TYPES[batch['type']].lower()}"
-    receipt = read_handoff_receipt(Path(batch["file"]))
+    package_file = Path(batch["file"])
+    if (package_file.parent / WITHDRAWN_DIR / package_file.name).is_file():
+        st.info(f"Sent {count} at {batch['at']}, then withdrawn on the Actions page.")
+        return False
+    receipt = read_handoff_receipt(package_file)
     if not receipt:
         st.info(f"Sent {count} to the outbox at {batch['at']}. Waiting for a connector to pick it up.")
         return True
