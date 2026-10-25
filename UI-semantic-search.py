@@ -7398,7 +7398,22 @@ model_change_pending = pending_model != corpus_config["embedding_model"] or bool
 sync_disabled = not first_index and model_change_pending
 rebuild_disabled = not first_index and model_change_pending and not reembed_ack
 
-if st.sidebar.button("⚡ Rescan (incremental)", disabled=sync_disabled, key=f"sync_{safe_lib}"):
+# The two incremental rescans side by side: this corpus, and every visible corpus.
+with st.sidebar.container(horizontal=True, gap="small"):
+    sync_clicked = st.button("⚡ Rescan (incremental)", disabled=sync_disabled, key=f"sync_{safe_lib}")
+    multi_rescan_clicked = not is_single_corpus_mode() and st.button(
+        "⚡ Rescan all corpora",
+        key="multi_rescan_start",
+        disabled=not scan_libraries,
+        help=(
+            f"Rescans the {len(scan_libraries)} visible sub-corpora (hidden ones are skipped) in turn, like the "
+            "Getting started wizard: new and edited notes are indexed and embedded, deleted notes "
+            "dropped. Each corpus keeps its own embedding engine and nothing is wiped — only changes "
+            "are processed, so after the first run this is quick."
+        ),
+    )
+
+if sync_clicked:
     try:
         ensure_embedding_dependencies(pending_model)
         ensure_corpus_root_persisted(corpus_root_path)
@@ -7450,23 +7465,11 @@ if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, 
     except Exception as exc:
         handle_embedding_run_error(exc, pending_model, sidebar=True)
 
-if not is_single_corpus_mode():
-    st.sidebar.markdown("**All corpora**")
-    if st.sidebar.button(
-        "⚡ Rescan all corpora",
-        key="multi_rescan_start",
-        disabled=not scan_libraries,
-        help=(
-            f"Rescans the {len(scan_libraries)} visible sub-corpora (hidden ones are skipped) in turn, like the "
-            "Getting started wizard: new and edited notes are indexed and embedded, deleted notes "
-            "dropped. Each corpus keeps its own embedding engine and nothing is wiped — only changes "
-            "are processed, so after the first run this is quick."
-        ),
-    ):
-        ensure_corpus_root_persisted(corpus_root_path)
-        set_embedding_acceleration(get_use_gpu_for_embeddings())
-        st.session_state["multi_rebuild_summary"] = run_multi_corpus_rescan(scan_libraries, corpus_root_path)
-        st.rerun()
+if multi_rescan_clicked:
+    ensure_corpus_root_persisted(corpus_root_path)
+    set_embedding_acceleration(get_use_gpu_for_embeddings())
+    st.session_state["multi_rebuild_summary"] = run_multi_corpus_rescan(scan_libraries, corpus_root_path)
+    st.rerun()
 
 multi_rebuild_request = st.session_state.pop("multi_rebuild_request", None)
 multi_rebuild_text_only = st.session_state.pop("multi_rebuild_text_only", False)

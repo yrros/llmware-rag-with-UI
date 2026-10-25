@@ -224,7 +224,7 @@ On first run — and after `./reset_rag.sh` — the app shows a three-step guide
 2. Open **Advanced — Indexing & Embeddings** if you want to change the embedding model or relevance cutoff.
 3. Click **Re-index (full rebuild)** for a new corpus, or **Rescan (incremental)** to pick up new, edited and deleted notes.
 
-The sidebar groups these under **This corpus**. Below them, **All corpora** has **⚡ Rescan all corpora**, which rescans every visible corpus in turn (see [Rescan vs Re-index](#rescan-vs-re-index)).
+The sidebar groups these under **This corpus**. Beside **⚡ Rescan** is **⚡ Rescan all corpora**, which rescans every visible corpus in turn, also incrementally (see [Rescan vs Re-index](#rescan-vs-re-index)).
 
 Progress appears in the sidebar: a live progress bar during the scan, then a persistent summary (docs, blocks, vectors, model used).
 
