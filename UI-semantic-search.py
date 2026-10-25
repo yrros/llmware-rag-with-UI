@@ -891,8 +891,32 @@ def apply_quick_date(kind: str, field: str) -> None:
     persist_search_filter()
 
 
+QUICK_SEARCH_TERM_SLOTS = 5
+
+
+def quick_search_terms() -> list[str]:
+    """The quick search terms set on the prompt library page (up to 5, blanks dropped)."""
+    terms = load_prompt_library().get("quick_search_terms") or []
+    return [str(t).strip() for t in terms[:QUICK_SEARCH_TERM_SLOTS] if str(t).strip()]
+
+
+def save_quick_search_terms() -> None:
+    library = load_prompt_library()
+    library["quick_search_terms"] = [
+        str(st.session_state.get(f"quick_search_term_{i}", "")).strip() for i in range(QUICK_SEARCH_TERM_SLOTS)
+    ]
+    save_prompt_library(library)
+
+
+def apply_quick_term(term: str, field: str) -> None:
+    """Add a quick search term to a filter field (once), then save."""
+    key = f"filter_{field}"
+    st.session_state[key] = clean_filter_terms(list(st.session_state.get(key, [])) + [term])
+    persist_search_filter()
+
+
 def render_filter_heading(field: str, label: str, field_help: str) -> None:
-    """A filter field's heading with its quick date buttons on the same line."""
+    """A filter field's heading with its quick date buttons on the same line, and quick search terms below."""
     today = datetime.date.today()
     with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
         st.markdown(label, width="content", help=field_help)
@@ -907,6 +931,23 @@ def render_filter_heading(field: str, label: str, field_help: str) -> None:
                 args=(kind, field),
                 help=f"Adds {shown} to **{label}**, and takes out dates left from the last search.",
             )
+    terms = quick_search_terms()
+    with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
+        for i, term in enumerate(terms):
+            st.button(
+                term,
+                key=f"quick_term_{field}_{i}",
+                type="tertiary",
+                on_click=apply_quick_term,
+                args=(term, field),
+                help=f"Adds `{term}` to **{label}**.",
+            )
+        st.link_button(
+            ":material/edit:" if terms else "Set quick search terms",
+            f"{PROMPT_LIBRARY_PAGE_URL}&section=quick_search",
+            type="tertiary",
+            help="Set up to 5 quick search terms in the prompt library (opens in a new tab).",
+        )
 
 
 def clear_search_filter() -> None:
@@ -2953,6 +2994,29 @@ def render_prompt_library_page() -> None:
                           on_click=delete_link, args=(link["id"],), help="Remove this link, from every prompt too")
         st.button("Add link", icon=":material/add:", key="link_add", on_click=add_link)
 
+    quick_terms = (library.get("quick_search_terms") or [])[:QUICK_SEARCH_TERM_SLOTS]
+    quick_terms += [""] * (QUICK_SEARCH_TERM_SLOTS - len(quick_terms))
+    with st.expander(
+        f"Quick search filters · {sum(1 for t in quick_terms if t.strip())} of {QUICK_SEARCH_TERM_SLOTS}",
+        expanded=st.query_params.get("section") == "quick_search",
+        key="prompt_page_quick_search_open",
+        icon=":material/bolt:",
+    ):
+        st.caption(
+            "Terms you filter by often, e.g. a customer or a folder such as `Clients-Prospects`. They show as "
+            "buttons under the quick dates on each filter field (**Must include**, **Any of**, **Exclude**); a "
+            "click adds the term to that field. Terms also match the folders notes are in. Saved as you type."
+        )
+        with st.container(horizontal=True, gap="small"):
+            for i, term in enumerate(quick_terms):
+                st.text_input(
+                    f"Term {i + 1}",
+                    value=term,
+                    key=f"quick_search_term_{i}",
+                    on_change=save_quick_search_terms,
+                    max_chars=60,
+                )
+
     outbox = get_outbox_dir()
     waiting = len(pending_outbox_files(outbox))
     with st.expander(
@@ -3544,6 +3608,39 @@ def note_folder_path(file_source: str, library_folder: Path, corpus_root: Path |
     return FOLDER_PATH_SEPARATOR.join(part for part in folder.relative_to(base).parts if part not in ("", "."))
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def library_source_paths(safe_lib: str, library_folder: str, corpus_root: str) -> dict[str, str]:
+    """{file_source: folder path} for every note in a library's index whose folder is known (cached 5 min)."""
+    table = safe_lib.replace('"', '""')
+    try:
+        with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+            sources = [row[0] for row in conn.execute(f'SELECT DISTINCT file_source FROM "{table}"')]
+    except sqlite3.Error:
+        return {}
+    root = Path(corpus_root) if corpus_root else None
+    paths = {str(source): note_folder_path(str(source), Path(library_folder), root) for source in sources}
+    return {source: path for source, path in paths.items() if path}
+
+
+def with_path_matches(search_filter: dict, safe_lib: str, library_folder: Path | None, corpus_root: Path | None) -> dict:
+    """Let filter terms match the folders notes are in, e.g. `Clients-Prospects`.
+
+    A term matches a path written either way, "Clients > Prospects" or "Clients/Prospects".
+    """
+    terms = {term.lower() for field in SEARCH_FILTER_FIELDS for term in search_filter.get(field, [])}
+    if not terms or not library_folder:
+        return search_filter
+    paths = library_source_paths(safe_lib, str(library_folder), str(corpus_root or ""))
+    haystacks = {
+        source: f"{path}\n{path.replace(FOLDER_PATH_SEPARATOR, '/')}".lower() for source, path in paths.items()
+    }
+    path_sources = {}
+    for term in terms:
+        if hits := [source for source, haystack in haystacks.items() if term in haystack]:
+            path_sources[term] = hits
+    return {**search_filter, "path_sources": path_sources}
+
+
 def add_folder_paths(results: list, library_folder: Path, corpus_root: Path | None) -> None:
     """Give each search result its note's folder path (`_folder_path`), for the LLM and the Sources list."""
     for result in results:
@@ -3886,7 +3983,7 @@ if (page.__filterCommitOnBlurVersion !== 2) {
 
 
 def install_quick_date_tooltip_hide() -> None:
-    """Hide a quick date button's tooltip once it is clicked, until the pointer leaves that button.
+    """Hide a quick date or quick term button's tooltip once it is clicked, until the pointer leaves it.
 
     Otherwise the tooltip stays up over the filter field while the pointer rests on the button.
     """
@@ -3894,15 +3991,16 @@ def install_quick_date_tooltip_hide() -> None:
         """
 <script>
 const page = window.parent;
-if (page.__quickDateTooltipVersion !== 2) {
-  page.__quickDateTooltipVersion = 2;
+if (page.__quickDateTooltipVersion !== 3) {
+  page.__quickDateTooltipVersion = 3;
   const style = page.document.createElement("style");
   style.textContent = 'body.quick-date-clicked > div:has([data-testid="stTooltipContent"])'
     + ' { visibility: hidden !important; }';
   page.document.head.appendChild(style);
   // The button's key class, e.g. "st-key-quick_date_all_today", which stays the same when a rerun redraws it.
   const buttonOf = (el) => {
-    const box = el instanceof page.Element ? el.closest('[class*="st-key-quick_date_"]') : null;
+    const box = el instanceof page.Element
+      ? el.closest('[class*="st-key-quick_date_"], [class*="st-key-quick_term_"]') : null;
     return box ? [...box.classList].find((c) => c.startsWith("st-key-")) : null;
   };
   let clicked = null;
@@ -4166,38 +4264,54 @@ def render_filter_results(search_state: dict, library_folder: Path, safe_lib: st
     label_col.caption("Exclude all")
     st.markdown('<hr style="margin:0.1rem 0 0.6rem">', unsafe_allow_html=True)
 
-    for (library, file_source), blocks in notes.items():
-        note_lib = blocks[0].get("_safe_lib", safe_lib)
-        excluded = file_source in get_excluded_notes(note_lib)
-        name = Path(file_source).name
-        label = (f"~~{name}~~ · excluded" if excluded else name) + (f"  ·  {library}" if library else "")
-        check_col, target_col, help_col, note_col = st.columns([1, 1, 0.6, 9.4])
-        with check_col:
-            checkbox_key = exclude_checkbox_key(note_lib, file_source)
-            if checkbox_key not in st.session_state:
-                st.session_state[checkbox_key] = excluded
-            st.checkbox(
-                "🚫",
-                key=checkbox_key,
-                on_change=toggle_excluded_note,
-                args=(note_lib, file_source),
-            )
-        with target_col:
-            st.button(
-                "🎯",
-                key=f"target::{note_lib}::{file_source}",
-                type="tertiary",
-                on_click=target_note,
-                args=(note_lib, file_source, listed),
-            )
-        help_col.markdown("\u200b", help=NOTE_SELECTION_HELP)
-        with note_col:
-            with st.expander(label):
-                note_folder = blocks[0].get("_library_folder", library_folder)
-                note_uploads = blocks[0].get("_uploads_dirs", search_state["uploads_dirs"])
-                path = resolve_source_path(file_source, note_folder, note_uploads)
-                st.caption(str(path) if path else f"Source: `{file_source}`")
-                render_full_document(file_source, path, note_lib)
+    # Grouped under their folder path, sorted by path; notes whose folder isn't known come last.
+    folders: dict[str, list] = {}
+    for note_key, blocks in notes.items():
+        folders.setdefault(blocks[0].get("_folder_path", ""), []).append((note_key, blocks))
+    for folder in sorted(folders, key=lambda path: (not path, path.lower())):
+        st.markdown(f"📁 **{folder or 'Folder not known'}** · {len(folders[folder])}")
+        for (library, file_source), blocks in folders[folder]:
+            render_filter_result_row(library, file_source, blocks, listed, library_folder, safe_lib, search_state)
+
+
+def render_filter_result_row(
+    library: str, file_source: str, blocks: list, listed: list, library_folder: Path, safe_lib: str,
+    search_state: dict,
+) -> None:
+    """One note in the Filter search list: exclude box, target button and an expander with the note."""
+    note_lib = blocks[0].get("_safe_lib", safe_lib)
+    excluded = file_source in get_excluded_notes(note_lib)
+    name = Path(file_source).name
+    label = (f"~~{name}~~ · excluded" if excluded else name) + (
+        f"  ·  {library}" if library and not blocks[0].get("_folder_path") else ""
+    )
+    check_col, target_col, help_col, note_col = st.columns([1, 1, 0.6, 9.4])
+    with check_col:
+        checkbox_key = exclude_checkbox_key(note_lib, file_source)
+        if checkbox_key not in st.session_state:
+            st.session_state[checkbox_key] = excluded
+        st.checkbox(
+            "🚫",
+            key=checkbox_key,
+            on_change=toggle_excluded_note,
+            args=(note_lib, file_source),
+        )
+    with target_col:
+        st.button(
+            "🎯",
+            key=f"target::{note_lib}::{file_source}",
+            type="tertiary",
+            on_click=target_note,
+            args=(note_lib, file_source, listed),
+        )
+    help_col.markdown("\u200b", help=NOTE_SELECTION_HELP)
+    with note_col:
+        with st.expander(label):
+            note_folder = blocks[0].get("_library_folder", library_folder)
+            note_uploads = blocks[0].get("_uploads_dirs", search_state["uploads_dirs"])
+            path = resolve_source_path(file_source, note_folder, note_uploads)
+            st.caption(str(path) if path else f"Source: `{file_source}`")
+            render_full_document(file_source, path, note_lib)
 
 
 RECEIPT_STATUS_TEXT = {
@@ -6264,24 +6378,34 @@ def describe_search_filter(search_filter: dict) -> str:
 
 
 def build_note_filter_sql(search_filter: dict) -> tuple[str, list]:
-    """HAVING clause matching whole notes (any block or the file name), case-insensitively."""
+    """HAVING clause matching whole notes (any block, the file name or its folder path), case-insensitively.
+
+    Folder paths aren't in the index, so `with_path_matches` lists the notes whose folder matches each term
+    under `path_sources`.
+    """
     term_in_note = (
         "MAX(instr(lower(coalesce(text_block, '')), ?) > 0 "
         "OR instr(lower(coalesce(file_source, '')), ?) > 0)"
     )
-    clauses: list[str] = []
+    path_sources = search_filter.get("path_sources") or {}
     params: list = []
+
+    def matches(term: str) -> str:
+        params.extend([term.lower(), term.lower()])
+        sources = path_sources.get(term.lower(), [])
+        if not sources:
+            return f"{term_in_note} = 1"
+        params.extend(sources)
+        return f"({term_in_note} = 1 OR file_source IN ({', '.join('?' for _ in sources)}))"
+
+    clauses: list[str] = []
     for term in search_filter.get("all", []):
-        clauses.append(f"{term_in_note} = 1")
-        params += [term.lower(), term.lower()]
+        clauses.append(matches(term))
     any_terms = search_filter.get("any", [])
     if any_terms:
-        clauses.append("(" + " OR ".join(f"{term_in_note} = 1" for _ in any_terms) + ")")
-        for term in any_terms:
-            params += [term.lower(), term.lower()]
+        clauses.append("(" + " OR ".join(matches(term) for term in any_terms) + ")")
     for term in search_filter.get("none", []):
-        clauses.append(f"{term_in_note} = 0")
-        params += [term.lower(), term.lower()]
+        clauses.append(f"NOT {matches(term)}")
     excluded = search_filter.get("exclude_sources") or []
     if excluded:
         clauses.append(f"file_source NOT IN ({', '.join('?' for _ in excluded)})")
@@ -6429,21 +6553,23 @@ def exact_text_search_all_libraries(
     taking notes from the libraries with the most matches first. With `apply_exclusions`,
     notes the user excluded are left out.
     """
-    counts: list[tuple[str, str, int]] = []
+    counts: list[tuple[str, str, int, dict]] = []
     for library in libraries:
         lib_key = resolve_library_registry_name(library)
         lib_filter = with_exclusions(search_filter, lib_key) if apply_exclusions else search_filter
+        lib_filter = with_path_matches(
+            lib_filter, lib_key, resolve_library_content_path(corpus_root, library), corpus_root
+        )
         matches = len(find_matching_sources(lib_key, lib_filter))
         if matches:
-            counts.append((library, lib_key, matches))
+            counts.append((library, lib_key, matches, lib_filter))
     counts.sort(key=lambda item: -item[2])
 
     results: list[dict] = []
     remaining = max_documents
-    for library, lib_key, _matches in counts:
+    for library, lib_key, _matches, lib_filter in counts:
         if remaining <= 0:
             break
-        lib_filter = with_exclusions(search_filter, lib_key) if apply_exclusions else search_filter
         blocks = exact_text_search(lib_key, lib_filter, remaining)
         try:
             uploads_dirs = get_library_uploads_dirs(Library().load_library(lib_key))
@@ -6460,7 +6586,7 @@ def exact_text_search_all_libraries(
         results.extend(blocks)
         remaining -= len({block["file_source"] for block in blocks})
 
-    return results, [(library, matches) for library, _lib_key, matches in counts]
+    return results, [(library, matches) for library, _lib_key, matches, _filter in counts]
 
 
 def filtered_semantic_search(
@@ -7414,6 +7540,7 @@ elif new_search and (prompt_text or run_filter_only):
                 with search_progress_slot.container(), st.spinner("Searching for exact text…", show_time=True):
                     # Filter search only lists excluded notes too, so they can be un-ticked.
                     run_filter = search_filter if filter_only_clicked else with_exclusions(search_filter, safe_lib)
+                    run_filter = with_path_matches(run_filter, safe_lib, library_folder, corpus_root_path)
                     final_results = exact_text_search(safe_lib, run_filter, result_limit)
                 if not final_results:
                     notice = f"No notes match {describe_search_filter(search_filter)}."
@@ -7430,7 +7557,9 @@ elif new_search and (prompt_text or run_filter_only):
                         final_results, notice, nearest_distance = perform_search(
                             search_lib,
                             prompt_text,
-                            with_exclusions(search_filter, safe_lib),
+                            with_path_matches(
+                                with_exclusions(search_filter, safe_lib), safe_lib, library_folder, corpus_root_path
+                            ),
                             selected_embedding_model,
                             result_limit,
                             distance_threshold,
