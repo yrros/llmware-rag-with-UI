@@ -725,6 +725,10 @@ def saved_search_route() -> str:
     return "literal" if load_app_settings().get("exact_text_only", False) else "semantic"
 
 
+def persist_max_results() -> None:
+    save_app_settings({"max_results": int(st.session_state.get("max_results", 15))})
+
+
 def persist_search_route() -> None:
     route = st.session_state.get("search_route")
     if route is None:  # clicking the selected option again clears it: keep the route instead
@@ -6964,14 +6968,16 @@ with filter_box_col:
                 ),
             )
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
+        if "max_results" not in st.session_state:  # saved between searches and sessions
+            st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
         result_limit = st.number_input(
             "Max results",
             min_value=1,
             max_value=50,
-            value=15,
             key="max_results",
+            on_change=persist_max_results,
             width=160,
-            help="The most passages (Semantic route) or notes (Literal route) a search returns.",
+            help="The most passages (Semantic route) or notes (Literal route) a search returns. Saved for next time.",
         )
         install_filter_commit_on_blur()
         search_filter = get_search_filter_from_widgets()
