@@ -1594,6 +1594,29 @@ def build_agent_task_prompt(prompt: dict) -> str:
     )
 
 
+TITLE_MARKER_POSITIONS = {"prefix": "Before the title", "suffix": "After the title"}
+
+
+def get_title_marker(library: dict) -> dict:
+    """The prompt library's marker for Agent-created titles: {"text": "", "position": "prefix"|"suffix"}."""
+    marker = library.get("title_marker") or {}
+    position = marker.get("position") if marker.get("position") in TITLE_MARKER_POSITIONS else "prefix"
+    return {"text": str(marker.get("text", "")).strip(), "position": position}
+
+
+def marked_title(title: str, marker: dict) -> str:
+    text, title = marker["text"], title.strip()
+    if not text or not title or text.lower() in title.lower():  # none set, nothing to mark, or already there
+        return title
+    return f"{text} {title}" if marker["position"] == "prefix" else f"{title} {text}"
+
+
+def apply_title_marker(item: dict, marker: dict) -> dict:
+    """Add the marker to a staged task's subject, note's title or email's subject."""
+    field = "title" if item.get("type") == "note" else "subject"
+    return {**item, field: marked_title(item.get(field, ""), marker)} if field in item else item
+
+
 def stage_agent_items(
     search_state: dict,
     prompt: dict,
@@ -1628,7 +1651,11 @@ def stage_agent_items(
             f"`{model_name}` didn't return complete JSON — usually it ran out of tokens. "
             "Raise **Max tokens** and try again."
         ) from exc
-    items = [normalise_draft_item(item_type, item) for item in data.get("items", []) if isinstance(item, dict)]
+    marker = get_title_marker(load_prompt_library())
+    items = [
+        apply_title_marker(normalise_draft_item(item_type, item), marker)
+        for item in data.get("items", []) if isinstance(item, dict)
+    ]
     return {
         "id": uuid.uuid4().hex,  # the package id if this is sent; each staging is a new package
         "type": item_type,
@@ -2105,6 +2132,9 @@ def render_actions_page() -> None:
     if notice := st.session_state.pop("actions_notice", None):
         st.toast(notice)
     entries = load_outbox_entries(outbox)
+    # "View in outbox" in the Agent box links here with ?package=<file name>: start filtered to it.
+    if (linked := st.query_params.get("package")) and "actions_query" not in st.session_state:
+        st.session_state["actions_query"] = Path(linked).stem
     with st.container(horizontal=True, vertical_alignment="bottom"):
         query = st.text_input(
             "Filter",
@@ -2126,6 +2156,17 @@ def render_actions_page() -> None:
 
 
 PROMPT_LIBRARY_PAGE_URL = "?page=prompts"
+
+
+def save_title_marker() -> None:
+    library = load_prompt_library()
+    current = get_title_marker(library)
+    position = st.session_state.get("title_marker_position") or current["position"]  # deselecting keeps it
+    library["title_marker"] = {
+        "text": str(st.session_state.get("title_marker_text", current["text"])).strip(),
+        "position": position,
+    }
+    save_prompt_library(library)
 
 
 def save_profile_from_widgets() -> None:
@@ -2474,6 +2515,37 @@ def render_prompt_library_page() -> None:
         )
         counts = {folder: len(list((outbox / folder).glob("*.receipt.json"))) for folder in HANDOFF_RESULT_DIRS}
         st.caption(f"Waiting: **{waiting}** · Processed: **{counts['processed']}** · Failed: **{counts['failed']}**")
+
+    marker = get_title_marker(library)
+    with st.expander(
+        "Task title marker · " + (f"“{marker['text']}”" if marker["text"] else "off"),
+        expanded=False,
+        key="prompt_page_title_marker_open",
+        icon=":material/label:",
+    ):
+        st.caption(
+            "Added to the title of everything an **Agent** stages (task subjects, note titles, email subjects), "
+            "so you can find those records easily, e.g. in Salesforce. It's added when the Agent stages, so you "
+            "see it before **That's right**; a title that already contains it is left alone. Empty means off."
+        )
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            st.text_input(
+                "Marker",
+                value=marker["text"],
+                key="title_marker_text",
+                on_change=save_title_marker,
+                placeholder="e.g. RAG_TEST: or [AI]",
+            )
+            st.segmented_control(
+                "Where",
+                options=list(TITLE_MARKER_POSITIONS),
+                default=marker["position"],
+                format_func=TITLE_MARKER_POSITIONS.get,
+                key="title_marker_position",
+                on_change=save_title_marker,
+            )
+        if marker["text"]:
+            st.caption(f"Example: **{marked_title('Follow up with Acme on the pilot', marker)}**")
 
     profile = library["profile"]
     profile_on = bool(profile.get("enabled", True) and str(profile.get("text", "")).strip())
@@ -3610,6 +3682,21 @@ def send_staged_to_outbox(search_state: dict, prompt: dict, source_notes: list[t
 
 
 def render_sent_batch(batch: dict) -> bool:
+    """One sent package: what happened to it, and a link to it on the Actions page.
+    Returns True while it's still waiting for a connector."""
+    waiting = render_sent_status(batch)
+    package_name = Path(batch["file"]).name
+    st.link_button(
+        "View in outbox",
+        f"{ACTIONS_PAGE_URL}&package={package_name}",
+        icon=":material/outbox:",
+        type="tertiary",
+        help=f"Opens the Actions page in a new tab, showing {package_name}: what it holds and what happened to it.",
+    )
+    return waiting
+
+
+def render_sent_status(batch: dict) -> bool:
     """What happened to one sent package; returns True while it's still waiting for a connector."""
     count = f"{len(batch['items'])} {OUTPUT_TYPES[batch['type']].lower()}"
     package_file = Path(batch["file"])
