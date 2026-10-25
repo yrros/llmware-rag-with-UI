@@ -3434,6 +3434,48 @@ def render_sidebar_job_summary(selected_lib: str, safe_lib: str) -> None:
     st.caption(" · ".join(meta_parts))
 
 
+FOLDER_PATH_SEPARATOR = " > "
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def library_file_folders(folder: str) -> dict[str, list[str]]:
+    """{file name: [its folder, relative to `folder`]} for every note under a library folder (cached 5 min)."""
+    root = Path(folder)
+    index: dict[str, list[str]] = {}
+    if root.is_dir():
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in INGEST_EXTENSIONS and not path.name.startswith("."):
+                index.setdefault(path.name, []).append(str(path.parent.relative_to(root)))
+    return index
+
+
+def note_folder_path(file_source: str, library_folder: Path, corpus_root: Path | None) -> str:
+    """Where a note lives, from its file's location, e.g. "Clients > Prospects > Acme".
+
+    The index's own copy of a file is flat, so the note is found by name in its library folder. Empty when
+    it can't be found, or when two notes in the library share the name (rather than guess).
+    """
+    if not file_source or not library_folder:
+        return ""
+    matches = library_file_folders(str(library_folder)).get(Path(str(file_source)).name, [])
+    if len(matches) != 1:
+        return ""
+    folder = (Path(library_folder) / matches[0]).resolve()
+    # Relative to the corpus root, so multi-library paths start with the library ("Clients > …").
+    base = Path(corpus_root).resolve() if corpus_root else Path(library_folder).resolve().parent
+    if not folder.is_relative_to(base):
+        base = Path(library_folder).resolve().parent
+    return FOLDER_PATH_SEPARATOR.join(part for part in folder.relative_to(base).parts if part not in ("", "."))
+
+
+def add_folder_paths(results: list, library_folder: Path, corpus_root: Path | None) -> None:
+    """Give each search result its note's folder path (`_folder_path`), for the LLM and the Sources list."""
+    for result in results:
+        result["_folder_path"] = note_folder_path(
+            str(result.get("file_source", "")), result.get("_library_folder", library_folder), corpus_root
+        )
+
+
 def resolve_source_path(
     file_source: str, library_folder: Path, extra_dirs: tuple[Path, ...] = ()
 ) -> Path | None:
@@ -4450,6 +4492,8 @@ def render_search_results(
                 default=None,
             )
             label = f"#{hits[0]['_rank']} — {Path(file_source).name}"
+            if hits[0].get("_folder_path"):
+                label += f" · {hits[0]['_folder_path']}"
             if library:
                 label = f"[{library}] " + label
             if len(hits) > 1:
@@ -5753,7 +5797,8 @@ def build_context_from_results(results: list, max_chars: int = LLM_CONTEXT_MAX_C
         if not text:
             continue
 
-        chunk = f"[Source {index}: {source}]\n{text}\n"
+        folder = result.get("_folder_path")  # where the note lives, so the LLM knows what it's about
+        chunk = f"[Source {index}: {source}" + (f", in {folder}" if folder else "") + f"]\n{text}\n"
         if total + len(chunk) > max_chars:
             break
 
@@ -7272,6 +7317,7 @@ elif new_search and (prompt_text or run_filter_only):
                         )
 
         if final_results is not None:
+            add_folder_paths(final_results, library_folder, corpus_root_path)
             # Corpus prompts describe one library's author role, so skip them across libraries.
             search_corpus_prompt = "" if search_all_libraries else run_prompts["corpus"]
             task_prompt = run_prompts["task"]

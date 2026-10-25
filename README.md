@@ -275,6 +275,7 @@ The Ask box reads top to bottom: your question → the injected prompt's **links
 - **Progress** shows right under **Search**: a spinner with the elapsed time while searching and answering, and beside it the generation speed (tokens per second and tokens so far), refreshed every 3 seconds. Answers stream from Ollama, so there's no overall time limit. The answer caption ends with the final tokens per second.
 - **Speed score.** After each answer the model's speed is saved (`llm_speed` in `app_settings.json`, per model) and shown under **Search** between runs, e.g. *Last run with `qwen3:30b` (25 Oct 10:42): 12.4 tokens/s · 10,000 tokens ≈ 13 min 26 s*, for whichever model is selected.
 - Search runs first; Ollama summarises the retrieved chunks—it does not replace retrieval.
+- **Folder paths.** Each result gets its note's folder path from where the file sits under the notes folder, e.g. *Clients > Prospects > Acme*. It's shown on the note in **Sources** and given to the LLM with every passage (`[Source 2: Kickoff-2026-10-20.md, in Clients > Prospects > Acme]`), so the model knows what each note is about even for passages that don't include its title. No rebuild is needed. When two notes in a library share a file name, the path is left out rather than guessed. Local Apple Notes Export can also put the path in each note's title line (its *Folder path in titles* option), which puts it in the indexed text for search, after a rescan and re-embed.
 
 ### Prompt library
 
