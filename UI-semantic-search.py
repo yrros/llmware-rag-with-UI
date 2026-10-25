@@ -2180,27 +2180,24 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
 
 
 def render_prompt_library_sidebar(corpus_config: dict) -> None:
-    """Sidebar summary of what is sent to the LLM, with a link to the Prompt library page."""
+    """Sidebar button that opens the Prompt library page; hover it for a summary of what is sent to the LLM."""
     library = load_prompt_library()
     profile = library["profile"]
     global_count = sum(1 for p in library["prompts"] if p.get("global"))
     task_count = len(library["prompts"]) - global_count
     agent_count = sum(1 for p in library["prompts"] if is_agent_prompt(p))
-    with st.sidebar.expander("Prompt Library", expanded=False):
-        st.caption(
+    st.sidebar.link_button(
+        "Prompt library",
+        PROMPT_LIBRARY_PAGE_URL,
+        icon=":material/library_books:",
+        width="stretch",
+        help=(
             f"About me: **{'on' if profile.get('enabled') and profile.get('text', '').strip() else 'off'}** · "
-            f"Corpus prompt: **{'applied' if get_active_corpus_prompt(corpus_config) else 'off'}**"
-        )
-        st.caption(
-            f"Global prompts: **{global_count}** · Task prompts: **{task_count}** (Agents: **{agent_count}**)"
-        )
-        st.link_button(
-            "Open prompt library",
-            PROMPT_LIBRARY_PAGE_URL,
-            icon=":material/open_in_new:",
-            width="stretch",
-            help="Opens in a new tab.",
-        )
+            f"Corpus prompt: **{'applied' if get_active_corpus_prompt(corpus_config) else 'off'}**  \n"
+            f"Global prompts: **{global_count}** · Task prompts: **{task_count}** (Agents: **{agent_count}**)  \n"
+            "Opens in a new tab."
+        ),
+    )
 
 
 def is_hide_corpora_enabled() -> bool:

@@ -263,7 +263,7 @@ Results appear under **Sources** as one dropdown per document (documents with se
 
 ### Prompt library
 
-Open it from **Prompt Library → Open prompt library** in the left panel, or **Manage** in the Ask panel's Prompt library box. It opens in a new tab (`?page=prompts`) and saves to `llmware_data/prompt_library.json` (the corpus prompt stays in `corpus_settings.json`).
+Open it with the **Prompt library** button in the left panel (hover it for a summary of what is switched on), or **Manage** in the Ask panel's Prompt library box. It opens in a new tab (`?page=prompts`) and saves to `llmware_data/prompt_library.json` (the corpus prompt stays in `corpus_settings.json`).
 
 | Section | What it does |
 |---------|--------------|
