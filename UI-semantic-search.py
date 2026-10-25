@@ -1467,13 +1467,23 @@ def build_prompt_context(corpus_prompt: str = "", profile_text: str = "", global
 # HANDOFF — structured drafts written to an outbox for another system to act on
 # ---------------------------------------------------------------------------
 
-OUTPUT_TYPES = {"text": "Text answer", "note": "Note", "task": "Tasks", "email": "Email"}
+OUTPUT_TYPES = {
+    "text": "Text answer", "note": "Note", "task": "Tasks", "email": "Email", "next_step": "Next step + chase task",
+}
 DRAFT_OUTPUT_TYPES = [t for t in OUTPUT_TYPES if t != "text"]  # what an Agent prompt can send to the outbox
 DEFAULT_AGENT_OUTPUT = "task"
-DEFAULT_AGENT_COMMANDS = {"task": "Create these as tasks", "note": "Save this as a note", "email": "Draft this as an email"}
+DEFAULT_AGENT_COMMANDS = {
+    "task": "Create these as tasks", "note": "Save this as a note", "email": "Draft this as an email",
+    "next_step": "Update the Opportunity's Next Step and create a task to chase",
+}
 AGENT_BORDER_COLOR = "#1c83e1"
 HANDOFF_SCHEMA_ID = "llm-notes-handoff/v1"
-HANDOFF_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "handoff.v1.schema.json"
+HANDOFF_SCHEMA_V2_ID = "llm-notes-handoff/v2"  # adds update items and mixed packages (e.g. Next Step + chase task)
+HANDOFF_SCHEMA_PATHS = {
+    HANDOFF_SCHEMA_ID: Path(__file__).resolve().parent / "schemas" / "handoff.v1.schema.json",
+    HANDOFF_SCHEMA_V2_ID: Path(__file__).resolve().parent / "schemas" / "handoff.v2.schema.json",
+}
+NEXT_STEP_LIMIT = 255  # characters an opportunity's Next Step can hold
 DEFAULT_OUTBOX_DIR = PROJECT_DIR / "outbox"
 HANDOFF_RESULT_DIRS = ("processed", "failed")  # where connectors move packages, with a receipt beside each
 RELATED_KINDS = ["", "opportunity", "account", "contact"]
@@ -1488,6 +1498,13 @@ STRUCTURED_OUTPUT_GUIDES = {
     "email": (
         "Return JSON with a one-paragraph `summary` and `items` holding exactly one email: `to` (names or "
         "addresses given in the notes — never invent addresses), `subject` and `body`."
+    ),
+    "next_step": (
+        "Return JSON with a one-paragraph `summary` and `items` holding one entry per opportunity to update: "
+        "`next_step` (one short sentence on where things stand and what happens next, under 200 characters; "
+        "no date or initials, they're added for you), `chase_subject` (a short subject for the follow-up task), "
+        "`chase_due_date` as YYYY-MM-DD worked out from today's date (or \"\" if the notes give none) and "
+        "`chase_description` (or \"\")."
     ),
 }
 STRUCTURED_RELATED_GUIDE = (
@@ -1536,6 +1553,12 @@ def structured_output_schema(item_type: str) -> dict:
             "owner": {"type": "string"},
         },
         "email": {"to": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}},
+        "next_step": {
+            "next_step": {"type": "string"},
+            "chase_subject": {"type": "string"},
+            "chase_due_date": {"type": "string"},
+            "chase_description": {"type": "string"},
+        },
     }[item_type]
     item = {"type": "object", "properties": {**fields, "related_to": related}, "required": [*fields, "related_to"]}
     return {
@@ -1558,6 +1581,10 @@ def normalise_draft_item(item_type: str, item) -> dict:
     draft = {"type": item_type}
     if item_type == "note":
         draft.update(title=text("title"), body=text("body"))
+    elif item_type == "update":
+        draft.update(field="next_step", value=text("value"))  # next_step is the only field v2 updates
+        if "previous" in item:
+            draft["previous"] = str(item.get("previous") or "")
     elif item_type == "task":
         due = text("due_date")
         priority = text("priority").lower()
@@ -1821,6 +1848,50 @@ def apply_title_marker(item: dict, marker: dict) -> dict:
     return {**item, field: marked_title(item.get(field, ""), marker)} if field in item else item
 
 
+def profile_short_name(library: dict) -> str:
+    """Your short name (e.g. initials), set under About me; it signs Next Step updates."""
+    return str((library.get("profile") or {}).get("short_name", "")).strip()
+
+
+def next_step_text(text: str, short_name: str, today: datetime.date, marker: dict) -> str:
+    """'2026-10-25-JDOE: waiting on client…', plus the title marker."""
+    signed = f"{today:%Y-%m-%d}-{short_name}" if short_name else f"{today:%Y-%m-%d}"
+    return marked_title(f"{signed}: {text.strip()}", marker)
+
+
+def expand_next_steps(entries: list[dict], marker: dict, short_name: str, today: datetime.date) -> list[dict]:
+    """Each model entry becomes a Next Step update and a task to chase it, both on the same opportunity.
+
+    The update carries `previous` (the Next Step in the reference snapshot) so the connector only overwrites
+    what the user saw; without a snapshot entry it's left out.
+    """
+    items = []
+    for entry in entries:
+        text = str(entry.get("next_step", "") or "").strip()
+        if not text:
+            continue
+        related = normalise_related_to(entry.get("related_to"))
+        if related["name"] and not related["kind"]:
+            related["kind"] = "opportunity"  # next steps live on opportunities
+        update = {
+            "type": "update",
+            "field": "next_step",
+            "value": next_step_text(text, short_name, today, marker),
+            "related_to": related,
+        }
+        record = find_reference_record(related["name"]) if related["kind"] == "opportunity" else None
+        if record is not None:
+            update["previous"] = record.get("next_step", "")
+        chase = normalise_draft_item("task", {
+            "subject": str(entry.get("chase_subject", "") or "").strip() or f"Chase: {text}",
+            "description": str(entry.get("chase_description", "") or "").strip() or text,
+            "due_date": entry.get("chase_due_date", ""),
+            "related_to": related,
+        })
+        items += [update, apply_title_marker(chase, marker)]
+    return items
+
+
 def stage_agent_items(
     search_state: dict,
     prompt: dict,
@@ -1856,14 +1927,16 @@ def stage_agent_items(
             f"`{model_name}` didn't return complete JSON — usually it ran out of tokens. "
             "Raise **Max tokens** and try again."
         ) from exc
-    marker = get_title_marker(load_prompt_library())
-    items = [
-        apply_title_marker(normalise_draft_item(item_type, item), marker)
-        for item in data.get("items", []) if isinstance(item, dict)
-    ]
+    library = load_prompt_library()
+    marker = get_title_marker(library)
+    entries = [item for item in data.get("items", []) if isinstance(item, dict)]
+    if item_type == "next_step":
+        items = expand_next_steps(entries, marker, profile_short_name(library), datetime.date.today())
+    else:
+        items = [apply_title_marker(normalise_draft_item(item_type, item), marker) for item in entries]
     return {
         "id": uuid.uuid4().hex,  # the package id if this is sent; each staging is a new package
-        "type": item_type,
+        "type": "mixed" if item_type == "next_step" else item_type,
         "summary": str(data.get("summary", "")).strip(),
         "items": items,
         "model": model_name,
@@ -1880,11 +1953,13 @@ def persist_outbox_path() -> None:
 
 
 def validate_handoff_package(package: dict) -> None:
-    """Check a package against schemas/handoff.v1.schema.json before it is written."""
+    """Check a package against its schema (schemas/handoff.v1 or v2) before it is written."""
     import jsonschema
 
-    schema = json.loads(HANDOFF_SCHEMA_PATH.read_text())
-    jsonschema.validate(package, schema)
+    path = HANDOFF_SCHEMA_PATHS.get(package.get("schema"))
+    if path is None:
+        raise ValueError(f"unknown package format {package.get('schema')!r}")
+    jsonschema.validate(package, json.loads(path.read_text()))
 
 
 def write_handoff_package(package: dict, outbox: Path) -> Path:
@@ -1903,7 +1978,8 @@ def build_handoff_package(
     search_state: dict, prompt: dict, staged: dict, source_notes: list[tuple[str, Path | None]]
 ) -> dict:
     return {
-        "schema": HANDOFF_SCHEMA_ID,
+        # v1 unless the package holds updates or mixed items, so connectors that only read v1 keep working.
+        "schema": HANDOFF_SCHEMA_V2_ID if staged["type"] in ("update", "mixed") else HANDOFF_SCHEMA_ID,
         "id": staged["id"],
         "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "item_type": staged["type"],
@@ -1997,7 +2073,11 @@ PACKAGE_STATUS = {
     "withdrawn": ("🚫", "withdrawn"),
     "": ("❔", "no receipt"),
 }
-RECEIPT_ITEM_ICONS = {"created": "✅", "exists": "✅", "needs_match": "⚠️", "invalid": "⚠️", "skipped": "⏭️", "error": "❌"}
+RECEIPT_ITEM_ICONS = {
+    "created": "✅", "updated": "✅", "exists": "✅", "needs_match": "⚠️", "invalid": "⚠️", "stale": "⚠️",
+    "skipped": "⏭️", "error": "❌",
+}
+DONE_ITEM_STATUSES = ("created", "updated", "exists")  # receipt item statuses meaning it went through
 
 
 def receipt_beside(package_file: Path) -> Path:
@@ -2073,7 +2153,7 @@ def render_outbox_entry(entry: dict, state: str) -> None:
     prompt_name = (source.get("prompt") or {}).get("name", "")
     status = state if state in ("waiting", "withdrawn") else receipt.get("status", "")
     icon, status_text = PACKAGE_STATUS.get(status, PACKAGE_STATUS[""])
-    kind = {"note": "note", "task": "task", "email": "email"}.get(package.get("item_type"), "item")
+    kind = {"note": "note", "task": "task", "email": "email", "update": "update"}.get(package.get("item_type"), "item")
     label = (
         f"{icon} {format_when(entry['when'])} · {len(items)} {kind}{'' if len(items) == 1 else 's'}"
         + (f" · Agent:{prompt_name}" if prompt_name else "")
@@ -2204,7 +2284,7 @@ def editable_item_indexes(entry: dict, state: str) -> list[int]:
         return []
     created = {
         r.get("index") for r in (entry["receipt"] or {}).get("items", [])
-        if isinstance(r, dict) and r.get("status") in ("created", "exists")
+        if isinstance(r, dict) and r.get("status") in DONE_ITEM_STATUSES
     }
     return [i for i, item in enumerate(package.get("items", [])) if isinstance(item, dict) and i not in created]
 
@@ -2223,8 +2303,11 @@ def render_package_editor(entry: dict, entry_key: str, indexes: list[int], state
             item = items[index]
             key = lambda field: package_edit_key(entry_key, index, field)  # noqa: E731
             item_type = item.get("type", "")
-            st.markdown(f"**{ {'note': 'Note', 'task': 'Task', 'email': 'Email'}.get(item_type, 'Item') } {index + 1}**")
-            if item_type == "note":
+            st.markdown(f"**{ {'note': 'Note', 'task': 'Task', 'email': 'Email', 'update': 'Next Step'}.get(item_type, 'Item') } {index + 1}**")
+            if item_type == "update":
+                st.text_area("New Next Step", value=item.get("value", ""), key=key("value"), height=80,
+                             max_chars=NEXT_STEP_LIMIT, help=f"At most {NEXT_STEP_LIMIT} characters.")
+            elif item_type == "note":
                 st.text_input("Title", value=item.get("title", ""), key=key("title"))
                 st.text_area("Body", value=item.get("body", ""), key=key("body"), height=140)
             elif item_type == "task":
@@ -2290,7 +2373,7 @@ def save_package_edits(path_text: str, entry_key: str, indexes: list[int]) -> No
                 "kind": value("related_kind", related.get("kind", "")),
             },
         }
-        for field in ("title", "body", "subject", "description", "priority", "owner"):
+        for field in ("title", "body", "subject", "description", "priority", "owner", "value"):
             if field in item:
                 edited[field] = value(field, item[field])
         if "due_date" in item:
@@ -2300,7 +2383,10 @@ def save_package_edits(path_text: str, entry_key: str, indexes: list[int]) -> No
             to = value("to", ", ".join(item["to"]))
             edited["to"] = to.split(",") if isinstance(to, str) else to
         cleaned = normalise_draft_item(item["type"], edited)
-        if not (cleaned.get("subject") or cleaned.get("title")):
+        if item["type"] == "update":
+            if not cleaned["value"]:
+                problems.append(f"Item {index + 1} needs a Next Step.")
+        elif not (cleaned.get("subject") or cleaned.get("title")):
             problems.append(f"Item {index + 1} needs a {'title' if item['type'] == 'note' else 'subject'}.")
         package["items"][index] = cleaned
     if problems:
@@ -2385,9 +2471,12 @@ def save_title_marker() -> None:
 
 def save_profile_from_widgets() -> None:
     library = load_prompt_library()
+    profile = library["profile"]
     library["profile"] = {
-        "text": str(st.session_state.get("profile_text", "")),
-        "enabled": bool(st.session_state.get("profile_enabled", True)),
+        **profile,  # keep fields whose widgets aren't on screen
+        "text": str(st.session_state.get("profile_text", profile.get("text", ""))),
+        "enabled": bool(st.session_state.get("profile_enabled", profile.get("enabled", True))),
+        "short_name": re.sub(r"\s+", "", str(st.session_state.get("profile_short_name", profile.get("short_name", "")))),
     }
     save_prompt_library(library)
 
@@ -2849,13 +2938,27 @@ def render_prompt_library_page() -> None:
             "Sent with every LLM request in every corpus: who you are, where you're based, how you'd like "
             "answers. Today's date is always added for you."
         )
-        st.checkbox(
-            "Include in LLM requests",
-            value=bool(library["profile"].get("enabled", True)),
-            key="profile_enabled",
-            on_change=save_profile_from_widgets,
-            help="You can also leave it out of a single run from the Ask panel.",
-        )
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            st.checkbox(
+                "Include in LLM requests",
+                value=bool(library["profile"].get("enabled", True)),
+                key="profile_enabled",
+                on_change=save_profile_from_widgets,
+                help="You can also leave it out of a single run from the Ask panel.",
+            )
+            st.text_input(
+                "Short name",
+                value=profile_short_name(library),
+                key="profile_short_name",
+                on_change=save_profile_from_widgets,
+                max_chars=8,
+                width=140,
+                placeholder="e.g. JDOE",
+                help=(
+                    "Your initials or short name. It signs the updates Agents make, e.g. a Next Step reads "
+                    "*2026-10-25-JDOE: waiting on the client…*. Not sent to the LLM."
+                ),
+            )
         st.text_area(
             "About me",
             value=str(library["profile"].get("text", "")),
@@ -3946,11 +4049,21 @@ RECEIPT_STATUS_TEXT = {
 
 
 def staged_item_title(item: dict) -> str:
+    if item.get("type") == "update":
+        return f"Next Step: {item.get('value', '')}"
     return item.get("subject") or item.get("title") or "(untitled)"
 
 
 def describe_staged_item(item: dict) -> str:
-    """One readable line (plus a short body) for a staged note, task or email."""
+    """One readable line (plus a short body) for a staged note, task, email or Next Step update."""
+    if item["type"] == "update":
+        name = item["related_to"]["name"] or "no opportunity yet"
+        text = f"**Next Step** on *{name}*  \n→ {item['value']}"
+        if len(item["value"]) > NEXT_STEP_LIMIT:
+            text += f"  \n⚠ {len(item['value'])} characters: a Next Step holds {NEXT_STEP_LIMIT}, so the connector will hold it."
+        if "previous" in item:
+            text += f"  \nNow: {item['previous'] or '(empty)'}"
+        return text
     details = []
     if item["type"] == "task":
         details += [
@@ -3988,6 +4101,13 @@ def set_staged_related(agent: dict, index: int, widget_key: str) -> None:
         item["related_to"] = {"name": "", "kind": ""}
     elif choice and choice != KEEP_RELATED:
         item["related_to"] = {"name": choice, "kind": "opportunity"}
+    if item["type"] == "update":
+        # The connector only overwrites the Next Step it was told the user saw, so keep that in step.
+        record = find_reference_record(item["related_to"]["name"])
+        if record is not None:
+            item["previous"] = record.get("next_step", "")
+        else:
+            item.pop("previous", None)
 
 
 def render_reference_picker(agent: dict, index: int, item: dict) -> None:
@@ -4004,10 +4124,12 @@ def render_reference_picker(agent: dict, index: int, item: dict) -> None:
                    "connector will hold it.")
     elif related["name"]:
         st.caption(f"Related to {related['kind']} *{related['name']}* (only opportunities are in the reference).")
-    elif item["type"] == "note":
-        st.caption("⚠ A note must be linked to a record: choose its opportunity below.")
+    elif item["type"] in ("note", "update"):
+        st.caption(f"⚠ {'A note' if item['type'] == 'note' else 'A Next Step'} must be on a record: "
+                   "choose its opportunity below.")
     names = [r["name"] for r in records]
-    options = ([] if match else [KEEP_RELATED]) + names + ([] if item["type"] == "note" else [NO_RELATED])
+    must_link = item["type"] in ("note", "update")  # notes and Next Step updates need a record; tasks don't
+    options = ([] if match else [KEEP_RELATED]) + names + ([] if must_link else [NO_RELATED])
     by_name = {r["name"]: r for r in records}
 
     def label(option: str) -> str:
@@ -4069,7 +4191,7 @@ def render_sent_batch(batch: dict) -> bool:
 
 def render_sent_status(batch: dict) -> bool:
     """What happened to one sent package; returns True while it's still waiting for a connector."""
-    count = f"{len(batch['items'])} {OUTPUT_TYPES[batch['type']].lower()}"
+    count = f"{len(batch['items'])} {OUTPUT_TYPES.get(batch['type'], 'items').lower()}"
     package_file = Path(batch["file"])
     if (package_file.parent / WITHDRAWN_DIR / package_file.name).is_file():
         st.info(f"Sent {count} at {batch['at']}, then withdrawn on the Actions page.")
@@ -4086,7 +4208,7 @@ def render_sent_status(batch: dict) -> bool:
         message += f" {receipt['error']}"
     (st.success if receipt["status"] == "done" else st.warning)(message)
     for result in receipt.get("items", []):
-        if result["status"] in ("created", "exists"):
+        if result["status"] in DONE_ITEM_STATUSES:
             continue
         index = result["index"]
         title = staged_item_title(batch["items"][index]) if index < len(batch["items"]) else f"Item {index + 1}"
@@ -4167,6 +4289,9 @@ def render_agent_panel(
         if staged:
             with st.container(border=True, key="agent_staging"):
                 st.markdown(f"**Staged — check before it goes to the outbox**  \n{staged['summary']}")
+                if any(i["type"] == "update" for i in staged["items"]) and not profile_short_name(load_prompt_library()):
+                    st.warning("Next Steps are signed with the date only: set your **Short name** in the prompt "
+                               "library's **About me** (e.g. JDOE), then stage again.")
                 if not staged["items"]:
                     st.info("Nothing to send: no agreed items were found. Choose **Needs work** and say what you want.")
                 for index, item in enumerate(staged["items"]):
@@ -6838,6 +6963,16 @@ with filter_box_col:
                     )
                 ),
             )
+        # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
+        result_limit = st.number_input(
+            "Max results",
+            min_value=1,
+            max_value=50,
+            value=15,
+            key="max_results",
+            width=160,
+            help="The most passages (Semantic route) or notes (Literal route) a search returns.",
+        )
         install_filter_commit_on_blur()
         search_filter = get_search_filter_from_widgets()
         if is_filter_active(search_filter):
@@ -7046,17 +7181,14 @@ with ask_box_col:
             llm_max_tokens = int(corpus_config["llm_max_tokens"])
             llm_temperature = float(corpus_config["llm_temperature"])
 
-        search_col, limit_col = st.columns([2, 1], vertical_alignment="bottom")
-        with search_col:
-            search_clicked = st.button(
-                "🔍 Search exact text" if exact_text_only else "🔍 Search",
-                type="primary",
-                use_container_width=True,
-                help="Uses the route chosen in the Filter box: "
-                + ("**Literal**, the notes matching the filter terms." if exact_text_only else "**Semantic**, by meaning."),
-            )
-        with limit_col:
-            result_limit = st.number_input("Max results", min_value=1, max_value=50, value=15)
+        search_clicked = st.button(
+            "🔍 Search exact text" if exact_text_only else "🔍 Search",
+            type="primary",
+            use_container_width=True,
+            help="Uses the route chosen in the Filter box: "
+            + ("**Literal**, the notes matching the filter terms." if exact_text_only else "**Semantic**, by meaning.")
+            + f" Returns at most {result_limit} results (**Max results**, in the Filter box).",
+        )
         # Searching and answering show their progress here, right under the button that started them.
         # Between runs it shows the selected model's last speed.
         search_progress_slot = st.empty()
