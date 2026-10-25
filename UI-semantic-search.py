@@ -9,6 +9,7 @@ import time
 import threading
 import datetime
 import uuid
+from contextlib import contextmanager
 from functools import lru_cache
 import streamlit as st
 import streamlit.components.v1 as components
@@ -106,6 +107,26 @@ SUGGESTED_OLLAMA_MODELS = [
 LLM_CONTEXT_MAX_CHARS = 12000
 # Follow-up conversations resend the notes plus history, so give Ollama a larger window.
 FOLLOW_UP_NUM_CTX = 8192
+# Ollama's context window must hold the prompt and the whole answer. These sizes are used in steps, so
+# the model isn't reloaded for every small change; bigger windows use more memory.
+OLLAMA_CONTEXT_SIZES = (8192, 16384, 32768, 65536)
+LLM_PROGRESS_SECONDS = 3  # how often the tokens-per-second count refreshes while an answer streams
+# Max tokens: up to roughly a short novel. English runs at about 0.75 words per token.
+WORDS_PER_TOKEN = 0.75
+LLM_MAX_TOKENS_LIMIT = 50000
+BOOK_LENGTHS = (  # (title, approximate word count): markers on the Max tokens slider
+    ("The Very Hungry Caterpillar", 225),
+    ("Where the Wild Things Are", 340),
+    ("The Tale of Peter Rabbit", 950),
+    ("Dr. Seuss, The Cat in the Hat", 1600),
+    ("The Little Prince", 17000),
+    ("Winnie-the-Pooh", 23000),
+    ("The Old Man and the Sea", 27000),
+    ("Animal Farm", 30000),
+    ("The Lion, the Witch and the Wardrobe", 37000),
+)
+BOOKS_BEYOND_LIMIT = (("The Hobbit", 95000), ("War and Peace", 587000))
+TOKEN_STEPS = (128, 256, 512, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768, 40960, LLM_MAX_TOKENS_LIMIT)
 DISCUSSION_HEIGHT = 520
 DISCUSSION_EXPANDED_HEIGHT = 1100
 FOLLOW_UP_BOX_HEIGHT = 90
@@ -3792,6 +3813,7 @@ def render_search_results(
                     f"Model: `{search_state['model']}` · "
                     f"{usage.get('total', '?')} tokens · "
                     f"{processing_time:.1f}s"
+                    + (f" · {usage['tokens_per_second']:.1f} tokens/s" if usage.get("tokens_per_second") else "")
                     + "".join(f" · {part}" for part in search_state.get("prompt_parts", []))
                 )
         elif search_state["answer_error"]:
@@ -5172,6 +5194,7 @@ def answer_with_ollama(
     temperature: float = 0.3,
     corpus_prompt: str = "",
     task_prompt: str = "",
+    on_progress=None,
 ) -> tuple[str, dict]:
     """Generate a natural-language answer from search results using a local Ollama model."""
     full_prompt = build_llm_prompt(question, results, max_tokens, temperature, corpus_prompt, task_prompt)
@@ -5182,6 +5205,7 @@ def answer_with_ollama(
         port=port,
         max_tokens=max_tokens,
         temperature=temperature,
+        on_progress=on_progress,
     )
 
 
@@ -5194,32 +5218,36 @@ def chat_with_ollama(
     temperature: float = 0.3,
     num_ctx: int | None = None,
     response_format: dict | None = None,
+    on_progress=None,
 ) -> tuple[str, dict]:
     """Send a chat conversation to a local Ollama model and return (reply, usage).
 
     `response_format` is a JSON schema; Ollama then constrains the reply to match it.
+    The reply is streamed, so long answers have no overall time limit; `on_progress(tokens, seconds)`
+    is called every LLM_PROGRESS_SECONDS with the tokens generated so far and the seconds since the
+    first one (None while the model is still reading the prompt).
     """
     import requests
 
     options = {
         "temperature": temperature,
         "num_predict": max_tokens,
+        "num_ctx": context_window_for(messages, max_tokens, num_ctx),
     }
-    if num_ctx:
-        options["num_ctx"] = num_ctx
 
     url = f"http://{host}:{port}/api/chat"
     payload = {
         "model": model_name,
         "messages": messages,
-        "stream": False,
+        "stream": True,
         "options": options,
     }
     if response_format:
         payload["format"] = response_format
 
     try:
-        response = requests.post(url, json=payload, timeout=300)
+        # (connect, longest wait between streamed pieces): a big prompt can take minutes before the first token.
+        response = requests.post(url, json=payload, stream=True, timeout=(10, 900))
     except requests.RequestException as exc:
         raise RuntimeError(
             f"Could not reach Ollama at `{host}:{port}`. "
@@ -5232,15 +5260,35 @@ def chat_with_ollama(
             f"{response.text[:500]}"
         )
 
+    content, thinking, data = [], [], {}
+    generated, first_token_at = 0, None
+    last_report = time.monotonic()
     try:
-        data = response.json()
-    except ValueError as exc:
-        raise RuntimeError(f"Ollama returned invalid JSON: {response.text[:500]}") from exc
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except ValueError as exc:
+                raise RuntimeError(f"Ollama returned invalid JSON: {line[:500]!r}") from exc
+            if chunk.get("error"):
+                raise RuntimeError(f"Ollama error for model `{model_name}`: {chunk['error']}")
+            piece = chunk.get("message") or {}
+            if piece.get("content") or piece.get("thinking"):
+                content.append(piece.get("content") or "")
+                thinking.append(piece.get("thinking") or "")
+                generated += 1  # Ollama streams about one token per piece
+                first_token_at = first_token_at or time.monotonic()
+            if chunk.get("done"):
+                data = chunk
+                break
+            if on_progress and time.monotonic() - last_report >= LLM_PROGRESS_SECONDS:
+                last_report = time.monotonic()
+                on_progress(generated, last_report - first_token_at if first_token_at else None)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Lost the connection to Ollama while `{model_name}` was answering: {exc}") from exc
 
-    if data.get("error"):
-        raise RuntimeError(f"Ollama error for model `{model_name}`: {data['error']}")
-
-    message = data.get("message") or {}
+    message = {"content": "".join(content), "thinking": "".join(thinking)}
     # Reasoning models (e.g. Qwen3) may inline their thinking; keep only the answer.
     answer = re.sub(r"<think>.*?</think>", "", str(message.get("content", "")), flags=re.DOTALL).strip()
     if not answer and message.get("thinking"):
@@ -5257,14 +5305,90 @@ def chat_with_ollama(
     prompt_tokens = int(data.get("prompt_eval_count") or 0)
     output_tokens = int(data.get("eval_count") or 0)
     total_duration = data.get("total_duration")
+    eval_duration = data.get("eval_duration")
     usage = {
         "input": prompt_tokens,
         "output": output_tokens,
         "total": prompt_tokens + output_tokens,
         "metric": "tokens",
         "processing_time": (total_duration / 1e9) if total_duration else None,
+        "tokens_per_second": (output_tokens / (eval_duration / 1e9)) if eval_duration else None,
     }
     return answer, usage
+
+
+def context_window_for(messages: list[dict], max_tokens: int, minimum: int | None = None) -> int:
+    """A context window that fits the prompt (about 3 characters a token) plus the whole answer."""
+    needed = sum(len(str(m.get("content", ""))) for m in messages) // 3 + max_tokens + 256
+    size = next((s for s in OLLAMA_CONTEXT_SIZES if s >= needed), OLLAMA_CONTEXT_SIZES[-1])
+    return max(size, minimum or 0)
+
+
+def tokens_as_words(tokens: int) -> int:
+    return round(tokens * WORDS_PER_TOKEN)
+
+
+def approximately(number: int) -> str:
+    """'≈1,600', or to the nearest thousand for big numbers: '≈127,000'."""
+    return f"≈{round(number, -3) if number >= 10000 else number:,}"
+
+
+def book_token_markers() -> dict[int, str]:
+    """{token count: book title} for the books that fit under the Max tokens limit."""
+    return {round(words / WORDS_PER_TOKEN): title for title, words in BOOK_LENGTHS}
+
+
+def max_tokens_options(current: int) -> list[int]:
+    """Slider stops: round steps plus the book markers (and the saved value, if it's neither)."""
+    return sorted({*TOKEN_STEPS, *book_token_markers(), min(max(int(current), TOKEN_STEPS[0]), LLM_MAX_TOKENS_LIMIT)})
+
+
+def format_max_tokens(tokens: int) -> str:
+    """Slider label: the book at a marker, otherwise the length in words."""
+    book = book_token_markers().get(tokens)
+    return f"{tokens:,} · {book}" if book else f"{tokens:,} · ≈{tokens_as_words(tokens):,} words"
+
+
+def describe_answer_length(tokens: int) -> str:
+    """How long an answer of `tokens` could be, compared with well-known books."""
+    words = tokens_as_words(tokens)
+    same = [title for title, book_words in BOOK_LENGTHS if abs(book_words - words) <= book_words * 0.01]
+    shorter = [(title, n) for title, n in BOOK_LENGTHS if n < words and title not in same]
+    longer = [(title, n) for title, n in BOOK_LENGTHS if n > words and title not in same]
+    text = f"Up to {approximately(words)} words"
+    if same:
+        text += f": about the length of *{same[0]}*"
+    else:
+        if shorter:
+            text += f": longer than *{shorter[-1][0]}* ({approximately(shorter[-1][1])})"
+        if longer:
+            text += f"{',' if shorter else ':'} shorter than *{longer[0][0]}* ({approximately(longer[0][1])})"
+    beyond = ", ".join(
+        f"*{title}* {approximately(round(book_words / WORDS_PER_TOKEN))}" for title, book_words in BOOKS_BEYOND_LIMIT
+    )
+    return text + f". For scale, in tokens: {beyond}."
+
+
+@contextmanager
+def llm_progress(slot, label: str):
+    """A spinner in `slot` (under the Search button) with a tokens-per-second count beside it.
+
+    Yields the `on_progress` callback for chat_with_ollama; the slot is cleared afterwards.
+    """
+    with slot.container():
+        spin_col, rate_col = st.columns([3, 2], vertical_alignment="center")
+        rate = rate_col.empty()
+        rate.caption("Reading the notes…")
+
+        def report(tokens: int, seconds: float | None) -> None:
+            if seconds:
+                rate.caption(f"**{tokens / seconds:.1f} tokens/s** · {tokens:,} tokens")
+            else:
+                rate.caption("Reading the notes…")
+
+        with spin_col, st.spinner(label, show_time=True):
+            yield report
+    slot.empty()
 
 
 def normalize_text_search_query(query: str) -> str | None:
@@ -6266,22 +6390,17 @@ with ask_box_col:
             help="Saved locally and restored when the page is reloaded.",
         )
         render_injected_prompt_token(prompt_library)
-
-        search_col, llm_col, limit_col = st.columns([1.2, 1.6, 1.2], vertical_alignment="bottom")
-        with limit_col:
-            result_limit = st.number_input("Max results", min_value=1, max_value=50, value=15)
-        with llm_col:
-            use_llm_answer = st.checkbox(
-                "Answer with LLM",
-                value=True,
-                help=(
-                    "**Semantic search** finds relevant note chunks using embedding vectors. "
-                    "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
-                    "Search still runs first; the LLM does not replace retrieval."
-                ),
-            )
-        with search_col:
-            search_clicked = st.button("🔍 Search", type="primary", use_container_width=True)
+        # Top to bottom: question → Answer with LLM → prompt library → model details → cutoff → Search → progress.
+        use_llm_answer = st.checkbox(
+            "Answer with LLM",
+            value=True,
+            key="use_llm_answer",
+            help=(
+                "**Semantic search** finds relevant note chunks using embedding vectors. "
+                "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
+                "Search still runs first; the LLM does not replace retrieval."
+            ),
+        )
 
         if use_llm_answer:
             render_ask_prompt_panel(prompt_library, corpus_config)
@@ -6289,29 +6408,31 @@ with ask_box_col:
             # the prompt; picking another model here overrides it for this run.
             prompt_model = (resolve_run_prompts(prompt_library, corpus_config)["task"] or {}).get("model")
             answer_model = prompt_model if prompt_model in ollama_model_options else default_ollama
-            selected_ollama_model = st.selectbox(
-                "Ollama model",
-                options=ollama_model_options,
-                index=ollama_model_options.index(answer_model),
-                help="Generative model that writes the final answer.",
-            )
-            tokens_col, temperature_col = st.columns(2)
-            with tokens_col:
-                llm_max_tokens = st.slider(
+            tokens_key = f"llm_max_tokens_{safe_lib}"
+            saved_tokens = int(st.session_state.get(tokens_key, corpus_config["llm_max_tokens"]))
+            with st.expander("Ollama model details", expanded=False, key="ask_model_details", icon=":material/tune:"):
+                selected_ollama_model = st.selectbox(
+                    "Ollama model",
+                    options=ollama_model_options,
+                    index=ollama_model_options.index(answer_model),
+                    help="Generative model that writes the final answer.",
+                )
+                llm_max_tokens = st.select_slider(
                     "Max tokens",
-                    min_value=128,
-                    max_value=2048,
-                    value=int(corpus_config["llm_max_tokens"]),
-                    step=64,
-                    key=f"llm_max_tokens_{safe_lib}",
+                    options=max_tokens_options(saved_tokens),
+                    value=min(max(saved_tokens, TOKEN_STEPS[0]), LLM_MAX_TOKENS_LIMIT),
+                    format_func=format_max_tokens,
+                    key=tokens_key,
                     on_change=persist_llm_tuning,
                     args=(safe_lib,),
                     help=(
-                        "Maximum length of the generated answer. Higher values allow longer responses but "
-                        "take more time. Saved for this corpus."
+                        "Maximum length of the answer, including a reasoning model's thinking. The stops include "
+                        "book lengths for scale. Long answers take a while (at 20 tokens/s, 50,000 tokens is about "
+                        "40 minutes) and use more memory, because Ollama's context window grows to fit them. "
+                        "Saved for this corpus."
                     ),
                 )
-            with temperature_col:
+                st.caption(describe_answer_length(llm_max_tokens))
                 llm_temperature = st.slider(
                     "Temperature",
                     min_value=0.0,
@@ -6326,6 +6447,9 @@ with ask_box_col:
                         "are more varied. Saved for this corpus."
                     ),
                 )
+            st.caption(
+                f"`{selected_ollama_model}` · up to {llm_max_tokens:,} tokens · temperature {llm_temperature:.2f}"
+            )
             if not ollama_ok:
                 st.warning(
                     f"Ollama is not reachable at `{OLLAMA_HOST}:{OLLAMA_PORT}`. "
@@ -6362,6 +6486,14 @@ with ask_box_col:
         distance_threshold = float(st.session_state[_cutoff_key])
         distance_map_slot = st.container()
 
+        search_col, limit_col = st.columns([2, 1], vertical_alignment="bottom")
+        with search_col:
+            search_clicked = st.button("🔍 Search", type="primary", use_container_width=True)
+        with limit_col:
+            result_limit = st.number_input("Max results", min_value=1, max_value=50, value=15)
+        # Searching and answering show their progress here, right under the button that started them.
+        search_progress_slot = st.empty()
+
 run_prompts = resolve_run_prompts(prompt_library, corpus_config)
 
 new_search = search_clicked or filter_only_clicked
@@ -6387,7 +6519,7 @@ elif new_search and (prompt_text or run_filter_only):
     try:
         if search_all_libraries:
             state_library = ALL_LIBRARIES_KEY
-            with st.spinner("Searching all libraries for exact text…"):
+            with search_progress_slot.container(), st.spinner("Searching all libraries for exact text…", show_time=True):
                 final_results, library_counts = exact_text_search_all_libraries(
                     filter_libraries_for_display(all_libraries),
                     search_filter,
@@ -6407,7 +6539,7 @@ elif new_search and (prompt_text or run_filter_only):
                 st.error("Library not found. Use **Rescan** or **Re-index** in the left panel first.")
             elif run_filter_only:
                 uploads_dirs = get_library_uploads_dirs(search_lib)
-                with st.spinner("Searching for exact text…"):
+                with search_progress_slot.container(), st.spinner("Searching for exact text…", show_time=True):
                     # Filter search only lists excluded notes too, so they can be un-ticked.
                     run_filter = search_filter if filter_only_clicked else with_exclusions(search_filter, safe_lib)
                     final_results = exact_text_search(safe_lib, run_filter, result_limit)
@@ -6422,7 +6554,7 @@ elif new_search and (prompt_text or run_filter_only):
                 if not emb_ready:
                     st.error(f"Semantic index not ready: {emb_message}")
                 else:
-                    with st.spinner("Searching…"):
+                    with search_progress_slot.container(), st.spinner("Searching…", show_time=True):
                         final_results, notice, nearest_distance = perform_search(
                             search_lib,
                             prompt_text,
@@ -6480,7 +6612,7 @@ elif new_search and (prompt_text or run_filter_only):
             if final_results and use_llm_answer and (
                 search_state["question"] or (task_prompt and not filter_only_clicked)
             ):
-                with st.spinner(f"Generating answer with `{selected_ollama_model}`…"):
+                with llm_progress(search_progress_slot, f"Generating answer with `{selected_ollama_model}`…") as report:
                     try:
                         search_state["answer"], search_state["usage"] = answer_with_ollama(
                             question=search_state["question"],
@@ -6490,6 +6622,7 @@ elif new_search and (prompt_text or run_filter_only):
                             temperature=llm_temperature,
                             corpus_prompt=search_state["prompt_context"],
                             task_prompt=search_state["task_prompt"],
+                            on_progress=report,
                         )
                         if task_prompt:
                             mark_prompt_used(task_prompt["id"])
