@@ -1531,8 +1531,7 @@ def delete_prompt(prompt_id: str) -> None:
     library = load_prompt_library()
     library["prompts"] = [p for p in library["prompts"] if p["id"] != prompt_id]
     save_prompt_library(library)
-    if st.session_state.get("active_task_prompt_id") == prompt_id:
-        st.session_state.pop("active_task_prompt_id", None)
+    remove_active_task_prompt(prompt_id)
 
 
 def mark_prompt_used(prompt_id: str) -> None:
@@ -1848,16 +1847,38 @@ def reference_prompt_text(records: list[dict]) -> str:
     )
 
 
-def build_agent_task_prompt(prompt: dict, results: list) -> str:
-    """Task for an Agent's first answer: its collection prompt, plus how to list items and where it's heading."""
+def agent_action(prompt: dict) -> str:
+    return f"\"{agent_command(prompt)}\" ({OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()})"
+
+
+def build_agent_task_prompt(prompts: list[dict], results: list) -> str:
+    """Task for an Agent's first answer: its collection prompt, plus how to list items and where it's heading.
+
+    Several Agents (e.g. SF_Next_Step and SF_Tasks) become parts of one request, each answered under its own
+    heading, with the items numbered across all parts.
+    """
     reference = reference_prompt_text(notes_reference_records(results))
-    return (
-        f"{prompt['text'].strip()}\n\n"
-        "Number every item you list (1, 2, 3…) so I can pick them by number, e.g. \"Yes:1,3 ignore 2\". "
-        f"We will finish with this action: \"{agent_command(prompt)}\" "
-        f"({OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()}). Ask me the questions you need answered "
-        "to do that well, and don't guess anything the notes don't say."
+    tail = (
+        " Ask me the questions you need answered to do that well, and don't guess anything the notes don't say."
         + (f" Say which opportunity each item belongs to.\n\n{reference}" if reference else "")
+    )
+    if len(prompts) == 1:
+        prompt = prompts[0]
+        return (
+            f"{prompt['text'].strip()}\n\n"
+            "Number every item you list (1, 2, 3…) so I can pick them by number, e.g. \"Yes:1,3 ignore 2\". "
+            f"We will finish with this action: {agent_action(prompt)}." + tail
+        )
+    parts = "\n\n".join(
+        f"Part {number}: {prompt['name']} (we will finish with {agent_action(prompt)})\n{prompt['text'].strip()}"
+        for number, prompt in enumerate(prompts, 1)
+    )
+    return (
+        f"This request has {len(prompts)} parts. Answer each under its own heading (the part's name), and keep "
+        "each part to what it asks for.\n\n"
+        f"{parts}\n\n"
+        "Number every item you list across all parts (1, 2, 3…, continuing from one part to the next) so I can "
+        "pick them by number, e.g. \"Yes:1,3 ignore 2\"." + tail
     )
 
 
@@ -1958,11 +1979,11 @@ def link_markdown(link: dict, guess: str = "") -> str:
     return f"{link_status_dot(link['url'])}[{title}]({url.replace(' ', '%20').replace(')', '%29')})"
 
 
-def render_prompt_links(prompt: dict | None, library: dict, guess: str) -> None:
-    """The injected prompt's links, inline (task executor first), each opening in a new tab."""
-    if not prompt:
+def render_prompt_links(prompts: list[dict], library: dict, guess: str) -> None:
+    """The injected prompts' links, inline (task executor first), each opening in a new tab."""
+    chosen = {link_id for prompt in prompts for link_id in prompt.get("links", [])}
+    if not chosen:
         return
-    chosen = set(prompt.get("links", []))
     parts = [link_markdown(link, guess) for link in ordered_links(library) if link["id"] in chosen and link.get("url")]
     if parts:
         st.markdown(" · ".join(parts))
@@ -2069,6 +2090,34 @@ def expand_next_steps(entries: list[dict], marker: dict, short_name: str, today:
     return items
 
 
+def stage_agent_batch(
+    search_state: dict,
+    prompts: list[dict],
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+    corpus_prompt: str,
+) -> dict:
+    """Stage every injected Agent's records into one batch (one package). Each Agent is asked separately."""
+    parts = len(prompts)
+    batches = [
+        stage_agent_items(search_state, prompt, model_name, max_tokens, temperature, corpus_prompt,
+                          part=(number, parts) if parts > 1 else None)
+        for number, prompt in enumerate(prompts, 1)
+    ]
+    if parts == 1:
+        return batches[0]
+    items = [item for batch in batches for item in batch["items"]]
+    types = {item["type"] for item in items}
+    return {
+        "id": uuid.uuid4().hex,
+        "type": (types.pop() if len(types) == 1 else "mixed") if items else batches[0]["type"],
+        "summary": " ".join(batch["summary"] for batch in batches if batch["summary"]),
+        "items": items,
+        "model": model_name,
+    }
+
+
 def stage_agent_items(
     search_state: dict,
     prompt: dict,
@@ -2076,15 +2125,23 @@ def stage_agent_items(
     max_tokens: int,
     temperature: float,
     corpus_prompt: str,
+    part: tuple[int, int] | None = None,
 ) -> dict:
-    """Turn the discussion so far into exact records for the Agent's Action Command. Nothing is sent."""
+    """Turn the discussion so far into exact records for the Agent's Action Command. Nothing is sent.
+
+    `part` is (number, of) when several Agents were injected: only this Agent's part is staged here.
+    """
     item_type = get_prompt_output_type(prompt)
     messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
     reference = reference_prompt_text(notes_reference_records(discussion_results(search_state)))
+    only_part = (
+        f"This covers only part {part[0]} of {part[1]} ({prompt['name']}): give only that part's records; "
+        "the other parts are staged separately.\n\n" if part else ""
+    )
     messages.append({
         "role": "user",
         "content": (
-            f"{agent_command(prompt)}\n\nTurn what we have agreed in this conversation into records now. "
+            f"{agent_command(prompt)}\n\n{only_part}Turn what we have agreed in this conversation into records now. "
             "Include only the items I selected or agreed, with the details we agreed, and leave out anything "
             f"I said to ignore. {STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
             + (f"\n\n{reference}" if reference else "")
@@ -2153,7 +2210,7 @@ def write_handoff_package(package: dict, outbox: Path) -> Path:
 
 
 def build_handoff_package(
-    search_state: dict, prompt: dict, staged: dict, source_notes: list[tuple[str, Path | None]]
+    search_state: dict, prompts: list[dict], staged: dict, source_notes: list[tuple[str, Path | None]]
 ) -> dict:
     return {
         # v1 unless the package holds updates or mixed items, so connectors that only read v1 keep working.
@@ -2165,7 +2222,9 @@ def build_handoff_package(
             "library": search_state.get("library_display") or search_state["library"],
             "library_key": search_state["library"],
             "question": search_state["question"],
-            "prompt": {"id": prompt["id"], "name": prompt["name"]},
+            "prompt": {  # several Agents read e.g. "SF_Next_Step + SF_Tasks"
+                "id": "+".join(p["id"] for p in prompts), "name": " + ".join(p["name"] for p in prompts),
+            },
             "model": staged["model"],
             "notes": [{"file": file, **({"path": str(path)} if path else {})} for file, path in source_notes],
         },
@@ -3308,35 +3367,55 @@ def render_prompt_library_page() -> None:
     install_filter_commit_on_blur()
 
 
+ACTIVE_TASK_PROMPTS_KEY = "active_task_prompt_ids"
+
+
+def active_task_prompts(library: dict) -> list[dict]:
+    """The injected task prompts: one plain prompt, or one or more Agents (e.g. SF_Next_Step and SF_Tasks)."""
+    prompts = (find_prompt(library, prompt_id) for prompt_id in st.session_state.get(ACTIVE_TASK_PROMPTS_KEY, []))
+    return [p for p in prompts if p and not p.get("global")]
+
+
 def set_active_task_prompt(prompt_id: str) -> None:
-    st.session_state["active_task_prompt_id"] = prompt_id
+    """Inject a task prompt. Agents add up, so one action can update Next Steps and create tasks; a plain
+    prompt replaces whatever was injected, and an Agent replaces a plain prompt."""
+    library = load_prompt_library()
+    current = active_task_prompts(library)
+    if is_agent_prompt(find_prompt(library, prompt_id)) and all(is_agent_prompt(p) for p in current):
+        ids = [p["id"] for p in current if p["id"] != prompt_id] + [prompt_id]
+    else:
+        ids = [prompt_id]
+    st.session_state[ACTIVE_TASK_PROMPTS_KEY] = ids
 
 
-def clear_active_task_prompt() -> None:
-    st.session_state.pop("active_task_prompt_id", None)
+def remove_active_task_prompt(prompt_id: str) -> None:
+    ids = st.session_state.get(ACTIVE_TASK_PROMPTS_KEY, [])
+    st.session_state[ACTIVE_TASK_PROMPTS_KEY] = [i for i in ids if i != prompt_id]
 
 
 def sync_injected_prompt_token() -> None:
-    if not st.session_state.get("question_task_token"):
-        clear_active_task_prompt()
+    st.session_state[ACTIVE_TASK_PROMPTS_KEY] = list(st.session_state.get("question_task_token") or [])
 
 
 def render_injected_prompt_token(library: dict) -> None:
-    """Red token under the question box showing the injected task prompt; its × removes it."""
-    task = find_prompt(library, st.session_state.get("active_task_prompt_id"))
-    if not task or task.get("global"):
+    """Red tokens under the question box showing the injected task prompts; each × removes that one."""
+    tasks = active_task_prompts(library)
+    if not tasks:
         return
-    st.session_state["question_task_token"] = [task["id"]]
-    if is_agent_prompt(task):
+    by_id = {task["id"]: task for task in tasks}
+    st.session_state["question_task_token"] = list(by_id)
+    if any(is_agent_prompt(task) for task in tasks):
         add_agent_border_style(".st-key-question_task_token [data-tag]")
     st.multiselect(
-        "Injected prompt",
-        options=[task["id"]],
-        format_func=lambda _: f"Prompt: {agent_prompt_label(task)}",
+        "Injected prompts",
+        options=list(by_id),
+        format_func=lambda prompt_id: f"Prompt: {agent_prompt_label(by_id[prompt_id])}",
         key="question_task_token",
         on_change=sync_injected_prompt_token,
         label_visibility="collapsed",
-        help=f"Injected into the LLM request as the task:\n\n{task['text']}",
+        help="Injected into the LLM request as the task" + (
+            "s, one part each" if len(tasks) > 1 else ""
+        ) + ":\n\n" + "\n\n".join(f"**{task['name']}:** {task['text']}" for task in tasks),
     )
 
 
@@ -3353,15 +3432,17 @@ def resolve_run_prompts(library: dict, corpus_config: dict) -> dict:
     profile_text = str(profile.get("text", "")).strip() if profile.get("enabled") else ""
     corpus_prompt = get_active_corpus_prompt(corpus_config)
     global_prompts = [p for p in library["prompts"] if p.get("global") and p.get("text", "").strip()]
-    task = find_prompt(library, st.session_state.get("active_task_prompt_id"))
-    if task and task.get("global"):
-        task = None
     return {
         "profile": profile_text if st.session_state.get("run_include_profile", True) else "",
         "corpus": corpus_prompt if st.session_state.get("run_include_corpus", True) else "",
         "globals": [p for p in global_prompts if st.session_state.get(f"run_include_global_{p['id']}", True)],
-        "task": task,
+        "tasks": active_task_prompts(library),
     }
+
+
+def first_prompt_model(prompts: list[dict]) -> str | None:
+    """The model the first of these prompts asks for, if any (a prompt can pick its own model)."""
+    return next((p["model"] for p in prompts if p.get("model")), None)
 
 
 def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
@@ -3371,8 +3452,7 @@ def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
     if corpus_prompt:
         parts.append("corpus prompt")
     parts.extend(f"Global: {p['name']}" for p in run_prompts["globals"])
-    if run_prompts["task"]:
-        parts.append(f"Task: {agent_prompt_label(run_prompts['task'])}")
+    parts.extend(f"Task: {agent_prompt_label(task)}" for task in run_prompts["tasks"])
     return parts
 
 
@@ -3383,9 +3463,10 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
     corpus_prompt = get_active_corpus_prompt(corpus_config)
     global_prompts = [p for p in library["prompts"] if p.get("global") and p.get("text", "").strip()]
     task_prompts = [p for p in library["prompts"] if not p.get("global")]
-    active = resolve_run_prompts(library, corpus_config)["task"]
-    add_agent_border_style("[class*='st-key-use_agent_prompt_'] button", ".st-key-active_agent_task")
-    st.html("<style>.st-key-active_agent_task { padding: 0.1rem 0.25rem 0.1rem 0.75rem !important; }</style>")
+    active = resolve_run_prompts(library, corpus_config)["tasks"]
+    active_ids = {task["id"] for task in active}
+    add_agent_border_style("[class*='st-key-use_agent_prompt_'] button", "[class*='st-key-active_agent_task']")
+    st.html("<style>[class*='st-key-active_agent_task'] { padding: 0.1rem 0.25rem 0.1rem 0.75rem !important; }</style>")
 
     with st.container(border=True, gap="xsmall"):
         with st.container(horizontal=True, vertical_alignment="center"):
@@ -3417,7 +3498,7 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
             with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
                 st.caption(f"{title}:")
                 for prompt in prompts:
-                    is_active = bool(active and active["id"] == prompt["id"])
+                    is_active = prompt["id"] in active_ids
                     agent = is_agent_prompt(prompt)
                     st.button(
                         truncate_text(agent_prompt_label(prompt), 34 if agent else 28),
@@ -3426,28 +3507,29 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
                         help=(f"**Agent** — ends by sending {OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()} "
                               f"to the outbox: *{agent_command(prompt)}*\n\n" if agent else "") + prompt["text"],
                         type="primary" if is_active else "secondary",
-                        on_click=clear_active_task_prompt if is_active else set_active_task_prompt,
-                        args=() if is_active else (prompt["id"],),
+                        on_click=remove_active_task_prompt if is_active else set_active_task_prompt,
+                        args=(prompt["id"],),
                     )
 
         with st.container(horizontal=True, vertical_alignment="center", gap="small"):
-            if active:
-                agent = is_agent_prompt(active)
+            for task in active:
+                agent = is_agent_prompt(task)
                 with st.container(
                     horizontal=True,
                     vertical_alignment="center",
                     gap="xsmall",
                     width="content",
                     border=agent,
-                    key="active_agent_task" if agent else "active_task",
+                    key=f"active_{'agent_' if agent else ''}task_{task['id']}",
                 ):
-                    st.markdown(f"**Task:** {agent_prompt_label(active)}", help=active["text"], width="content")
+                    st.markdown(f"**Task:** {agent_prompt_label(task)}", help=task["text"], width="content")
                     st.button(
                         ":material/close:",
                         type="tertiary",
-                        key="clear_task_prompt",
-                        on_click=clear_active_task_prompt,
-                        help="Remove the task",
+                        key=f"clear_task_prompt_{task['id']}",
+                        on_click=remove_active_task_prompt,
+                        args=(task["id"],),
+                        help="Remove this task",
                     )
             if task_prompts:
                 # A dropdown can't style single options, so Agents show what they draft instead.
@@ -4489,11 +4571,14 @@ def start_needs_work(agent: dict) -> None:
     agent["rejected"], agent["staged"], agent["needs_work"] = agent["staged"], None, True
 
 
-def send_staged_to_outbox(search_state: dict, prompt: dict, source_notes: list[tuple[str, Path | None]]) -> None:
+def send_staged_to_outbox(
+    search_state: dict, prompts: list[dict], source_notes: list[tuple[str, Path | None]]
+) -> None:
     agent = search_state["agent"]
     staged = agent["staged"]
     try:
-        path = write_handoff_package(build_handoff_package(search_state, prompt, staged, source_notes), get_outbox_dir())
+        package = build_handoff_package(search_state, prompts, staged, source_notes)
+        path = write_handoff_package(package, get_outbox_dir())
     except Exception as exc:
         agent["send_error"] = f"Couldn't write to the outbox: {exc}"
         return
@@ -4559,25 +4644,33 @@ def render_agent_panel(
 ) -> None:
     """Agent workflow under the discussion: step buttons, Agent:<name> to stage, That's right / Needs work."""
     agent = search_state["agent"]
-    # Read the prompt live, so edits made in the prompt library apply on the next click.
-    prompt = find_prompt(load_prompt_library(), agent["prompt"]["id"]) or agent["prompt"]
-    label = agent_prompt_label(prompt)
-    item_kind = OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()
+    # Read the prompts live, so edits made in the prompt library apply on the next click. Searches from
+    # before several Agents could be injected hold one "prompt".
+    library = load_prompt_library()
+    prompts = [find_prompt(library, p["id"]) or p for p in agent.get("prompts") or [agent["prompt"]]]
+    several = len(prompts) > 1
+    label = " + ".join(agent_prompt_label(prompt) for prompt in prompts)
+    item_kind = " and ".join(OUTPUT_TYPES[get_prompt_output_type(prompt)].lower() for prompt in prompts)
     add_agent_border_style(".st-key-agent_panel", ".st-key-agent_run button", ".st-key-agent_staging")
 
     with st.container(border=True, key="agent_panel"):
         with st.container(horizontal=True, vertical_alignment="center"):
             st.markdown(f"**{label}**", width="content")
-            st.link_button(
-                "Edit prompt workflow",
-                f"{PROMPT_LIBRARY_PAGE_URL}&prompt={prompt['id']}",
-                icon=":material/open_in_new:",
-                type="tertiary",
-                help="Opens this Agent's steps and Action Command in the prompt library, in a new tab.",
-            )
-        steps = [s for s in prompt.get("steps", []) if s.get("text", "").strip()]
-        if steps:
-            with st.container(horizontal=True, gap="xsmall"):
+            for prompt in prompts:
+                st.link_button(
+                    f"Edit {prompt['name']}" if several else "Edit prompt workflow",
+                    f"{PROMPT_LIBRARY_PAGE_URL}&prompt={prompt['id']}",
+                    icon=":material/open_in_new:",
+                    type="tertiary",
+                    help="Opens this Agent's steps and Action Command in the prompt library, in a new tab.",
+                )
+        for prompt in prompts:
+            steps = [s for s in prompt.get("steps", []) if s.get("text", "").strip()]
+            if not steps:
+                continue
+            with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
+                if several:
+                    st.caption(f"{prompt['name']}:")
                 for number, step in enumerate(steps, 2):
                     if st.button(f"{number} · {step['name']}", key=f"agent_step_{step['id']}", help=step["text"]):
                         if add_discussion_turn(
@@ -4604,12 +4697,17 @@ def render_agent_panel(
             key="agent_run",
             icon=":material/smart_toy:",
             use_container_width=True,
-            help=f"**Action Command:** {agent_command(prompt)}\n\nStages what you've agreed so you can check it first.",
+            help=(
+                "**Action Command" + ("s" if several else "") + ":** "
+                + "; ".join(agent_command(prompt) for prompt in prompts)
+                + "\n\nStages what you've agreed so you can check it first"
+                + (", asking the model once per Agent; it's all sent as one package." if several else ".")
+            ),
         ):
             with st.spinner(f"`{model_name}` is staging the {item_kind}…"):
                 try:
-                    agent["staged"] = stage_agent_items(
-                        search_state, prompt, model_name, max_tokens, temperature, corpus_prompt
+                    agent["staged"] = stage_agent_batch(
+                        search_state, prompts, model_name, max_tokens, temperature, corpus_prompt
                     )
                     agent["needs_work"] = False
                 except Exception as exc:
@@ -4647,7 +4745,7 @@ def render_agent_panel(
                     type="primary",
                     icon=":material/check:",
                     on_click=send_staged_to_outbox,
-                    args=(search_state, prompt, source_notes),
+                    args=(search_state, prompts, source_notes),
                     disabled=not staged["items"],
                     use_container_width=True,
                     help=f"Write these to the outbox ({get_outbox_dir()}).",
@@ -7451,7 +7549,7 @@ with ask_box_col:
         # The injected prompt's links (e.g. Salesforce, the connector app), between the question and its token.
         last_search_state = st.session_state.get(LAST_SEARCH_KEY)
         render_prompt_links(
-            resolve_run_prompts(prompt_library, corpus_config)["task"],
+            resolve_run_prompts(prompt_library, corpus_config)["tasks"],
             prompt_library,
             best_guess(prompt_text, search_filter, last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
         )
@@ -7472,7 +7570,7 @@ with ask_box_col:
             render_ask_prompt_panel(prompt_library, corpus_config)
             # A task prompt with its own model preselects it. The box has no key, so its default changes with
             # the prompt; picking another model here overrides it for this run.
-            prompt_model = (resolve_run_prompts(prompt_library, corpus_config)["task"] or {}).get("model")
+            prompt_model = first_prompt_model(resolve_run_prompts(prompt_library, corpus_config)["tasks"])
             answer_model = prompt_model if prompt_model in ollama_model_options else default_ollama
             tokens_key = f"llm_max_tokens_{safe_lib}"
             saved_tokens = int(st.session_state.get(tokens_key, corpus_config["llm_max_tokens"]))
@@ -7631,7 +7729,8 @@ elif new_search and (prompt_text or run_filter_only):
             add_folder_paths(final_results, library_folder, corpus_root_path)
             # Corpus prompts describe one library's author role, so skip them across libraries.
             search_corpus_prompt = "" if search_all_libraries else run_prompts["corpus"]
-            task_prompt = run_prompts["task"]
+            tasks = run_prompts["tasks"]
+            agents = [task for task in tasks if is_agent_prompt(task)]
             search_state = {
                 "filter_only": filter_only_clicked,
                 "library": state_library,
@@ -7658,23 +7757,24 @@ elif new_search and (prompt_text or run_filter_only):
                 ),
                 # An Agent's first answer comes from its collection prompt (step 1), told where it's heading.
                 "task_prompt": (
-                    build_agent_task_prompt(task_prompt, final_results) if is_agent_prompt(task_prompt)
-                    else task_prompt["text"] if task_prompt else ""
+                    build_agent_task_prompt(agents, final_results) if agents
+                    else tasks[0]["text"] if tasks else ""
                 ),
                 "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt),
                 "library_display": selected_lib if state_library == safe_lib else "All libraries",
                 "id": uuid.uuid4().hex[:8],  # keys this search's per-note widgets
                 "left_out_notes": [],
-                "prompt_model": (task_prompt or {}).get("model") or None,
+                "prompt_model": first_prompt_model(tasks),
                 # The Agent workflow (step buttons, staging, sent batches) lives under the discussion.
                 "agent": (
-                    {"prompt": dict(task_prompt), "staged": None, "rejected": None, "needs_work": False, "sent": []}
-                    if use_llm_answer and is_agent_prompt(task_prompt) else None
+                    {"prompts": [dict(a) for a in agents], "staged": None, "rejected": None, "needs_work": False,
+                     "sent": []}
+                    if use_llm_answer and agents else None
                 ),
             }
             # A chosen task can drive the answer on its own, e.g. after an exact-text search.
             if final_results and use_llm_answer and (
-                search_state["question"] or (task_prompt and not filter_only_clicked)
+                search_state["question"] or (tasks and not filter_only_clicked)
             ):
                 with llm_progress(search_progress_slot, f"Generating answer with `{selected_ollama_model}`…") as report:
                     try:
@@ -7688,8 +7788,8 @@ elif new_search and (prompt_text or run_filter_only):
                             task_prompt=search_state["task_prompt"],
                             on_progress=report,
                         )
-                        if task_prompt:
-                            mark_prompt_used(task_prompt["id"])
+                        for task in tasks:
+                            mark_prompt_used(task["id"])
                     except Exception as llm_exc:
                         search_state["answer_error"] = str(llm_exc)
                 # Keep this run's speed for the model, and show it under Search now the spinner has gone.

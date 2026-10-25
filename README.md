@@ -324,7 +324,7 @@ Four example task prompts are added the first time; edit or delete them freely.
 **In the Ask panel** (shown when **Answer with LLM** is on), the compact **Prompt library** box sits above the model settings and has:
 
 - **Always** — About me, the corpus prompt and each global prompt, ticked. Untick one to leave it out of this run.
-- **Task** — click a prompt to attach it (click it again, or **✕**, to remove it); your question still decides which notes are found, and the task tells the LLM what to write from them. The task also applies to follow-up questions. On the **Literal** search route, a task can produce an answer even without a question.
+- **Task** — click a prompt to attach it (click it again, or **✕**, to remove it). Agents add up: click **Agent:SF_Next_Step** and **Agent:SF_Tasks** to do both in one action (see [Several Agents at once](#several-agents-at-once)); a plain prompt replaces whatever was attached, and an Agent replaces a plain prompt; your question still decides which notes are found, and the task tells the LLM what to write from them. The task also applies to follow-up questions. On the **Literal** search route, a task can produce an answer even without a question.
 - **Recent** — titles of the five task prompts most recently used for an answer, newest first. **Starred** — up to five starred prompts not already in Recent, most recently used first, so favourites fill the gap. Hover a title to see the full prompt.
 - **Find a prompt** — search every task prompt by name or tag.
 - **Agent prompts** read *Agent:Name* (e.g. *Agent:SF_Tasks*) and have a blue border: on the Recent and Starred buttons, on the chosen **Task**, and on the prompt token under the question box. **Find a prompt** shows the same *Agent:* names.
@@ -341,6 +341,15 @@ Choose an Agent as the task and **Search**. Its collection prompt (step 1) write
 2. **Narrow the sources.** Untick a note under **Sources** to leave it out of the following replies and of what the Agent stages. The discussion caption says how many notes are in use.
 3. **Stage.** Click **Agent:Name** (blue outline; hover it to see the Action Command). The LLM turns what you agreed into exact records and shows them in a staging box with a one-line summary. Nothing has been sent yet. Remove any record with ✕.
 4. **That's right** writes the staged records to the outbox as one package (checked against `schemas/handoff.v1.schema.json`); each record in it becomes its own task, note or email in the other system. Under each sent package, **View in outbox** opens the Actions page in a new tab, filtered to that package. **Needs work** discards them and asks what's wrong; your explanation goes into the discussion (with the rejected list, so the LLM knows what to fix), and you carry on refining and stage again.
+
+#### Several Agents at once
+
+Attach more than one Agent, e.g. **Agent:SF_Next_Step** and **Agent:SF_Tasks**, to update Next Steps and create tasks in one action. Each shows as its own token under the question and its own **Task** box; **✕** removes just that one.
+
+- **First answer:** each Agent's collection prompt is a part of one request (*Part 1: SF_Next_Step*, *Part 2: SF_Tasks*), answered under its own heading, with items numbered across all parts so *Yes:1,3 ignore 2* still works.
+- **Agent box:** titled *Agent:SF_Next_Step + Agent:SF_Tasks*, with an **Edit** link and a row of step buttons for each Agent.
+- **Stage:** the model is asked once per Agent (each told it covers only its part), and everything lands in one staging box.
+- **That's right** sends one package. When the records differ in type it's a *mixed* `llm-notes-handoff/v2` package, and its prompt reads *SF_Next_Step + SF_Tasks*. The connector must have every type in it switched on (`item_types`), or it skips the whole package.
 
 Unknown values stay empty; nothing is guessed. **Related to** is a name (e.g. *Acme pilot*), not a link; the receiving system finds the matching record. You can stage and send more than once in the same discussion; each **That's right** is a new package.
 
