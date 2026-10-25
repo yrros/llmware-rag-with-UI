@@ -1773,6 +1773,15 @@ def find_reference_record(name: str) -> dict | None:
     return next((r for r in reference_records() if r["name"].strip().lower() == wanted), None) if wanted else None
 
 
+def reference_record_link(record: dict) -> str:
+    """A markdown link to the record's page in the other system, e.g. "[Open in Salesforce ↗](…)", or ""."""
+    url = str(record.get("url") or "")
+    if not url.startswith("https://"):
+        return ""
+    source = str((load_reference_snapshot() or {}).get("source") or "").strip()
+    return f"[Open in {source.title() if source else 'the other system'} ↗]({url})"
+
+
 def describe_reference_record(record: dict) -> str:
     parts = [record.get("account") or "", f"stage {record['stage']}" if record.get("stage") else "",
              f"updated {record['last_updated']}" if record.get("last_updated") else ""]
@@ -4440,7 +4449,8 @@ def render_reference_picker(agent: dict, index: int, item: dict) -> None:
     related = item["related_to"]
     match = find_reference_record(related["name"]) if related["kind"] in ("", "opportunity") else None
     if match:
-        st.caption(f"✓ Opportunity *{match['name']}* · {describe_reference_record(match)}")
+        link = reference_record_link(match)
+        st.caption(f"✓ Opportunity *{match['name']}* · {describe_reference_record(match)}" + (f" · {link}" if link else ""))
     elif related["name"] and related["kind"] in ("", "opportunity"):
         st.caption(f"⚠ *{related['name']}* isn't an open opportunity in the reference: choose one below, or the "
                    "connector will hold it.")
