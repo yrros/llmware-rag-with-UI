@@ -1255,6 +1255,7 @@ DEFAULT_TASK_PROMPTS = (
         ),
         "tags": ["email", "meeting"],
         "starred": True,
+        "agent": True,
         "output": "email",
     },
     {
@@ -1265,6 +1266,7 @@ DEFAULT_TASK_PROMPTS = (
         ),
         "tags": ["tasks"],
         "starred": True,
+        "agent": True,
         "output": "task",
     },
     {
@@ -1274,6 +1276,7 @@ DEFAULT_TASK_PROMPTS = (
             "risks or blockers, and the next step. Plain language, no more than 150 words."
         ),
         "tags": ["client", "update"],
+        "agent": True,
         "output": "note",
     },
     {
@@ -1285,13 +1288,21 @@ DEFAULT_TASK_PROMPTS = (
 
 
 def new_prompt_record(
-    name: str, text: str, *, global_prompt: bool = False, tags=None, starred: bool = False, output: str = "text"
+    name: str,
+    text: str,
+    *,
+    global_prompt: bool = False,
+    tags=None,
+    starred: bool = False,
+    agent: bool = False,
+    output: str = "text",
 ) -> dict:
     return {
         "id": uuid.uuid4().hex[:12],
         "name": name.strip(),
         "text": text.strip(),
         "global": bool(global_prompt),
+        "agent": bool(agent),
         "output": output,
         "tags": clean_filter_terms(tags or []),
         "starred": bool(starred),
@@ -1315,6 +1326,9 @@ def load_prompt_library() -> dict:
             library = {}
         library.setdefault("profile", {"text": "", "enabled": True})
         library.setdefault("prompts", [])
+        for prompt in library["prompts"]:
+            # Libraries saved before Agent existed: prompts that already drafted output become Agents.
+            prompt.setdefault("agent", prompt.get("output", "text") in DRAFT_OUTPUT_TYPES and not prompt.get("global"))
         return library
     return save_prompt_library(
         {
@@ -1325,6 +1339,7 @@ def load_prompt_library() -> dict:
                     p["text"],
                     tags=p.get("tags"),
                     starred=p.get("starred", False),
+                    agent=p.get("agent", False),
                     output=p.get("output", "text"),
                 )
                 for p in DEFAULT_TASK_PROMPTS
@@ -1407,6 +1422,9 @@ def build_prompt_context(corpus_prompt: str = "", profile_text: str = "", global
 # ---------------------------------------------------------------------------
 
 OUTPUT_TYPES = {"text": "Text answer", "note": "Note", "task": "Tasks", "email": "Email"}
+DRAFT_OUTPUT_TYPES = [t for t in OUTPUT_TYPES if t != "text"]  # what an Agent prompt can send to the outbox
+DEFAULT_AGENT_OUTPUT = "task"
+AGENT_BORDER_COLOR = "#1c83e1"
 HANDOFF_SCHEMA_ID = "llm-notes-handoff/v1"
 HANDOFF_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "handoff.v1.schema.json"
 DEFAULT_OUTBOX_DIR = PROJECT_DIR / "outbox"
@@ -1432,9 +1450,16 @@ STRUCTURED_RELATED_GUIDE = (
 )
 
 
+def is_agent_prompt(prompt: dict | None) -> bool:
+    return bool(prompt and prompt.get("agent") and not prompt.get("global"))
+
+
 def get_prompt_output_type(prompt: dict | None) -> str:
-    output = (prompt or {}).get("output", "text")
-    return output if output in OUTPUT_TYPES else "text"
+    """Only Agent prompts draft output for the outbox; every other prompt gets a text answer."""
+    if not is_agent_prompt(prompt):
+        return "text"
+    output = prompt.get("output", "")
+    return output if output in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
 
 
 def structured_output_schema(item_type: str) -> dict:
@@ -1670,15 +1695,19 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
     value = st.session_state.get(f"prompt_{field}_{prompt_id}")
     if field == "tags":
         value = clean_filter_terms(value)
-    elif field in ("global", "starred"):
+    elif field in ("global", "starred", "agent"):
         value = bool(value)
     elif field == "output":
-        value = value if value in OUTPUT_TYPES else "text"
+        value = value if value in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
     else:
         value = str(value or "").strip()
         if not value:
             return  # keep the old name/text rather than saving an empty prompt
     update_prompt(prompt_id, **{field: value})
+    if field == "agent" and value:
+        prompt = find_prompt(load_prompt_library(), prompt_id)
+        if prompt and prompt.get("output") not in DRAFT_OUTPUT_TYPES:
+            update_prompt(prompt_id, output=DEFAULT_AGENT_OUTPUT)
     if field in ("name", "text"):
         mark_text_saved(f"prompt_{prompt_id}")
 
@@ -1689,15 +1718,21 @@ def add_prompt_from_form() -> None:
     if not name or not text:
         st.session_state["add_prompt_error"] = "Give the prompt a name and some text."
         return
+    global_prompt = bool(st.session_state.get("new_prompt_global", False))
+    agent = bool(st.session_state.get("new_prompt_agent", False))
+    if global_prompt and agent:
+        st.session_state["add_prompt_error"] = "A prompt can be Global or Agent, not both."
+        return
     library = load_prompt_library()
     library["prompts"].append(
         new_prompt_record(
             name,
             text,
-            global_prompt=bool(st.session_state.get("new_prompt_global", False)),
+            global_prompt=global_prompt,
             tags=st.session_state.get("new_prompt_tags", []),
             starred=bool(st.session_state.get("new_prompt_starred", False)),
-            output=st.session_state.get("new_prompt_output", "text"),
+            agent=agent,
+            output=st.session_state.get("new_prompt_output", DEFAULT_AGENT_OUTPUT) if agent else "text",
         )
     )
     save_prompt_library(library)
@@ -1725,7 +1760,9 @@ def common_prompt_tags(library: dict, limit: int = 8) -> list[str]:
 
 def render_prompt_card(prompt: dict) -> None:
     prompt_id = prompt["id"]
-    with st.container(border=True):
+    agent = is_agent_prompt(prompt)
+    # The key gives the card a CSS class; Agent cards get a blue border (see render_prompt_library_page).
+    with st.container(border=True, key=f"{'agent' if agent else 'task'}_prompt_card_{prompt_id}"):
         with st.container(horizontal=True, vertical_alignment="center"):
             st.text_input(
                 "Name",
@@ -1762,9 +1799,11 @@ def render_prompt_card(prompt: dict) -> None:
                 key=f"prompt_global_{prompt_id}",
                 on_change=save_prompt_field,
                 args=(prompt_id, "global"),
+                disabled=agent,
                 help=(
                     "Send this with **every** LLM request in **every** corpus, like About me — for standing "
-                    "instructions. It can still be left out of a single run in the Ask panel."
+                    "instructions. It can still be left out of a single run in the Ask panel. "
+                    "Not available for Agent prompts."
                 ),
             )
             st.checkbox(
@@ -1775,23 +1814,32 @@ def render_prompt_card(prompt: dict) -> None:
                 args=(prompt_id, "starred"),
                 help="Starred prompts fill the Ask panel's Starred row.",
             )
-            st.selectbox(
-                "Output",
-                options=list(OUTPUT_TYPES),
-                index=list(OUTPUT_TYPES).index(get_prompt_output_type(prompt)),
-                format_func=OUTPUT_TYPES.get,
-                key=f"prompt_output_{prompt_id}",
+            st.checkbox(
+                "Agent",
+                value=agent,
+                key=f"prompt_agent_{prompt_id}",
                 on_change=save_prompt_field,
-                args=(prompt_id, "output"),
+                args=(prompt_id, "agent"),
                 disabled=bool(prompt.get("global")),
-                width=150,
-                label_visibility="collapsed",
                 help=(
-                    "**Text answer** — the LLM writes prose. **Note**, **Tasks** or **Email** — it drafts records "
-                    "you can review and send to the outbox for another system (e.g. Salesforce). "
-                    "Not used for global prompts."
+                    "Agent prompts draft a **Note**, **Tasks** or an **Email** instead of a text answer. You review "
+                    "the drafts and send them to the outbox for another system (e.g. Salesforce). Only Agent prompts "
+                    "send to the outbox. Not available for Global prompts."
                 ),
             )
+            if agent:
+                st.selectbox(
+                    "Output",
+                    options=DRAFT_OUTPUT_TYPES,
+                    index=DRAFT_OUTPUT_TYPES.index(get_prompt_output_type(prompt)),
+                    format_func=OUTPUT_TYPES.get,
+                    key=f"prompt_output_{prompt_id}",
+                    on_change=save_prompt_field,
+                    args=(prompt_id, "output"),
+                    width=150,
+                    label_visibility="collapsed",
+                    help="What this Agent drafts for the outbox.",
+                )
             st.multiselect(
                 "Tags",
                 options=prompt.get("tags", []),
@@ -1810,11 +1858,34 @@ def render_prompt_card(prompt: dict) -> None:
 def render_prompt_library_page() -> None:
     """Prompt library page (opened in its own tab): About me, corpus prompt, task prompts."""
     library = load_prompt_library()
+    st.html(f"<style>[class*='st-key-agent_prompt_card_'] {{ border-color: {AGENT_BORDER_COLOR} !important; }}</style>")
     st.title("Prompt library")
     st.caption(
         "Shape what the LLM is told when it answers from your notes. Each request is built in this order: "
         "today's date → About me → corpus prompt → global prompts → your notes and question → the task you pick."
     )
+
+    outbox = get_outbox_dir()
+    waiting = len([p for p in outbox.glob("*.json") if not p.name.startswith(".")]) if outbox.is_dir() else 0
+    with st.expander(
+        f"Outbox · {waiting} waiting",
+        expanded=False,
+        key="prompt_page_outbox_open",
+        icon=":material/outbox:",
+    ):
+        st.caption(
+            "Drafts you send from an **Agent** prompt are written here as JSON files. A separate connector "
+            "(e.g. Salesforce) picks them up and moves each to processed/ or failed/ with a receipt."
+        )
+        st.text_input(
+            "Outbox folder",
+            value=str(outbox),
+            key="outbox_path_input",
+            on_change=persist_outbox_path,
+            help="Must match the folder your connector reads. Leave empty for the default.",
+        )
+        counts = {folder: len(list((outbox / folder).glob("*.receipt.json"))) for folder in HANDOFF_RESULT_DIRS}
+        st.caption(f"Waiting: **{waiting}** · Processed: **{counts['processed']}** · Failed: **{counts['failed']}**")
 
     profile = library["profile"]
     profile_on = bool(profile.get("enabled", True) and str(profile.get("text", "")).strip())
@@ -1874,7 +1945,9 @@ def render_prompt_library_page() -> None:
         st.subheader("Task prompts")
         st.caption(
             "Pick a task in the Ask panel to tell the LLM what to write from the notes. Tick **Global** to "
-            "send a prompt with every request instead. Tags help you find prompts; tick **Starred** for the ones you use most."
+            "send a prompt with every request instead. Tick **Agent** to draft a note, tasks or an email to send "
+            "to the outbox; Agent prompts have a blue border. Tags help you find prompts; tick **Starred** for the "
+            "ones you use most."
         )
         with st.container(horizontal=True, vertical_alignment="bottom"):
             query = st.text_input(
@@ -1891,6 +1964,11 @@ def render_prompt_library_page() -> None:
                 disabled=not query,
                 key="prompt_page_clear_search",
             )
+            agents_only = st.toggle(
+                "Agents only",
+                key="prompt_page_agents_only",
+                help="Show only Agent prompts, the ones that send drafts to the outbox.",
+            )
         keywords = common_prompt_tags(library)
         if keywords:
             with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
@@ -1903,8 +1981,11 @@ def render_prompt_library_page() -> None:
                         on_click=set_prompt_page_query,
                         args=(keyword,),
                     )
-        shown = [p for p in library["prompts"] if prompt_matches_query(p, query)]
-        if query.strip():
+        shown = [
+            p for p in library["prompts"]
+            if prompt_matches_query(p, query) and (is_agent_prompt(p) or not agents_only)
+        ]
+        if query.strip() or agents_only:
             st.caption(f"{len(shown)} of {len(library['prompts'])} prompts match.")
         if not shown:
             st.caption("No prompts match." if library["prompts"] else "No prompts yet — add one below.")
@@ -1924,14 +2005,20 @@ def render_prompt_library_page() -> None:
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.checkbox("Global", key="new_prompt_global", help="Send with every LLM request in every corpus.")
                 st.checkbox("Starred", key="new_prompt_starred", help="Show it in the Ask panel's Starred row.")
+                st.checkbox(
+                    "Agent",
+                    key="new_prompt_agent",
+                    help="Draft a note, tasks or an email to review and send to the outbox, instead of a text answer.",
+                )
                 st.selectbox(
                     "Output",
-                    options=list(OUTPUT_TYPES),
+                    options=DRAFT_OUTPUT_TYPES,
+                    index=DRAFT_OUTPUT_TYPES.index(DEFAULT_AGENT_OUTPUT),
                     format_func=OUTPUT_TYPES.get,
                     key="new_prompt_output",
                     width=150,
                     label_visibility="collapsed",
-                    help="Text answer, or drafts (note, tasks, email) to review and send to the outbox.",
+                    help="What an Agent prompt drafts. Ignored unless **Agent** is ticked.",
                 )
                 st.multiselect(
                     "Tags",
@@ -1946,24 +2033,6 @@ def render_prompt_library_page() -> None:
             st.warning(error)
         if added := st.session_state.pop("add_prompt_added", None):
             st.success(f"Added **{added}**.")
-
-    with st.container(border=True):
-        st.subheader("Outbox")
-        st.caption(
-            "Drafts you send from a Note, Tasks or Email prompt are written here as JSON files. A separate "
-            "connector (e.g. Salesforce) picks them up and moves each to processed/ or failed/ with a receipt."
-        )
-        outbox = get_outbox_dir()
-        st.text_input(
-            "Outbox folder",
-            value=str(outbox),
-            key="outbox_path_input",
-            on_change=persist_outbox_path,
-            help="Must match the folder your connector reads. Leave empty for the default.",
-        )
-        waiting = len([p for p in outbox.glob("*.json") if not p.name.startswith(".")]) if outbox.is_dir() else 0
-        counts = {folder: len(list((outbox / folder).glob("*.receipt.json"))) for folder in HANDOFF_RESULT_DIRS}
-        st.caption(f"Waiting: **{waiting}** · Processed: **{counts['processed']}** · Failed: **{counts['failed']}**")
 
     install_filter_commit_on_blur()
 
@@ -2116,12 +2185,15 @@ def render_prompt_library_sidebar(corpus_config: dict) -> None:
     profile = library["profile"]
     global_count = sum(1 for p in library["prompts"] if p.get("global"))
     task_count = len(library["prompts"]) - global_count
+    agent_count = sum(1 for p in library["prompts"] if is_agent_prompt(p))
     with st.sidebar.expander("Prompt Library", expanded=False):
         st.caption(
             f"About me: **{'on' if profile.get('enabled') and profile.get('text', '').strip() else 'off'}** · "
             f"Corpus prompt: **{'applied' if get_active_corpus_prompt(corpus_config) else 'off'}**"
         )
-        st.caption(f"Global prompts: **{global_count}** · Task prompts: **{task_count}**")
+        st.caption(
+            f"Global prompts: **{global_count}** · Task prompts: **{task_count}** (Agents: **{agent_count}**)"
+        )
         st.link_button(
             "Open prompt library",
             PROMPT_LIBRARY_PAGE_URL,

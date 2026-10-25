@@ -267,13 +267,13 @@ Open it from **Prompt Library → Open prompt library** in the left panel, or **
 
 | Section | What it does |
 |---------|--------------|
+| **Outbox** | Collapsed at the top. The folder that sent drafts are written to, and how many packages are waiting, processed and failed. See [Drafts and the outbox](#drafts-and-the-outbox). |
 | **About me** | One free-text box sent with every LLM request in every corpus — your name, where you're based, accessibility needs, how you like answers. Untick **Include in LLM requests** to switch it off. Today's date is always added. |
 | **Corpus prompt** | Pick a corpus and describe the role you wrote its notes in (e.g. business owner, salesperson). Tick **Apply corpus prompt** to send it for that corpus only. |
-| **Task prompts** | Reusable instructions such as "Write a meeting summary and next steps as an email". Each has a name, text, **Global** and **Starred** checkboxes, tags (for finding prompts) and a delete button. Edits save as you go, with a *Saved* time under the text. Tick **Global** to send a prompt with every request in every corpus, like About me — for standing instructions. Above the list: full-text search, **Clear search**, and **Common keywords** (tags from your most recently used prompts) to filter with one click. |
-| **Add a prompt** | Name, text, **Global**, **Starred**, **Output** and tags, then **Add prompt**. |
-| **Outbox** | The folder that sent drafts are written to, and how many packages are waiting, processed and failed. See [Drafts and the outbox](#drafts-and-the-outbox). |
+| **Task prompts** | Reusable instructions such as "Write a meeting summary and next steps as an email". Each has a name, text, **Global**, **Starred** and **Agent** checkboxes, tags (for finding prompts) and a delete button. Edits save as you go, with a *Saved* time under the text. Tick **Global** to send a prompt with every request in every corpus, like About me — for standing instructions. Tick **Agent** to make it draft output for the outbox (see below); Agent prompts have a blue border. Above the list: full-text search, **Clear search**, an **Agents only** switch, and **Common keywords** (tags from your most recently used prompts) to filter with one click. |
+| **Add a prompt** | Name, text, **Global**, **Starred**, **Agent**, the Agent's output and tags, then **Add prompt**. |
 
-Each task prompt also has an **Output**: **Text answer** (the default) or **Note**, **Tasks** or **Email**, which turn the answer into drafts you can send to the outbox.
+**Agent prompts** are the only prompts that send anything to the outbox. Instead of a text answer, an Agent drafts a **Note**, **Tasks** or an **Email** (pick which in the box next to **Agent**; it defaults to Tasks) for you to review and send. A prompt can be Global or Agent, not both. Prompt libraries saved before Agent existed are upgraded on load: prompts that were already set to draft a note, tasks or an email become Agents.
 
 Four example task prompts are added the first time; edit or delete them freely.
 
@@ -290,7 +290,7 @@ Requires Ollama running locally (`localhost:11434`).
 
 ### Drafts and the outbox
 
-When the task prompt's **Output** is **Note**, **Tasks** or **Email**, the LLM writes drafts instead of prose (the built-in **Action items** prompt drafts tasks). They appear under the answer as editable cards:
+When the task prompt is an **Agent**, the LLM writes drafts instead of prose (the built-in **Action items** Agent drafts tasks). They appear under the answer as editable cards:
 
 1. Review and edit each draft. Untick a draft to leave it out. Leave a field empty when the notes don't say; nothing is guessed.
 2. **Related to** and **Kind** name the client, deal or person a draft belongs to (e.g. *Acme pilot*, *Opportunity*). They are a name, not a link; the receiving system finds the matching record.
