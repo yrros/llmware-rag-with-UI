@@ -327,6 +327,15 @@ Choose an Agent as the task and **Search**. Its collection prompt (step 1) write
 
 Unknown values stay empty; nothing is guessed. **Related to** is a name (e.g. *Acme pilot*), not a link; the receiving system finds the matching record. You can stage and send more than once in the same discussion; each **That's right** is a new package.
 
+**Reference snapshot (real record names).** If the task executor provides one, `outbox/reference/opportunities.json` (format `llm-notes-reference/v1`, see `schemas/reference.v1.schema.json`) lists current records from the other system, e.g. the Salesforce connector's open opportunities with recent activity: name, account, stage, last updated, last activity and description. This app only reads it; it never contacts the other system. With a snapshot:
+
+- the Agent is given the real names and told to use one exactly in **Related to** (or leave it empty rather than invent one);
+- in the staging box each item shows **✓** with the record's account, stage and last update when it matches, or **⚠** when it doesn't (the connector would hold it), and a picker to choose the right record (notes must be linked; tasks can also be standalone);
+- **best guess search** links prefer a record whose name or account appears in your question;
+- the Agent box says how many records the snapshot holds and when it was refreshed. Refresh it from the task executor (the Salesforce Connector app refreshes it on every scheduled run and with **Refresh now**).
+
+The snapshot holds customer data, stays in the gitignored outbox folder and is only sent to your local Ollama model. The starter Agent **SF_Opp_Notes** (in the prompt library) summarises what your notes say about each opportunity and stages one note per chosen opportunity, linked to it in Salesforce.
+
 The app never contacts another system. A separate connector (for example [rag-action-interface](https://github.com/yrros/rag-action-interface) for Salesforce) reads the outbox, moves each package to `outbox/processed/` or `outbox/failed/`, and leaves a `<package name>.receipt.json` beside it. The Agent box shows each sent package's result once its receipt appears: what was created, and why anything wasn't.
 
 **Outbox status line.** The top of every page shows, e.g., *Outbox: 2 waiting (7 items) · 1 needs attention · Last processed 25 Oct 10:42 · Last error 24 Oct 18:03 · Open Actions*. "Waiting" counts packages not yet picked up and the records in them; "needs attention" counts packages in `failed/`, including items held for you to choose a record; the dates come from the connector's receipts.
@@ -472,6 +481,7 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 | `Installer.sh` | Creates `venv`, installs dependencies, and builds Desktop `LLM-Notes.app` |
 | `reset_rag.sh` | Deletes indexes, vectors, histories and temp files; keeps models and settings |
 | `schemas/handoff.v1.schema.json` | Format of the packages written to the outbox (`llm-notes-handoff/v1`), shared with connectors |
+| `schemas/reference.v1.schema.json` | Format of the read-only reference snapshot a connector writes to `outbox/reference/` (`llm-notes-reference/v1`) |
 | `.gitignore` | Excludes `llmware_data/`, `outbox/`, venvs, `__pycache__` |
 
 ---

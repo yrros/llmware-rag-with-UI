@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "llm-notes-reference/v1",
+  "title": "LLM Notes reference snapshot (v1)",
+  "description": "A small read-only copy of current records in another system, written by a connector to <outbox>/reference/ for RAG Workspace Manager to read. The notes app never contacts that system; it uses the snapshot to pick real record names and show their current state. Each refresh overwrites the file.",
+  "type": "object",
+  "required": ["schema", "source", "target", "generated_at", "scope", "records"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "llm-notes-reference/v1" },
+    "source": { "type": "string", "description": "The system the records come from, e.g. salesforce." },
+    "target": { "type": "string", "description": "e.g. sandbox or production." },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "scope": { "type": "string", "description": "Which records are included, in words." },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "id", "name", "account", "stage", "last_updated", "last_activity", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "enum": ["opportunity"] },
+          "id": { "type": "string" },
+          "name": { "type": "string", "description": "The record's exact name, used as a related_to name hint." },
+          "account": { "type": "string", "description": "The prospect or customer, or empty." },
+          "stage": { "type": "string" },
+          "last_updated": { "type": "string", "description": "YYYY-MM-DD the record last changed." },
+          "last_activity": { "type": "string", "description": "YYYY-MM-DD of the latest task or event, or empty." },
+          "description": { "type": "string", "description": "Trimmed to 2000 characters." }
+        }
+      }
+    }
+  }
+}

@@ -1586,14 +1586,74 @@ def agent_command(prompt: dict) -> str:
     return str(prompt.get("command", "")).strip() or DEFAULT_AGENT_COMMANDS[get_prompt_output_type(prompt)]
 
 
+# --- Reference snapshot: current records a connector copied from the other system (read-only) -----------
+# The connector writes `llm-notes-reference/v1` files to <outbox>/reference/; this app only reads them, so it
+# never contacts the other system. They let the Agent use real record names and show their current state.
+
+REFERENCE_SCHEMA_ID = "llm-notes-reference/v1"
+REFERENCE_FILE = "opportunities.json"
+REFERENCE_PROMPT_LIMIT = 80  # records listed to the model; the snapshot is newest-updated first
+_reference_cache: dict = {}
+
+
+def load_reference_snapshot() -> dict | None:
+    """The connector's snapshot of open opportunities, or None if there isn't a valid one (re-read when it changes)."""
+    path = get_outbox_dir() / "reference" / REFERENCE_FILE
+    try:
+        stamp = path.stat().st_mtime
+    except OSError:
+        return None
+    if _reference_cache.get("key") != (str(path), stamp):
+        try:
+            snapshot = json.loads(path.read_text())
+        except (OSError, ValueError):
+            snapshot = None
+        if not isinstance(snapshot, dict) or snapshot.get("schema") != REFERENCE_SCHEMA_ID:
+            snapshot = None
+        _reference_cache.update(key=(str(path), stamp), snapshot=snapshot)
+    return _reference_cache["snapshot"]
+
+
+def reference_records() -> list[dict]:
+    snapshot = load_reference_snapshot()
+    return [r for r in (snapshot or {}).get("records", []) if isinstance(r, dict) and r.get("name")]
+
+
+def find_reference_record(name: str) -> dict | None:
+    """The snapshot record with exactly this name (ignoring case), as the connector matches it."""
+    wanted = (name or "").strip().lower()
+    return next((r for r in reference_records() if r["name"].strip().lower() == wanted), None) if wanted else None
+
+
+def describe_reference_record(record: dict) -> str:
+    parts = [record.get("account") or "", f"stage {record['stage']}" if record.get("stage") else "",
+             f"updated {record['last_updated']}" if record.get("last_updated") else ""]
+    return ", ".join(p for p in parts if p)
+
+
+def reference_prompt_text() -> str:
+    """The open opportunities, for the model to name in related_to (empty if there's no snapshot)."""
+    records = reference_records()[:REFERENCE_PROMPT_LIMIT]
+    if not records:
+        return ""
+    lines = "\n".join(f"- {r['name']} ({describe_reference_record(r)})" for r in records)
+    return (
+        "These are the open opportunities in the connected system. When an item is about one of them, set "
+        "related_to.name to its exact name and related_to.kind to \"opportunity\". If none fits, leave "
+        f"related_to empty rather than inventing a name.\n{lines}"
+    )
+
+
 def build_agent_task_prompt(prompt: dict) -> str:
     """Task for an Agent's first answer: its collection prompt, plus how to list items and where it's heading."""
+    reference = reference_prompt_text()
     return (
         f"{prompt['text'].strip()}\n\n"
         "Number every item you list (1, 2, 3…) so I can pick them by number, e.g. \"Yes:1,3 ignore 2\". "
         f"We will finish with this action: \"{agent_command(prompt)}\" "
         f"({OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()}). Ask me the questions you need answered "
         "to do that well, and don't guess anything the notes don't say."
+        + (f" Say which opportunity each item belongs to.\n\n{reference}" if reference else "")
     )
 
 
@@ -1630,8 +1690,9 @@ def link_status_dot(url: str) -> str:
 def best_guess(question: str, search_filter: dict | None, search_state: dict | None) -> str:
     """What the user is probably looking for, for best guess search links (no LLM involved).
 
-    In order: the Related to names of the Agent's staged or sent records, the first Must include filter
-    term, then capitalised names in the question (skipping the question's first word when there's another).
+    In order: the Related to names of the Agent's staged or sent records, a reference opportunity whose name
+    or account appears in the question (longest first), the first Must include filter term, then capitalised
+    names in the question (skipping the question's first word when there's another).
     """
     agent = (search_state or {}).get("agent") or {}
     for batch in [agent.get("staged"), *reversed(agent.get("sent") or [])]:
@@ -1639,6 +1700,14 @@ def best_guess(question: str, search_filter: dict | None, search_state: dict | N
             name = str((item.get("related_to") or {}).get("name", "")).strip()
             if name:
                 return name
+    asked = (question or "").lower()
+    if asked:
+        mentioned = [
+            (len(term), record["name"]) for record in reference_records()
+            for term in (record["name"], record.get("account") or "") if len(term) >= 3 and term.lower() in asked
+        ]
+        if mentioned:
+            return max(mentioned)[1]
     must_include = (search_filter or {}).get("all") or []
     if must_include:
         return str(must_include[0])
@@ -1769,6 +1838,7 @@ def stage_agent_items(
             f"{agent_command(prompt)}\n\nTurn what we have agreed in this conversation into records now. "
             "Include only the items I selected or agreed, with the details we agreed, and leave out anything "
             f"I said to ignore. {STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
+            + (f"\n\n{reference_prompt_text()}" if reference_records() else "")
         ),
     })
     reply, _usage = chat_with_ollama(
@@ -3900,6 +3970,65 @@ def describe_staged_item(item: dict) -> str:
 
 def unstage_item(agent: dict, index: int) -> None:
     agent["staged"]["items"].pop(index)
+    # Item positions shift, so drop the record pickers' remembered choices for this staging.
+    prefix = f"agent_ref_{agent['staged']['id']}_"
+    for key in [k for k in st.session_state if str(k).startswith(prefix)]:
+        del st.session_state[key]
+
+
+KEEP_RELATED = "__keep__"
+NO_RELATED = "__none__"
+
+
+def set_staged_related(agent: dict, index: int, widget_key: str) -> None:
+    """Apply the record picked for a staged item: a reference opportunity, or no record."""
+    choice = st.session_state.get(widget_key)
+    item = agent["staged"]["items"][index]
+    if choice == NO_RELATED:
+        item["related_to"] = {"name": "", "kind": ""}
+    elif choice and choice != KEEP_RELATED:
+        item["related_to"] = {"name": choice, "kind": "opportunity"}
+
+
+def render_reference_picker(agent: dict, index: int, item: dict) -> None:
+    """Under a staged item: whether its Related to is a real open opportunity, and a picker to choose one."""
+    records = reference_records()
+    if not records:
+        return
+    related = item["related_to"]
+    match = find_reference_record(related["name"]) if related["kind"] in ("", "opportunity") else None
+    if match:
+        st.caption(f"✓ Opportunity *{match['name']}* · {describe_reference_record(match)}")
+    elif related["name"] and related["kind"] in ("", "opportunity"):
+        st.caption(f"⚠ *{related['name']}* isn't an open opportunity in the reference: choose one below, or the "
+                   "connector will hold it.")
+    elif related["name"]:
+        st.caption(f"Related to {related['kind']} *{related['name']}* (only opportunities are in the reference).")
+    elif item["type"] == "note":
+        st.caption("⚠ A note must be linked to a record: choose its opportunity below.")
+    names = [r["name"] for r in records]
+    options = ([] if match else [KEEP_RELATED]) + names + ([] if item["type"] == "note" else [NO_RELATED])
+    by_name = {r["name"]: r for r in records}
+
+    def label(option: str) -> str:
+        if option == KEEP_RELATED:
+            return f"Keep “{related['name']}”" if related["name"] else "Choose an opportunity…"
+        if option == NO_RELATED:
+            return "No record (standalone)"
+        return f"{option} — {describe_reference_record(by_name[option])}"
+
+    widget_key = f"agent_ref_{agent['staged']['id']}_{index}"
+    st.selectbox(
+        "Opportunity",
+        options,
+        index=options.index(match["name"]) if match else 0,
+        format_func=label,
+        key=widget_key,
+        on_change=set_staged_related,
+        args=(agent, index, widget_key),
+        label_visibility="collapsed",
+        help="Open opportunities from the connector's reference snapshot. The connector links to the one you choose.",
+    )
 
 
 def start_needs_work(agent: dict) -> None:
@@ -4006,6 +4135,16 @@ def render_agent_panel(
             "Reply in the discussion to pick items (e.g. *Yes:1,2,3 ignore 4,5,6*), set dates and answer questions. "
             f"When it's right, stage the {item_kind}. Untick notes under Sources to narrow what the LLM uses."
         )
+        snapshot = load_reference_snapshot()
+        if snapshot:
+            refreshed = datetime.datetime.fromisoformat(snapshot["generated_at"]).strftime("%d %b %H:%M")
+            st.caption(
+                f"Reference: {len(reference_records())} {snapshot.get('scope', 'records')} from "
+                f"{snapshot.get('source', 'the connector')} ({snapshot.get('target', '?')}), refreshed {refreshed}. "
+                "The Agent uses their exact names; refresh it from the task executor."
+            )
+        else:
+            st.caption("No reference snapshot yet: the task executor can refresh one so the Agent uses real record names.")
         if st.button(
             label,
             key="agent_run",
@@ -4032,7 +4171,9 @@ def render_agent_panel(
                     st.info("Nothing to send: no agreed items were found. Choose **Needs work** and say what you want.")
                 for index, item in enumerate(staged["items"]):
                     item_col, remove_col = st.columns([0.92, 0.08])
-                    item_col.markdown(describe_staged_item(item))
+                    with item_col:
+                        st.markdown(describe_staged_item(item))
+                        render_reference_picker(agent, index, item)
                     with remove_col:
                         st.button(
                             ":material/close:",
