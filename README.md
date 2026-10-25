@@ -246,10 +246,10 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
    |---|---|---|
    | **Today** | `2026-10-25` | the same |
    | **-1 day** | `2026-10-24` | the same |
-   | **This week** | `2026` and `Week#43` | the 7 dates `2026-10-19` … `2026-10-25` |
-   | **-1 week** | `2026` and `Week#42` | the 7 dates `2026-10-12` … `2026-10-18` |
-   | **This month** | `2026-10` | the same |
-   | **-1 month** | `2026-09` | the same |
+   | **This wk** | `2026` and `Week#43` | the 7 dates `2026-10-19` … `2026-10-25` |
+   | **-1 wk** | `2026` and `Week#42` | the 7 dates `2026-10-12` … `2026-10-18` |
+   | **This mnth** | `2026-10` | the same |
+   | **-1 mnth** | `2026-09` | the same |
 
    Days match notes that contain the date as `YYYY-MM-DD`, and months every date in that month. In **Must include**, weeks match notes headed `Week#NN` in that year, using ISO weeks (Monday to Sunday; 29 Dec 2025 is 2026 `Week#1`). The year is its own term rather than a month, so a week that spans two months still matches. Because terms match anywhere, `Week#4` also matches `Week#40`–`Week#49`, which only matters in weeks 1–9. In **Any of** and **Exclude** a bare year would match, or exclude, the whole year, so weeks are the seven days instead. A bare four-digit number counts as a year, so a button would take a leftover one out too. Hover a button to see exactly what it puts in.
 
