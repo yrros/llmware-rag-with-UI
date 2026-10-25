@@ -267,13 +267,24 @@ Open it with the **Prompt library** button in the left panel (hover it for a sum
 
 | Section | What it does |
 |---------|--------------|
-| **Outbox** | Collapsed at the top. The folder that sent drafts are written to, and how many packages are waiting, processed and failed. See [Drafts and the outbox](#drafts-and-the-outbox). |
+| **Outbox** | Collapsed at the top. The folder that sent drafts are written to, and how many packages are waiting, processed and failed. See [Agents and the outbox](#agents-and-the-outbox). |
 | **About me** | One free-text box sent with every LLM request in every corpus — your name, where you're based, accessibility needs, how you like answers. Untick **Include in LLM requests** to switch it off. Today's date is always added. |
 | **Corpus prompt** | Pick a corpus and describe the role you wrote its notes in (e.g. business owner, salesperson). Tick **Apply corpus prompt** to send it for that corpus only. |
-| **Task prompts** | Reusable instructions such as "Write a meeting summary and next steps as an email". Each has a name, text, **Global**, **Starred** and **Agent** checkboxes, tags (for finding prompts) and a delete button. Edits save as you go, with a *Saved* time under the text. Tick **Global** to send a prompt with every request in every corpus, like About me — for standing instructions. Tick **Agent** to make it draft output for the outbox (see below); Agent prompts have a blue border. Above the list: full-text search, **Clear search**, an **Agents only** switch, and **Common keywords** (tags from your most recently used prompts) to filter with one click. |
-| **Add a prompt** | Name, text, **Global**, **Starred**, **Agent**, the Agent's output and tags, then **Add prompt**. |
+| **Task prompts** | Reusable instructions such as "Write a meeting summary and next steps as an email". Each has a name, text, **Global**, **Starred** and **Agent** checkboxes, a **Model** box, tags (for finding prompts) and a delete button. Edits save as you go, with a *Saved* time under the text. Tick **Global** to send a prompt with every request in every corpus, like About me — for standing instructions. Tick **Agent** to make it a workflow that ends by sending to the outbox (see below); Agent prompts have a blue border. **Model** picks the Ollama model used when you choose the prompt (see below). Above the list: full-text search, **Clear search**, an **Agents only** switch, and **Common keywords** (tags from your most recently used prompts) to filter with one click. |
+| **Add a prompt** | Name, text, **Global**, **Starred**, **Agent**, the Agent's output, **Model** and tags, then **Add prompt**. Add an Agent's steps and Action Command on its card afterwards. |
 
-**Agent prompts** are the only prompts that send anything to the outbox. Instead of a text answer, an Agent drafts a **Note**, **Tasks** or an **Email** (pick which in the box next to **Agent**; it defaults to Tasks) for you to review and send. A prompt can be Global or Agent, not both. Prompt libraries saved before Agent existed are upgraded on load: prompts that were already set to draft a note, tasks or an email become Agents.
+**Model per prompt.** Leave it on *Model: as selected* to use whatever is chosen in the Ask panel. Pick a model (any you have pulled into Ollama, e.g. a Qwen model) and choosing the prompt selects it as the **Ollama model** for the answer and as the **Follow-up model** for the discussion. You can still change either one in the Ask panel; that overrides it for the run. A model picked by a prompt doesn't become the corpus's saved default.
+
+**Agent prompts** are the only prompts that send anything to the outbox. Each is a workflow you refine as you use it:
+
+| Part | What it is |
+|------|------------|
+| **Step 1 · Collection** | The prompt text. It runs with the search: what to find in the notes, list (numbered, so you can pick by number) and ask about. |
+| **Steps 2, 3, …** | Optional. Each has a short name and a prompt, e.g. *Select tasks* ("List the tasks again and ask which to send") or *Set due dates*. They become one-click buttons in the Discussion panel. **Add step**, reorder with the arrows, remove with ✕. |
+| **Output** | What the Agent sends: **Note**, **Tasks** or **Email** (the box next to **Agent**). |
+| **Action Command** | The last step, e.g. *Send to tasks in Salesforce*. It's the instruction used to stage the result. |
+
+A prompt can be Global or Agent, not both. Prompt libraries saved before Agent workflows existed are upgraded on load: prompts already set to draft a note, tasks or an email become Agents with no middle steps and a default Action Command (*Create these as tasks*, *Save this as a note* or *Draft this as an email*).
 
 Four example task prompts are added the first time; edit or delete them freely.
 
@@ -283,21 +294,26 @@ Four example task prompts are added the first time; edit or delete them freely.
 - **Task** — click a prompt to attach it (click it again, or **✕**, to remove it); your question still decides which notes are found, and the task tells the LLM what to write from them. The task also applies to follow-up questions. With **Exact text only**, a task can produce an answer even without a question.
 - **Recent** — titles of the five task prompts most recently used for an answer, newest first. **Starred** — up to five starred prompts not already in Recent, most recently used first, so favourites fill the gap. Hover a title to see the full prompt.
 - **Find a prompt** — search every task prompt by name or tag.
-- **Agent prompts** have a blue border here too: on the Recent and Starred buttons, on the chosen **Task**, and on the prompt token under the question box. Their names show what they draft (e.g. *Action items → Tasks*), including in **Find a prompt**.
+- **Agent prompts** read *Agent:Name* (e.g. *Agent:SF_Tasks*) and have a blue border: on the Recent and Starred buttons, on the chosen **Task**, and on the prompt token under the question box. **Find a prompt** shows the same *Agent:* names.
 
 Each request is sent in this order: today's date → About me → corpus prompt → global prompts → notes and question → task. The answer caption lists the prompts that were used.
 
 Requires Ollama running locally (`localhost:11434`).
 
-### Drafts and the outbox
+### Agents and the outbox
 
-When the task prompt is an **Agent**, the LLM writes drafts instead of prose (the built-in **Action items** Agent drafts tasks). They appear under the answer as editable cards:
+Choose an Agent as the task and **Search**. Its collection prompt (step 1) writes the first answer: a numbered list of what it found, and questions. Then, in the **Discussion** panel:
 
-1. Review and edit each draft. Untick a draft to leave it out. Leave a field empty when the notes don't say; nothing is guessed.
-2. **Related to** and **Kind** name the client, deal or person a draft belongs to (e.g. *Acme pilot*, *Opportunity*). They are a name, not a link; the receiving system finds the matching record.
-3. Click **Send to outbox**. The drafts are checked against `schemas/handoff.v1.schema.json` and written as one JSON file, then locked so they can't be sent twice.
+1. **Refine.** Reply as usual, e.g. *Yes:1,2,3 ignore 4,5,6*, or give due dates and owners. The Agent box under the discussion has a button for each of the Agent's steps (*2 · Select tasks*, *3 · Set due dates*…) that sends that step's prompt for you. **Edit prompt workflow** opens this Agent in the prompt library in a new tab, so you can improve its steps as you go; changes apply on your next click.
+2. **Narrow the sources.** Untick a note under **Sources** to leave it out of the following replies and of what the Agent stages. The discussion caption says how many notes are in use.
+3. **Stage.** Click **Agent:Name** (blue outline; hover it to see the Action Command). The LLM turns what you agreed into exact records and shows them in a staging box with a one-line summary. Nothing has been sent yet. Remove any record with ✕.
+4. **That's right** writes the staged records to the outbox as one package (checked against `schemas/handoff.v1.schema.json`). **Needs work** discards them and asks what's wrong; your explanation goes into the discussion (with the rejected list, so the LLM knows what to fix), and you carry on refining and stage again.
 
-The app never contacts another system. A separate connector (for example [rag-action-interface](https://github.com/yrros/rag-action-interface) for Salesforce) reads the outbox, moves each package to `outbox/processed/` or `outbox/failed/`, and leaves a `<package name>.receipt.json` beside it. The drafts panel shows that result once the receipt appears: what was created, and why anything wasn't.
+Unknown values stay empty; nothing is guessed. **Related to** is a name (e.g. *Acme pilot*), not a link; the receiving system finds the matching record. You can stage and send more than once in the same discussion; each **That's right** is a new package.
+
+The app never contacts another system. A separate connector (for example [rag-action-interface](https://github.com/yrros/rag-action-interface) for Salesforce) reads the outbox, moves each package to `outbox/processed/` or `outbox/failed/`, and leaves a `<package name>.receipt.json` beside it. The Agent box shows each sent package's result once its receipt appears: what was created, and why anything wasn't.
+
+**Outbox status line.** The top of every page shows, e.g., *Outbox: 2 waiting (7 items) · Last processed 25 Oct 10:42 · Last error 24 Oct 18:03*. "Waiting" counts packages not yet picked up and the records in them; the dates come from the connector's receipts, and "error" includes items held for you to choose a record.
 
 **Default location:** `outbox/` in the project folder, i.e. the folder you run Streamlit from, which is the project folder when you start with `start_app.sh` or the Desktop launcher. Change it under **Outbox** on the Prompt library page (saved as `outbox_path` in `app_settings.json`); the connector must read the same folder. The outbox is gitignored because sent drafts contain your notes, and `reset_rag.sh` leaves it alone.
 
@@ -352,7 +368,7 @@ llmware_data/
 
 This folder is gitignored. To reset it, use `reset_rag.sh` (see [Resetting the environment](#resetting-the-environment)).
 
-Drafts you send are written to **`./outbox/`** next to it by default (also gitignored; see [Drafts and the outbox](#drafts-and-the-outbox)).
+Drafts you send are written to **`./outbox/`** next to it by default (also gitignored; see [Agents and the outbox](#agents-and-the-outbox)).
 
 On first run, the app may copy data from the legacy location `~/llmware_data/` if the project-local folder is empty.
 

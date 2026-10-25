@@ -1296,6 +1296,7 @@ def new_prompt_record(
     starred: bool = False,
     agent: bool = False,
     output: str = "text",
+    model: str = "",
 ) -> dict:
     return {
         "id": uuid.uuid4().hex[:12],
@@ -1304,6 +1305,9 @@ def new_prompt_record(
         "global": bool(global_prompt),
         "agent": bool(agent),
         "output": output,
+        "steps": [],  # Agent workflow steps between the collection prompt (text) and the command
+        "command": DEFAULT_AGENT_COMMANDS.get(output, "") if agent else "",
+        "model": model,  # empty: use whichever model is selected
         "tags": clean_filter_terms(tags or []),
         "starred": bool(starred),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1329,6 +1333,10 @@ def load_prompt_library() -> dict:
         for prompt in library["prompts"]:
             # Libraries saved before Agent existed: prompts that already drafted output become Agents.
             prompt.setdefault("agent", prompt.get("output", "text") in DRAFT_OUTPUT_TYPES and not prompt.get("global"))
+            # ...and before Agent workflows: no middle steps, a default Action Command, no model of its own.
+            prompt.setdefault("steps", [])
+            prompt.setdefault("command", DEFAULT_AGENT_COMMANDS.get(prompt.get("output", ""), ""))
+            prompt.setdefault("model", "")
         return library
     return save_prompt_library(
         {
@@ -1424,6 +1432,7 @@ def build_prompt_context(corpus_prompt: str = "", profile_text: str = "", global
 OUTPUT_TYPES = {"text": "Text answer", "note": "Note", "task": "Tasks", "email": "Email"}
 DRAFT_OUTPUT_TYPES = [t for t in OUTPUT_TYPES if t != "text"]  # what an Agent prompt can send to the outbox
 DEFAULT_AGENT_OUTPUT = "task"
+DEFAULT_AGENT_COMMANDS = {"task": "Create these as tasks", "note": "Save this as a note", "email": "Draft this as an email"}
 AGENT_BORDER_COLOR = "#1c83e1"
 HANDOFF_SCHEMA_ID = "llm-notes-handoff/v1"
 HANDOFF_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "handoff.v1.schema.json"
@@ -1460,9 +1469,8 @@ def add_agent_border_style(*selectors: str) -> None:
 
 
 def agent_prompt_label(prompt: dict) -> str:
-    """Prompt name, plus what it drafts when it's an Agent (e.g. 'Action items → Tasks')."""
-    output = get_prompt_output_type(prompt)
-    return prompt["name"] + (f" → {OUTPUT_TYPES[output]}" if output != "text" else "")
+    """Prompt name as shown in the Ask area: Agents read 'Agent:SF_Tasks'."""
+    return f"Agent:{prompt['name']}" if is_agent_prompt(prompt) else prompt["name"]
 
 
 def get_prompt_output_type(prompt: dict | None) -> str:
@@ -1535,27 +1543,47 @@ def normalise_draft_item(item_type: str, item) -> dict:
     return draft
 
 
-def draft_items_with_ollama(
-    question: str,
-    results: list,
+def agent_command(prompt: dict) -> str:
+    """The Agent's Action Command, or the default for its output type."""
+    return str(prompt.get("command", "")).strip() or DEFAULT_AGENT_COMMANDS[get_prompt_output_type(prompt)]
+
+
+def build_agent_task_prompt(prompt: dict) -> str:
+    """Task for an Agent's first answer: its collection prompt, plus how to list items and where it's heading."""
+    return (
+        f"{prompt['text'].strip()}\n\n"
+        "Number every item you list (1, 2, 3…) so I can pick them by number, e.g. \"Yes:1,3 ignore 2\". "
+        f"We will finish with this action: \"{agent_command(prompt)}\" "
+        f"({OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()}). Ask me the questions you need answered "
+        "to do that well, and don't guess anything the notes don't say."
+    )
+
+
+def stage_agent_items(
+    search_state: dict,
+    prompt: dict,
     model_name: str,
-    item_type: str,
-    *,
     max_tokens: int,
     temperature: float,
-    prompt_context: str,
-    task_prompt: str,
-) -> tuple[str, list[dict], dict]:
-    """Ask the model for structured drafts; returns (summary, items, usage)."""
-    guide = f"{STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
-    full_prompt = build_llm_prompt(
-        question, results, max_tokens, temperature, prompt_context, f"{task_prompt.strip()}\n\n{guide}"
-    )
-    reply, usage = chat_with_ollama(
-        [{"role": "user", "content": full_prompt}],
+    corpus_prompt: str,
+) -> dict:
+    """Turn the discussion so far into exact records for the Agent's Action Command. Nothing is sent."""
+    item_type = get_prompt_output_type(prompt)
+    messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
+    messages.append({
+        "role": "user",
+        "content": (
+            f"{agent_command(prompt)}\n\nTurn what we have agreed in this conversation into records now. "
+            "Include only the items I selected or agreed, with the details we agreed, and leave out anything "
+            f"I said to ignore. {STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
+        ),
+    })
+    reply, _usage = chat_with_ollama(
+        messages,
         model_name,
-        max_tokens=max_tokens,
+        max_tokens=max(max_tokens, 1024),  # several records in JSON need more room than a short answer
         temperature=temperature,
+        num_ctx=FOLLOW_UP_NUM_CTX,
         response_format=structured_output_schema(item_type),
     )
     try:
@@ -1566,8 +1594,13 @@ def draft_items_with_ollama(
             "Raise **Max tokens** and try again."
         ) from exc
     items = [normalise_draft_item(item_type, item) for item in data.get("items", []) if isinstance(item, dict)]
-    summary = str(data.get("summary", "")).strip() or f"Drafted {len(items)} {OUTPUT_TYPES[item_type].lower()} item(s)."
-    return summary, items, usage
+    return {
+        "id": uuid.uuid4().hex,  # the package id if this is sent; each staging is a new package
+        "type": item_type,
+        "summary": str(data.get("summary", "")).strip(),
+        "items": items,
+        "model": model_name,
+    }
 
 
 def get_outbox_dir() -> Path:
@@ -1599,22 +1632,23 @@ def write_handoff_package(package: dict, outbox: Path) -> Path:
     return target
 
 
-def build_handoff_package(search_state: dict, items: list[dict], source_notes: list[tuple[str, Path | None]]) -> dict:
-    drafts = search_state["drafts"]
+def build_handoff_package(
+    search_state: dict, prompt: dict, staged: dict, source_notes: list[tuple[str, Path | None]]
+) -> dict:
     return {
         "schema": HANDOFF_SCHEMA_ID,
-        "id": drafts["id"],
+        "id": staged["id"],
         "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "item_type": drafts["type"],
+        "item_type": staged["type"],
         "source": {
             "library": search_state.get("library_display") or search_state["library"],
             "library_key": search_state["library"],
             "question": search_state["question"],
-            "prompt": drafts["prompt"],
-            "model": search_state["model"],
+            "prompt": {"id": prompt["id"], "name": prompt["name"]},
+            "model": staged["model"],
             "notes": [{"file": file, **({"path": str(path)} if path else {})} for file, path in source_notes],
         },
-        "items": items,
+        "items": staged["items"],
     }
 
 
@@ -1630,59 +1664,47 @@ def read_handoff_receipt(package_file: Path) -> dict | None:
     return None
 
 
-def draft_key(drafts: dict, index: int, field: str) -> str:
-    return f"draft_{drafts['id']}_{index}_{field}"
+def pending_outbox_files(outbox: Path) -> list[Path]:
+    """Packages waiting in the outbox (connectors move them to processed/ or failed/ when done)."""
+    if not outbox.is_dir():
+        return []
+    return [p for p in outbox.glob("*.json") if not p.name.startswith(".")]
 
 
-def collect_draft_items(drafts: dict) -> tuple[list[dict], list[int], list[str]]:
-    """Read the edited drafts from their widgets; returns (items, original indexes, problems)."""
-    items, indexes, problems = [], [], []
-    for index, item in enumerate(drafts["items"]):
-        value = lambda field: st.session_state.get(draft_key(drafts, index, field), item.get(field))  # noqa: E731
-        if not st.session_state.get(draft_key(drafts, index, "include"), True):
-            continue
-        related = item.get("related_to", {})
-        edited = {
-            **item,
-            "related_to": {
-                "name": st.session_state.get(draft_key(drafts, index, "related_name"), related.get("name", "")),
-                "kind": st.session_state.get(draft_key(drafts, index, "related_kind"), related.get("kind", "")),
-            },
-        }
-        for field in ("title", "body", "subject", "description", "priority", "owner"):
-            if field in item:
-                edited[field] = value(field)
-        if "due_date" in item:
-            due = value("due_date")
-            edited["due_date"] = due.isoformat() if isinstance(due, datetime.date) else str(due or "")
-        if "to" in item:
-            to = value("to")
-            edited["to"] = to.split(",") if isinstance(to, str) else to
-        cleaned = normalise_draft_item(drafts["type"], edited)
-        label = f"{OUTPUT_TYPES[drafts['type']].rstrip('s')} {index + 1}"
-        if drafts["type"] == "note" and not cleaned["title"]:
-            problems.append(f"{label} needs a title.")
-        if drafts["type"] in ("task", "email") and not cleaned["subject"]:
-            problems.append(f"{label} needs a subject.")
-        items.append(cleaned)
-        indexes.append(index)
-    if not items:
-        problems.append("Include at least one draft.")
-    return items, indexes, problems
+def latest_receipt_time(folder: Path) -> datetime.datetime | None:
+    times = []
+    for path in folder.glob("*.receipt.json"):
+        try:
+            when = datetime.datetime.fromisoformat(json.loads(path.read_text())["processed_at"])
+        except (OSError, ValueError, KeyError, TypeError):
+            when = datetime.datetime.fromtimestamp(path.stat().st_mtime)
+        times.append(when if when.tzinfo else when.astimezone())
+    return max(times) if times else None
 
 
-def send_drafts_to_outbox(search_state: dict, source_notes: list[tuple[str, Path | None]]) -> None:
-    drafts = search_state["drafts"]
-    items, indexes, problems = collect_draft_items(drafts)
-    if problems:
-        st.session_state["draft_send_error"] = " ".join(problems)
-        return
-    try:
-        path = write_handoff_package(build_handoff_package(search_state, items, source_notes), get_outbox_dir())
-    except Exception as exc:
-        st.session_state["draft_send_error"] = f"Couldn't write to the outbox: {exc}"
-        return
-    drafts["sent"] = {"file": str(path), "indexes": indexes}
+def render_outbox_status() -> None:
+    """One line at the top of every page: what's waiting in the outbox and when a connector last processed it."""
+    outbox = get_outbox_dir()
+    waiting = pending_outbox_files(outbox)
+    items = 0
+    for path in waiting:
+        try:
+            items += len(json.loads(path.read_text()).get("items", []))
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def last(folder: str) -> str:
+        when = latest_receipt_time(outbox / folder)
+        return when.strftime("%d %b %H:%M") if when else "never"
+
+    st.caption(
+        f":material/outbox: **Outbox:** {len(waiting)} waiting ({items} item{'' if items == 1 else 's'}) · "
+        f"Last processed {last('processed')} · Last error {last('failed')}",
+        help=(
+            f"Folder: `{outbox}`. A connector (e.g. Salesforce) processes what's waiting. "
+            "Errors include items held for you to choose a record."
+        ),
+    )
 
 
 PROMPT_LIBRARY_PAGE_URL = "?page=prompts"
@@ -1710,17 +1732,56 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
         value = bool(value)
     elif field == "output":
         value = value if value in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
+    elif field == "model":
+        value = str(value or "")
     else:
         value = str(value or "").strip()
         if not value:
-            return  # keep the old name/text rather than saving an empty prompt
+            return  # keep the old name/text/command rather than saving an empty one
+    before = find_prompt(load_prompt_library(), prompt_id) or {}
     update_prompt(prompt_id, **{field: value})
     if field == "agent" and value:
-        prompt = find_prompt(load_prompt_library(), prompt_id)
-        if prompt and prompt.get("output") not in DRAFT_OUTPUT_TYPES:
-            update_prompt(prompt_id, output=DEFAULT_AGENT_OUTPUT)
-    if field in ("name", "text"):
+        output = before.get("output") if before.get("output") in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
+        update_prompt(prompt_id, output=output, command=before.get("command") or DEFAULT_AGENT_COMMANDS[output])
+    if field == "output" and before.get("command", "") in ("", *DEFAULT_AGENT_COMMANDS.values()):
+        update_prompt(prompt_id, command=DEFAULT_AGENT_COMMANDS[value])  # keep a default command in step with the output
+    if field in ("name", "text", "command"):
         mark_text_saved(f"prompt_{prompt_id}")
+
+
+def update_prompt_steps(prompt_id: str, change) -> None:
+    """Apply `change(steps)` to an Agent prompt's middle steps and save."""
+    library = load_prompt_library()
+    prompt = find_prompt(library, prompt_id)
+    if prompt:
+        prompt["steps"] = change(list(prompt.get("steps", [])))
+        save_prompt_library(library)
+
+
+def add_prompt_step(prompt_id: str) -> None:
+    update_prompt_steps(prompt_id, lambda steps: steps + [{"id": uuid.uuid4().hex[:8], "name": "New step", "text": ""}])
+
+
+def delete_prompt_step(prompt_id: str, step_id: str) -> None:
+    update_prompt_steps(prompt_id, lambda steps: [s for s in steps if s["id"] != step_id])
+
+
+def move_prompt_step(prompt_id: str, step_id: str, offset: int) -> None:
+    def move(steps: list[dict]) -> list[dict]:
+        index = next(i for i, s in enumerate(steps) if s["id"] == step_id)
+        target = min(max(index + offset, 0), len(steps) - 1)
+        steps.insert(target, steps.pop(index))
+        return steps
+
+    update_prompt_steps(prompt_id, move)
+
+
+def save_prompt_step(prompt_id: str, step_id: str, field: str) -> None:
+    value = str(st.session_state.get(f"prompt_step_{field}_{step_id}", "")).strip()
+    if field == "name" and not value:
+        return  # a step always keeps a name for its button
+    update_prompt_steps(prompt_id, lambda steps: [{**s, field: value} if s["id"] == step_id else s for s in steps])
+    mark_text_saved(f"prompt_step_{step_id}")
 
 
 def add_prompt_from_form() -> None:
@@ -1744,6 +1805,7 @@ def add_prompt_from_form() -> None:
             starred=bool(st.session_state.get("new_prompt_starred", False)),
             agent=agent,
             output=st.session_state.get("new_prompt_output", DEFAULT_AGENT_OUTPUT) if agent else "text",
+            model=st.session_state.get("new_prompt_model") or "",
         )
     )
     save_prompt_library(library)
@@ -1752,6 +1814,23 @@ def add_prompt_from_form() -> None:
 
 def set_prompt_page_query(text: str) -> None:
     st.session_state["prompt_page_query"] = text
+
+
+def prompt_model_options(current: str = "") -> list[str]:
+    """Choices for a prompt's Model box: '' (use the selected model), then the installed Ollama models."""
+    ok, installed = discover_ollama_models()
+    models = list(installed if ok and installed else SUGGESTED_OLLAMA_MODELS)
+    if current and current not in models:
+        models.insert(0, current)  # keep a saved model that isn't installed right now
+    return ["", *models]
+
+
+def format_prompt_model(model: str) -> str:
+    return model or "Model: as selected"
+
+
+def show_all_prompts() -> None:
+    st.query_params.pop("prompt", None)
 
 
 def common_prompt_tags(library: dict, limit: int = 8) -> list[str]:
@@ -1769,7 +1848,65 @@ def common_prompt_tags(library: dict, limit: int = 8) -> list[str]:
     return tags[:limit]
 
 
-def render_prompt_card(prompt: dict) -> None:
+def render_agent_workflow_editor(prompt: dict) -> None:
+    """Middle steps and the Action Command of an Agent prompt; step 1 is the prompt text above."""
+    prompt_id = prompt["id"]
+    steps = prompt.get("steps", [])
+    for number, step in enumerate(steps, 2):
+        step_id = step["id"]
+        with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
+            st.caption(f"**Step {number}**", width="content")
+            st.text_input(
+                "Step name",
+                value=step["name"],
+                key=f"prompt_step_name_{step_id}",
+                on_change=save_prompt_step,
+                args=(prompt_id, step_id, "name"),
+                label_visibility="collapsed",
+                help="Shown on the step's button in the Discussion panel.",
+            )
+            st.button(":material/arrow_upward:", key=f"prompt_step_up_{step_id}", type="tertiary",
+                      disabled=number == 2, on_click=move_prompt_step, args=(prompt_id, step_id, -1), help="Move up")
+            st.button(":material/arrow_downward:", key=f"prompt_step_down_{step_id}", type="tertiary",
+                      disabled=number == len(steps) + 1, on_click=move_prompt_step, args=(prompt_id, step_id, 1),
+                      help="Move down")
+            st.button(":material/close:", key=f"prompt_step_delete_{step_id}", type="tertiary",
+                      on_click=delete_prompt_step, args=(prompt_id, step_id), help="Remove this step")
+        st.text_area(
+            "Step prompt",
+            value=step["text"],
+            key=f"prompt_step_text_{step_id}",
+            on_change=save_prompt_step,
+            args=(prompt_id, step_id, "text"),
+            height=68,
+            placeholder="e.g. Ask me for a due date and an owner for each task I selected.",
+            label_visibility="collapsed",
+        )
+        render_saved_note(f"prompt_step_{step_id}")
+    st.button(
+        "Add step",
+        icon=":material/add:",
+        key=f"prompt_step_add_{prompt_id}",
+        on_click=add_prompt_step,
+        args=(prompt_id,),
+        help="A step is a prompt you can send with one click while refining, e.g. 'Select tasks' or 'Set due dates'.",
+    )
+    st.text_input(
+        "Action Command",
+        value=prompt.get("command", ""),
+        key=f"prompt_command_{prompt_id}",
+        on_change=save_prompt_field,
+        args=(prompt_id, "command"),
+        placeholder="e.g. Send to tasks in Salesforce",
+        help=(
+            "The last step. Its button in the Discussion panel stages what you agreed as "
+            f"{OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()}; you confirm with **That's right** "
+            "before anything goes to the outbox."
+        ),
+    )
+
+
+def render_prompt_card(prompt: dict, model_options: list[str]) -> None:
     prompt_id = prompt["id"]
     agent = is_agent_prompt(prompt)
     # The key gives the card a CSS class; Agent cards get a blue border (see render_prompt_library_page).
@@ -1793,6 +1930,8 @@ def render_prompt_card(prompt: dict) -> None:
                     on_click=delete_prompt,
                     args=(prompt_id,),
                 )
+        if agent:
+            st.caption("**Step 1 · Collection** — what to find in the notes, list and ask about.")
         st.text_area(
             "Prompt",
             value=prompt["text"],
@@ -1833,9 +1972,10 @@ def render_prompt_card(prompt: dict) -> None:
                 args=(prompt_id, "agent"),
                 disabled=bool(prompt.get("global")),
                 help=(
-                    "Agent prompts draft a **Note**, **Tasks** or an **Email** instead of a text answer. You review "
-                    "the drafts and send them to the outbox for another system (e.g. Salesforce). Only Agent prompts "
-                    "send to the outbox. Not available for Global prompts."
+                    "Agent prompts are a workflow: step 1 collects and lists what's in the notes, optional steps "
+                    "refine it with you, and the **Action Command** stages a **Note**, **Tasks** or an **Email** "
+                    "for you to confirm and send to the outbox for another system (e.g. Salesforce). Only Agent "
+                    "prompts send to the outbox. Not available for Global prompts."
                 ),
             )
             if agent:
@@ -1851,6 +1991,22 @@ def render_prompt_card(prompt: dict) -> None:
                     label_visibility="collapsed",
                     help="What this Agent drafts for the outbox.",
                 )
+            options = model_options if prompt.get("model", "") in model_options else [*model_options, prompt["model"]]
+            st.selectbox(
+                "Model",
+                options=options,
+                index=options.index(prompt.get("model", "")),
+                format_func=format_prompt_model,
+                key=f"prompt_model_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "model"),
+                width=200,
+                label_visibility="collapsed",
+                help=(
+                    "Model to use when you pick this prompt, for the answer and the discussion. You can still "
+                    "change either model in the Ask panel. **Model: as selected** keeps whatever is selected."
+                ),
+            )
             st.multiselect(
                 "Tags",
                 options=prompt.get("tags", []),
@@ -1862,6 +2018,8 @@ def render_prompt_card(prompt: dict) -> None:
                 placeholder="Add a tag, press Enter",
                 label_visibility="collapsed",
             )
+        if agent:
+            render_agent_workflow_editor(prompt)
         if prompt.get("last_used"):
             st.caption(f"Last used {prompt['last_used'].replace('T', ' ')}")
 
@@ -1870,6 +2028,7 @@ def render_prompt_library_page() -> None:
     """Prompt library page (opened in its own tab): About me, corpus prompt, task prompts."""
     library = load_prompt_library()
     add_agent_border_style("[class*='st-key-agent_prompt_card_']")
+    render_outbox_status()
     st.title("Prompt library")
     st.caption(
         "Shape what the LLM is told when it answers from your notes. Each request is built in this order: "
@@ -1877,7 +2036,7 @@ def render_prompt_library_page() -> None:
     )
 
     outbox = get_outbox_dir()
-    waiting = len([p for p in outbox.glob("*.json") if not p.name.startswith(".")]) if outbox.is_dir() else 0
+    waiting = len(pending_outbox_files(outbox))
     with st.expander(
         f"Outbox · {waiting} waiting",
         expanded=False,
@@ -1956,9 +2115,9 @@ def render_prompt_library_page() -> None:
         st.subheader("Task prompts")
         st.caption(
             "Pick a task in the Ask panel to tell the LLM what to write from the notes. Tick **Global** to "
-            "send a prompt with every request instead. Tick **Agent** to draft a note, tasks or an email to send "
-            "to the outbox; Agent prompts have a blue border. Tags help you find prompts; tick **Starred** for the "
-            "ones you use most."
+            "send a prompt with every request instead. Tick **Agent** to make it a workflow that ends by sending "
+            "a note, tasks or an email to the outbox; Agent prompts have a blue border. **Model** picks the model "
+            "used with the prompt. Tags help you find prompts; tick **Starred** for the ones you use most."
         )
         with st.container(horizontal=True, vertical_alignment="bottom"):
             query = st.text_input(
@@ -1996,12 +2155,20 @@ def render_prompt_library_page() -> None:
             p for p in library["prompts"]
             if prompt_matches_query(p, query) and (is_agent_prompt(p) or not agents_only)
         ]
-        if query.strip() or agents_only:
+        # "Edit prompt workflow" in the Discussion panel opens this page with ?prompt=<id>.
+        focused = find_prompt(library, st.query_params.get("prompt"))
+        if focused:
+            shown = [focused]
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.caption(f"Showing the workflow you opened: **{focused['name']}**.")
+                st.button("Show all prompts", key="prompt_page_show_all", on_click=show_all_prompts)
+        elif query.strip() or agents_only:
             st.caption(f"{len(shown)} of {len(library['prompts'])} prompts match.")
         if not shown:
             st.caption("No prompts match." if library["prompts"] else "No prompts yet — add one below.")
+        model_options = prompt_model_options()
         for prompt in shown:
-            render_prompt_card(prompt)
+            render_prompt_card(prompt, model_options)
 
     with st.container(border=True):
         st.subheader("Add a prompt")
@@ -2031,6 +2198,15 @@ def render_prompt_library_page() -> None:
                     label_visibility="collapsed",
                     help="What an Agent prompt drafts. Ignored unless **Agent** is ticked.",
                 )
+                st.selectbox(
+                    "Model",
+                    options=model_options,
+                    format_func=format_prompt_model,
+                    key="new_prompt_model",
+                    width=200,
+                    label_visibility="collapsed",
+                    help="Model to use when you pick this prompt. You can still change it in the Ask panel.",
+                )
                 st.multiselect(
                     "Tags",
                     options=[],
@@ -2043,7 +2219,7 @@ def render_prompt_library_page() -> None:
         if error := st.session_state.pop("add_prompt_error", None):
             st.warning(error)
         if added := st.session_state.pop("add_prompt_added", None):
-            st.success(f"Added **{added}**.")
+            st.success(f"Added **{added}**. Agent prompts get their steps and Action Command on their card above.")
 
     install_filter_commit_on_blur()
 
@@ -2112,7 +2288,7 @@ def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
         parts.append("corpus prompt")
     parts.extend(f"Global: {p['name']}" for p in run_prompts["globals"])
     if run_prompts["task"]:
-        parts.append(f"Task: {run_prompts['task']['name']}")
+        parts.append(f"Task: {agent_prompt_label(run_prompts['task'])}")
     return parts
 
 
@@ -2160,11 +2336,11 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
                     is_active = bool(active and active["id"] == prompt["id"])
                     agent = is_agent_prompt(prompt)
                     st.button(
-                        truncate_text(prompt["name"], 28),
+                        truncate_text(agent_prompt_label(prompt), 34 if agent else 28),
                         # Agent keys pick up the blue border style above.
                         key=f"use_{'agent_' if agent else ''}prompt_{title}_{prompt['id']}",
-                        help=(f"**Agent** — drafts {OUTPUT_TYPES[get_prompt_output_type(prompt)]} for the outbox.\n\n"
-                              if agent else "") + prompt["text"],
+                        help=(f"**Agent** — ends by sending {OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()} "
+                              f"to the outbox: *{agent_command(prompt)}*\n\n" if agent else "") + prompt["text"],
                         type="primary" if is_active else "secondary",
                         on_click=clear_active_task_prompt if is_active else set_active_task_prompt,
                         args=() if is_active else (prompt["id"],),
@@ -2512,6 +2688,45 @@ def describe_prompt_parts(search_state: dict) -> str:
     return f" with {', '.join(parts)}." if parts else "."
 
 
+def discussion_note_key(result: dict) -> tuple[str, str]:
+    return (result.get("_library", ""), str(result.get("file_source", "")))
+
+
+def discussion_results(search_state: dict) -> list:
+    """The search's results minus notes the user unticked under Sources ('use in this discussion')."""
+    left_out = {tuple(key) for key in search_state.get("left_out_notes", [])}
+    return [r for r in search_state["results"] if discussion_note_key(r) not in left_out]
+
+
+def toggle_discussion_note(search_state: dict, note_key: tuple[str, str], widget_key: str) -> None:
+    left_out = [tuple(key) for key in search_state.get("left_out_notes", []) if tuple(key) != note_key]
+    if not st.session_state.get(widget_key, True):
+        left_out.append(note_key)
+    search_state["left_out_notes"] = left_out
+
+
+def build_discussion_messages(search_state: dict, max_tokens: int, temperature: float, corpus_prompt: str) -> list[dict]:
+    """The conversation so far, opening with the notes still in use (rebuilt each time, so unticking applies)."""
+    messages = [{
+        "role": "user",
+        "content": build_llm_prompt(
+            search_state["question"],
+            discussion_results(search_state),
+            max_tokens,
+            temperature,
+            corpus_prompt,
+            search_state.get("task_prompt", ""),
+        ),
+    }]
+    if search_state.get("answer"):
+        messages.append({"role": "assistant", "content": search_state["answer"]})
+    messages.extend(
+        {"role": turn["role"], "content": turn.get("prompt", turn["content"])}
+        for turn in search_state["discussion"]
+    )
+    return messages
+
+
 def follow_up_with_ollama(
     search_state: dict,
     question: str,
@@ -2519,41 +2734,17 @@ def follow_up_with_ollama(
     max_tokens: int,
     temperature: float,
     corpus_prompt: str = "",
+    sent_text: str | None = None,
 ) -> dict:
-    """Answer a follow-up using the search's notes plus the conversation so far.
+    """Answer a follow-up using the notes in use plus the conversation so far.
 
-    Returns the new user turn; `prompt` holds the full text sent when it differs from `content`.
+    `sent_text` is sent instead of `question` when they differ (e.g. a step's full prompt); it is kept
+    as the turn's `prompt` so later requests repeat what the model actually saw.
     """
-    messages: list[dict] = []
-    if search_state.get("answer"):
-        messages.append({
-            "role": "user",
-            "content": build_llm_prompt(
-                search_state["question"],
-                search_state["results"],
-                max_tokens,
-                temperature,
-                corpus_prompt,
-                search_state.get("task_prompt", ""),
-            ),
-        })
-        messages.append({"role": "assistant", "content": search_state["answer"]})
-    messages.extend(
-        {"role": turn["role"], "content": turn.get("prompt", turn["content"])}
-        for turn in search_state["discussion"]
-    )
-
+    messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
     user_turn = {"role": "user", "content": question}
-    if not messages:
-        # No answer yet — this turn carries the notes as context.
-        user_turn["prompt"] = build_llm_prompt(
-            question,
-            search_state["results"],
-            max_tokens,
-            temperature,
-            corpus_prompt,
-            search_state.get("task_prompt", ""),
-        )
+    if sent_text and sent_text != question:
+        user_turn["prompt"] = sent_text
     messages.append({"role": "user", "content": user_turn.get("prompt", question)})
 
     reply, _usage = chat_with_ollama(
@@ -2564,6 +2755,29 @@ def follow_up_with_ollama(
         num_ctx=FOLLOW_UP_NUM_CTX,
     )
     return {"user": user_turn, "assistant": {"role": "assistant", "content": reply}}
+
+
+def add_discussion_turn(
+    search_state: dict,
+    question: str,
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+    corpus_prompt: str,
+    sent_text: str | None = None,
+) -> bool:
+    """Ask the follow-up and add both turns to the discussion; False (with an error shown) if it failed."""
+    with st.spinner(f"Asking `{model_name}`…"):
+        try:
+            turns = follow_up_with_ollama(
+                search_state, question, model_name, max_tokens, temperature, corpus_prompt, sent_text
+            )
+        except Exception as exc:
+            st.error(f"Follow-up failed: {exc}")
+            return False
+    turns["assistant"]["model"] = model_name
+    search_state["discussion"].extend([turns["user"], turns["assistant"]])
+    return True
 
 
 def persist_llm_tuning(safe_lib: str) -> None:
@@ -2692,8 +2906,8 @@ def render_follow_up_discussion(
     corpus_prompt: str = "",
     model_options: list[str] | None = None,
     safe_lib: str = "",
-) -> None:
-    """Chat panel for follow-up questions about the notes from the last search."""
+) -> str:
+    """Chat panel for follow-up questions about the notes from the last search; returns the follow-up model."""
     st.subheader("Discussion")
 
     # Follow-ups can use a different (e.g. larger) model than the main answer.
@@ -2701,11 +2915,18 @@ def render_follow_up_discussion(
     saved_model = get_corpus_config(safe_lib).get("follow_up_model") or model_name
     if saved_model not in options:
         saved_model = model_name if model_name in options else options[0]
+    # A prompt with its own model sets the follow-up model once per search; changing it afterwards overrides it.
+    prompt_model = search_state.get("prompt_model")
+    if prompt_model in options and not search_state.get("prompt_model_applied"):
+        st.session_state[f"follow_up_model_{safe_lib}"] = prompt_model
+        search_state["prompt_model_applied"] = True
+    model_key = f"follow_up_model_{safe_lib}"
+    if st.session_state.get(model_key) not in options:
+        st.session_state[model_key] = saved_model  # set here, not via index, so a prompt's model can replace it
     model_name = st.selectbox(
         "Follow-up model",
         options=options,
-        index=options.index(saved_model),
-        key=f"follow_up_model_{safe_lib}",
+        key=model_key,
         on_change=persist_follow_up_model,
         args=(safe_lib,),
         help=(
@@ -2713,7 +2934,10 @@ def render_follow_up_discussion(
             "e.g. a larger model for deeper discussion. Saved per corpus."
         ),
     )
-    caption = f"Follow-ups are answered from the notes in this search using `{model_name}`"
+    in_use = len({discussion_note_key(r) for r in discussion_results(search_state)})
+    total = len({discussion_note_key(r) for r in search_state["results"]})
+    notes = "the notes in this search" if in_use == total else f"{in_use} of {total} notes from this search"
+    caption = f"Follow-ups are answered from {notes} using `{model_name}`"
     st.caption(caption + describe_prompt_parts(search_state))
 
     view_col, popout_col = st.columns(2)
@@ -2737,6 +2961,7 @@ def render_follow_up_discussion(
         # A content-sized panel can be shorter than the default box, so expanding uses a fixed taller height.
         height=DISCUSSION_EXPANDED_HEIGHT if expanded else DISCUSSION_HEIGHT,
     )
+    return model_name
 
 
 def render_discussion_body(
@@ -2779,17 +3004,8 @@ def render_discussion_body(
         st.rerun(scope=rerun_scope)
 
     if submitted and follow_up.strip():
-        with st.spinner(f"Asking `{model_name}`…"):
-            try:
-                turns = follow_up_with_ollama(
-                    search_state, follow_up.strip(), model_name, max_tokens, temperature, corpus_prompt
-                )
-            except Exception as exc:
-                st.error(f"Follow-up failed: {exc}")
-                return
-        turns["assistant"]["model"] = model_name
-        discussion.extend([turns["user"], turns["assistant"]])
-        st.rerun(scope=rerun_scope)
+        if add_discussion_turn(search_state, follow_up.strip(), model_name, max_tokens, temperature, corpus_prompt):
+            st.rerun(scope=rerun_scope)
 
 
 @st.dialog("Discussion", width="large", on_dismiss="rerun")
@@ -2916,109 +3132,197 @@ RECEIPT_STATUS_TEXT = {
 }
 
 
-def render_drafts(search_state: dict, source_notes: list[tuple[str, Path | None]]) -> None:
-    """Editable drafts from a Note/Tasks/Email prompt, a Send to outbox button, then the connector's result."""
-    drafts = search_state["drafts"]
-    sent = drafts.get("sent")
-    st.subheader("Drafts")
-    if not drafts["items"]:
-        st.info("The model returned no drafts. Try a different question or raise **Max tokens**.")
+def staged_item_title(item: dict) -> str:
+    return item.get("subject") or item.get("title") or "(untitled)"
+
+
+def describe_staged_item(item: dict) -> str:
+    """One readable line (plus a short body) for a staged note, task or email."""
+    details = []
+    if item["type"] == "task":
+        details += [
+            f"due {item['due_date'] or 'not set'}",
+            f"priority {item['priority'] or 'not set'}",
+            f"owner {item['owner'] or 'not given'}",
+        ]
+    elif item["type"] == "email":
+        details.append("to " + (", ".join(item["to"]) or "nobody given"))
+    related = item["related_to"]
+    if related["name"]:
+        details.append(f"related to {related['name']}" + (f" ({related['kind']})" if related["kind"] else ""))
+    text = f"**{staged_item_title(item)}** — " + " · ".join(details) if details else f"**{staged_item_title(item)}**"
+    body = item.get("description") or item.get("body") or ""
+    return text + (f"  \n{truncate_text(body, 200)}" if body else "")
+
+
+def unstage_item(agent: dict, index: int) -> None:
+    agent["staged"]["items"].pop(index)
+
+
+def start_needs_work(agent: dict) -> None:
+    agent["rejected"], agent["staged"], agent["needs_work"] = agent["staged"], None, True
+
+
+def send_staged_to_outbox(search_state: dict, prompt: dict, source_notes: list[tuple[str, Path | None]]) -> None:
+    agent = search_state["agent"]
+    staged = agent["staged"]
+    try:
+        path = write_handoff_package(build_handoff_package(search_state, prompt, staged, source_notes), get_outbox_dir())
+    except Exception as exc:
+        agent["send_error"] = f"Couldn't write to the outbox: {exc}"
         return
-    if not sent:
-        st.caption(
-            "Review and edit, then send. Sending writes one file to the outbox folder for a connector "
-            "(e.g. Salesforce) to pick up; this app never contacts other systems. Leave a field empty if the notes don't say."
-        )
+    agent["sent"].append({
+        "file": str(path),
+        "type": staged["type"],
+        "items": staged["items"],
+        "at": datetime.datetime.now().strftime("%H:%M"),
+    })
+    agent["staged"] = None
 
-    for index, item in enumerate(drafts["items"]):
-        key = lambda field: draft_key(drafts, index, field)  # noqa: E731
-        with st.container(border=True):
-            st.checkbox(
-                f"{OUTPUT_TYPES[drafts['type']].rstrip('s')} {index + 1}",
-                value=True,
-                key=key("include"),
-                disabled=bool(sent),
-                help="Untick to leave this draft out.",
-            )
-            if item["type"] == "note":
-                st.text_input("Title", value=item["title"], key=key("title"), disabled=bool(sent))
-                st.text_area("Body", value=item["body"], key=key("body"), height=160, disabled=bool(sent))
-            elif item["type"] == "task":
-                st.text_input("Subject", value=item["subject"], key=key("subject"), disabled=bool(sent))
-                st.text_area("Description", value=item["description"], key=key("description"), height=80, disabled=bool(sent))
-                due_col, priority_col, owner_col = st.columns(3)
-                due_col.date_input(
-                    "Due date",
-                    value=datetime.date.fromisoformat(item["due_date"]) if item["due_date"] else None,
-                    key=key("due_date"),
-                    format="YYYY-MM-DD",
-                    disabled=bool(sent),
-                )
-                priority_col.selectbox(
-                    "Priority",
-                    TASK_PRIORITIES,
-                    index=TASK_PRIORITIES.index(item["priority"]),
-                    format_func=lambda p: p.capitalize() or "Not set",
-                    key=key("priority"),
-                    disabled=bool(sent),
-                )
-                owner_col.text_input("Owner", value=item["owner"], key=key("owner"), placeholder="Not given", disabled=bool(sent))
-            else:
-                st.text_input(
-                    "To", value=", ".join(item["to"]), key=key("to"), help="Names or addresses, comma-separated.", disabled=bool(sent)
-                )
-                st.text_input("Subject", value=item["subject"], key=key("subject"), disabled=bool(sent))
-                st.text_area("Body", value=item["body"], key=key("body"), height=160, disabled=bool(sent))
-            name_col, kind_col = st.columns([2, 1])
-            name_col.text_input(
-                "Related to",
-                value=item["related_to"]["name"],
-                key=key("related_name"),
-                placeholder="e.g. Acme pilot",
-                help="The client, deal or person this belongs to. The connector finds the matching record.",
-                disabled=bool(sent),
-            )
-            kind_col.selectbox(
-                "Kind",
-                RELATED_KINDS,
-                index=RELATED_KINDS.index(item["related_to"]["kind"]),
-                format_func=lambda k: k.capitalize() or "Not sure",
-                key=key("related_kind"),
-                disabled=bool(sent),
-            )
 
-    if not sent:
-        st.button(
-            "Send to outbox",
-            type="primary",
-            icon=":material/outbox:",
-            key=f"send_drafts_{drafts['id']}",
-            on_click=send_drafts_to_outbox,
-            args=(search_state, source_notes),
-            help=f"Writes to {get_outbox_dir()}. Change the folder on the Prompt library page.",
-        )
-        if error := st.session_state.pop("draft_send_error", None):
-            st.warning(error)
-        return
-
-    package_file = Path(sent["file"])
-    receipt = read_handoff_receipt(package_file)
+def render_sent_batch(batch: dict) -> bool:
+    """What happened to one sent package; returns True while it's still waiting for a connector."""
+    count = f"{len(batch['items'])} {OUTPUT_TYPES[batch['type']].lower()}"
+    receipt = read_handoff_receipt(Path(batch["file"]))
     if not receipt:
-        st.info(f"Sent to the outbox as `{package_file.name}`. Waiting for a connector to pick it up.")
-        st.button("Check again", icon=":material/refresh:", key=f"check_drafts_{drafts['id']}")
-        return
-    message = f"**{receipt.get('connector', 'Connector').capitalize()}:** {RECEIPT_STATUS_TEXT.get(receipt['status'], receipt['status'])}."
+        st.info(f"Sent {count} to the outbox at {batch['at']}. Waiting for a connector to pick it up.")
+        return True
+    message = (
+        f"Sent {count} at {batch['at']}. **{receipt.get('connector', 'Connector').capitalize()}:** "
+        f"{RECEIPT_STATUS_TEXT.get(receipt['status'], receipt['status'])}."
+    )
     if receipt.get("error"):
         message += f" {receipt['error']}"
     (st.success if receipt["status"] == "done" else st.warning)(message)
     for result in receipt.get("items", []):
         if result["status"] in ("created", "exists"):
             continue
-        number = sent["indexes"][result["index"]] + 1 if result["index"] < len(sent["indexes"]) else result["index"] + 1
+        index = result["index"]
+        title = staged_item_title(batch["items"][index]) if index < len(batch["items"]) else f"Item {index + 1}"
         candidates = ", ".join(c["name"] for c in result.get("candidates", []))
+        st.caption(f"{title}: {result['message']}" + (f" Possible matches: {candidates}." if candidates else ""))
+    return False
+
+
+def render_agent_panel(
+    search_state: dict,
+    source_notes: list[tuple[str, Path | None]],
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+    corpus_prompt: str,
+) -> None:
+    """Agent workflow under the discussion: step buttons, Agent:<name> to stage, That's right / Needs work."""
+    agent = search_state["agent"]
+    # Read the prompt live, so edits made in the prompt library apply on the next click.
+    prompt = find_prompt(load_prompt_library(), agent["prompt"]["id"]) or agent["prompt"]
+    label = agent_prompt_label(prompt)
+    item_kind = OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()
+    add_agent_border_style(".st-key-agent_panel", ".st-key-agent_run button", ".st-key-agent_staging")
+
+    with st.container(border=True, key="agent_panel"):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(f"**{label}**", width="content")
+            st.link_button(
+                "Edit prompt workflow",
+                f"{PROMPT_LIBRARY_PAGE_URL}&prompt={prompt['id']}",
+                icon=":material/open_in_new:",
+                type="tertiary",
+                help="Opens this Agent's steps and Action Command in the prompt library, in a new tab.",
+            )
+        steps = [s for s in prompt.get("steps", []) if s.get("text", "").strip()]
+        if steps:
+            with st.container(horizontal=True, gap="xsmall"):
+                for number, step in enumerate(steps, 2):
+                    if st.button(f"{number} · {step['name']}", key=f"agent_step_{step['id']}", help=step["text"]):
+                        if add_discussion_turn(
+                            search_state, f"*{step['name']}* — {step['text']}", model_name, max_tokens,
+                            temperature, corpus_prompt, sent_text=step["text"],
+                        ):
+                            st.rerun()
         st.caption(
-            f"Draft {number}: {result['message']}" + (f" Possible matches: {candidates}." if candidates else "")
+            "Reply in the discussion to pick items (e.g. *Yes:1,2,3 ignore 4,5,6*), set dates and answer questions. "
+            f"When it's right, stage the {item_kind}. Untick notes under Sources to narrow what the LLM uses."
         )
+        if st.button(
+            label,
+            key="agent_run",
+            icon=":material/smart_toy:",
+            use_container_width=True,
+            help=f"**Action Command:** {agent_command(prompt)}\n\nStages what you've agreed so you can check it first.",
+        ):
+            with st.spinner(f"`{model_name}` is staging the {item_kind}…"):
+                try:
+                    agent["staged"] = stage_agent_items(
+                        search_state, prompt, model_name, max_tokens, temperature, corpus_prompt
+                    )
+                    agent["needs_work"] = False
+                except Exception as exc:
+                    st.error(f"Couldn't stage the {item_kind}: {exc}")
+                else:
+                    st.rerun()
+
+        staged = agent.get("staged")
+        if staged:
+            with st.container(border=True, key="agent_staging"):
+                st.markdown(f"**Staged — check before it goes to the outbox**  \n{staged['summary']}")
+                if not staged["items"]:
+                    st.info("Nothing to send: no agreed items were found. Choose **Needs work** and say what you want.")
+                for index, item in enumerate(staged["items"]):
+                    item_col, remove_col = st.columns([0.92, 0.08])
+                    item_col.markdown(describe_staged_item(item))
+                    with remove_col:
+                        st.button(
+                            ":material/close:",
+                            key=f"agent_unstage_{staged['id']}_{index}",
+                            type="tertiary",
+                            on_click=unstage_item,
+                            args=(agent, index),
+                            help="Leave this one out",
+                        )
+                right_col, needs_col = st.columns(2)
+                right_col.button(
+                    "That's right",
+                    key=f"agent_confirm_{staged['id']}",
+                    type="primary",
+                    icon=":material/check:",
+                    on_click=send_staged_to_outbox,
+                    args=(search_state, prompt, source_notes),
+                    disabled=not staged["items"],
+                    use_container_width=True,
+                    help=f"Write these to the outbox ({get_outbox_dir()}).",
+                )
+                needs_col.button(
+                    "Needs work",
+                    key=f"agent_reject_{staged['id']}",
+                    icon=":material/edit:",
+                    on_click=start_needs_work,
+                    args=(agent,),
+                    use_container_width=True,
+                    help="Discard this and say what's wrong; then keep refining and stage again.",
+                )
+        if error := agent.pop("send_error", None):
+            st.warning(error)
+
+        if agent.get("needs_work"):
+            with st.form("agent_needs_work_form", clear_on_submit=True):
+                issue = st.text_area(
+                    "What needs work?", placeholder="e.g. Task 2 is Jo's, not mine, and drop the last one."
+                )
+                submitted = st.form_submit_button("Send", type="primary")
+            if submitted and issue.strip():
+                rejected = agent.get("rejected") or {"items": []}
+                proposal = "\n".join(f"- {describe_staged_item(item)}" for item in rejected["items"]) or "- (nothing)"
+                if add_discussion_turn(
+                    search_state, f"**Needs work:** {issue.strip()}", model_name, max_tokens, temperature,
+                    corpus_prompt, sent_text=f"You proposed:\n{proposal}\n\nThat needs work: {issue.strip()}",
+                ):
+                    agent["needs_work"], agent["rejected"] = False, None
+                    st.rerun()
+
+        waiting = [render_sent_batch(batch) for batch in reversed(agent["sent"])]
+        if any(waiting):
+            st.button("Check again", icon=":material/refresh:", key="agent_check_sent")
 
 
 def render_search_results(
@@ -3052,14 +3356,19 @@ def render_search_results(
 
     # Each source note once, in rank order, with its local path when it can be found.
     source_notes: list[tuple[str, Path | None]] = []
+    notes_in_use: list[tuple[str, Path | None]] = []  # minus notes unticked for the discussion
+    in_use_keys = {discussion_note_key(r) for r in discussion_results(search_state)}
     seen_sources: set[tuple[str, str]] = set()
     for result in results:
         file_source = str(result.get("file_source", ""))
-        source_key = (result.get("_library", ""), file_source)
+        source_key = discussion_note_key(result)
         if file_source and source_key not in seen_sources:
             seen_sources.add(source_key)
             result_folder, _result_lib, result_uploads = hit_location(result)
-            source_notes.append((file_source, resolve_source_path(file_source, result_folder, result_uploads)))
+            note = (file_source, resolve_source_path(file_source, result_folder, result_uploads))
+            source_notes.append(note)
+            if source_key in in_use_keys:
+                notes_in_use.append(note)
 
     main_col, chat_col = st.columns([3, 2], gap="large")
 
@@ -3090,10 +3399,8 @@ def render_search_results(
         elif not search_state["question"]:
             st.info("No question was asked — use the discussion panel to ask about these notes.")
 
-        if search_state.get("drafts"):
-            render_drafts(search_state, source_notes)
-
         st.subheader("Sources")
+        st.caption("Untick a note to leave it out of the discussion's next replies (and of what an Agent sends).")
         # Group hits by document, keeping the order of each document's best hit.
         hits_by_source: dict[tuple[str, str], list[dict]] = {}
         for i, res in enumerate(results, 1):
@@ -3113,7 +3420,20 @@ def render_search_results(
             if best is not None:
                 label += f" (distance: {best:.3f})"
             hit_folder, hit_lib, hit_uploads = hit_location(hits[0])
-            with st.expander(label):
+            note_key = (library, file_source)
+            use_key = f"use_note_{search_state.get('id', '')}_{library}_{file_source}"
+            if use_key not in st.session_state:
+                st.session_state[use_key] = note_key in in_use_keys
+            use_col, note_col = st.columns([0.05, 0.95])
+            use_col.checkbox(
+                "Use in discussion",
+                key=use_key,
+                on_change=toggle_discussion_note,
+                args=(search_state, note_key, use_key),
+                label_visibility="collapsed",
+                help="Use this note in the discussion and for the Agent. Untick to leave it out of the next replies.",
+            )
+            with note_col.expander(label if note_key in in_use_keys else f"~~{label}~~ · left out"):
                 render_source_document(
                     file_source,
                     hits,
@@ -3123,7 +3443,7 @@ def render_search_results(
                 )
 
     with chat_col:
-        render_follow_up_discussion(
+        follow_up_model = render_follow_up_discussion(
             search_state,
             model_name,
             max_tokens,
@@ -3132,6 +3452,8 @@ def render_search_results(
             model_options,
             safe_lib,
         )
+        if search_state.get("agent"):
+            render_agent_panel(search_state, notes_in_use, follow_up_model, max_tokens, temperature, corpus_prompt)
 
 
 def get_pending_index_settings(safe_lib: str, corpus_config: dict) -> tuple[str, float, bool]:
@@ -4950,6 +5272,7 @@ if st.query_params.get("page") == "prompts":
     render_prompt_library_page()
     st.stop()
 
+render_outbox_status()
 st.title("🧠 RAG Workspace Manager")
 
 if should_show_setup_wizard():
@@ -5559,10 +5882,14 @@ with ask_box_col:
 
         if use_llm_answer:
             render_ask_prompt_panel(prompt_library, corpus_config)
+            # A task prompt with its own model preselects it. The box has no key, so its default changes with
+            # the prompt; picking another model here overrides it for this run.
+            prompt_model = (resolve_run_prompts(prompt_library, corpus_config)["task"] or {}).get("model")
+            answer_model = prompt_model if prompt_model in ollama_model_options else default_ollama
             selected_ollama_model = st.selectbox(
                 "Ollama model",
                 options=ollama_model_options,
-                index=ollama_model_options.index(default_ollama),
+                index=ollama_model_options.index(answer_model),
                 help="Generative model that writes the final answer.",
             )
             tokens_col, temperature_col = st.columns(2)
@@ -5730,47 +6057,37 @@ elif new_search and (prompt_text or run_filter_only):
                     run_prompts["profile"],
                     [p["text"] for p in run_prompts["globals"]],
                 ),
-                "task_prompt": task_prompt["text"] if task_prompt else "",
+                # An Agent's first answer comes from its collection prompt (step 1), told where it's heading.
+                "task_prompt": (
+                    build_agent_task_prompt(task_prompt) if is_agent_prompt(task_prompt)
+                    else task_prompt["text"] if task_prompt else ""
+                ),
                 "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt),
                 "library_display": selected_lib if state_library == safe_lib else "All libraries",
-                "drafts": None,
+                "id": uuid.uuid4().hex[:8],  # keys this search's per-note widgets
+                "left_out_notes": [],
+                "prompt_model": (task_prompt or {}).get("model") or None,
+                # The Agent workflow (step buttons, staging, sent batches) lives under the discussion.
+                "agent": (
+                    {"prompt": dict(task_prompt), "staged": None, "rejected": None, "needs_work": False, "sent": []}
+                    if use_llm_answer and is_agent_prompt(task_prompt) else None
+                ),
             }
-            draft_type = get_prompt_output_type(task_prompt) if task_prompt else "text"
             # A chosen task can drive the answer on its own, e.g. after an exact-text search.
             if final_results and use_llm_answer and (
                 search_state["question"] or (task_prompt and not filter_only_clicked)
             ):
                 with st.spinner(f"Generating answer with `{selected_ollama_model}`…"):
                     try:
-                        if draft_type != "text":
-                            summary, items, search_state["usage"] = draft_items_with_ollama(
-                                search_state["question"],
-                                final_results,
-                                selected_ollama_model,
-                                draft_type,
-                                max_tokens=llm_max_tokens,
-                                temperature=llm_temperature,
-                                prompt_context=search_state["prompt_context"],
-                                task_prompt=search_state["task_prompt"],
-                            )
-                            search_state["answer"] = summary
-                            search_state["drafts"] = {
-                                "id": uuid.uuid4().hex,
-                                "type": draft_type,
-                                "items": items,
-                                "prompt": {"id": task_prompt["id"], "name": task_prompt["name"]},
-                                "sent": None,
-                            }
-                        else:
-                            search_state["answer"], search_state["usage"] = answer_with_ollama(
-                                question=search_state["question"],
-                                results=final_results,
-                                model_name=selected_ollama_model,
-                                max_tokens=llm_max_tokens,
-                                temperature=llm_temperature,
-                                corpus_prompt=search_state["prompt_context"],
-                                task_prompt=search_state["task_prompt"],
-                            )
+                        search_state["answer"], search_state["usage"] = answer_with_ollama(
+                            question=search_state["question"],
+                            results=final_results,
+                            model_name=selected_ollama_model,
+                            max_tokens=llm_max_tokens,
+                            temperature=llm_temperature,
+                            corpus_prompt=search_state["prompt_context"],
+                            task_prompt=search_state["task_prompt"],
+                        )
                         if task_prompt:
                             mark_prompt_used(task_prompt["id"])
                     except Exception as llm_exc:
@@ -5778,14 +6095,11 @@ elif new_search and (prompt_text or run_filter_only):
             st.session_state[LAST_SEARCH_KEY] = search_state
 
             if final_results and use_llm_answer and not filter_only_clicked:
-                save_corpus_config(
-                    safe_lib,
-                    {
-                        "ollama_model": selected_ollama_model,
-                        "llm_max_tokens": llm_max_tokens,
-                        "llm_temperature": llm_temperature,
-                    },
-                )
+                tuning = {"llm_max_tokens": llm_max_tokens, "llm_temperature": llm_temperature}
+                # A model picked by the prompt is for that prompt; don't make it the corpus default.
+                if selected_ollama_model != search_state["prompt_model"]:
+                    tuning["ollama_model"] = selected_ollama_model
+                save_corpus_config(safe_lib, tuning)
     except Exception as exc:
         st.error(f"Search failed: {exc}")
 
