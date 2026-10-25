@@ -7535,6 +7535,42 @@ with filter_box_col:
             ),
         )
         exact_text_only = st.session_state.get("search_route") == "literal"
+        find_clicked = False
+        find_query = ""
+        if not exact_text_only:
+            # Semantic route: find, then down-select, then ask. Find lists the notes closest in meaning; untick or 🎯
+            # the ones you want, and Search answers from those. Search on its own still does it all in one go.
+            with st.container(border=True, gap="xsmall", key="find_notes_box"):
+                find_query = st.text_input(
+                    "Find notes about",
+                    key="find_notes_query",
+                    placeholder="e.g. pilot pricing discussions",
+                    help=(
+                        "Lists the notes closest in meaning to this (within **Narrow by terms**, if set), without an LLM "
+                        "answer. Exclude 🚫 or keep 🎯 notes in the list, then **Search** answers your "
+                        "question from the notes you kept. **Max results** is the number of notes."
+                    ),
+                )
+                find_clicked = st.button(
+                    "🔎 Find notes",
+                    key="find_notes_button",
+                    use_container_width=True,
+                )
+                if found := found_notes(safe_lib):
+                    kept = [s for s in found["sources"] if s not in get_excluded_notes(safe_lib)]
+                    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                        st.caption(
+                            f"Found {len(found['sources'])} note(s) about *{found['query']}* · "
+                            f"**Search** asks within the {len(kept)} you kept.",
+                            width="stretch",
+                        )
+                        st.button(
+                            ":material/close:",
+                            key="clear_found_notes",
+                            type="tertiary",
+                            on_click=clear_found_notes,
+                            help="Forget the found notes: **Search** looks through the whole library again.",
+                        )
         _saved_filter = load_app_settings().get("search_filter") or {}
         FILTER_WIDGETS = {
             "all": (
@@ -7551,33 +7587,44 @@ with filter_box_col:
             ),
         }
         st.html(FILTER_FIELD_STYLE)
-        for field, (label, field_help) in FILTER_WIDGETS.items():
-            _key = f"filter_{field}"
-            if _key not in st.session_state:
-                st.session_state[_key] = clean_filter_terms(_saved_filter.get(field, []))
-                # Dates restored from the last session count as left over from an earlier search.
-                st.session_state[f"searched_dates_{field}"] = date_terms(st.session_state[_key])
-            # Each field is one small box: heading and quick dates, quick terms, then the terms themselves.
-            with st.container(border=True, gap="xsmall", key=f"filter_field_{field}"):
-                render_filter_heading(field, label, (
-                    f"{field_help}\n\n"
-                    "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
-                    "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
-                    + (
-                        "On the **Literal** route, **Search** returns the matching notes in full."
-                        if exact_text_only
-                        else "On the **Semantic** route, passages are ranked **only within** the matching notes."
+        # On the Semantic route the terms only narrow which notes are searched, so they're folded away.
+        set_terms = [
+            t for field in SEARCH_FILTER_FIELDS
+            for t in st.session_state.get(f"filter_{field}", _saved_filter.get(field, []))
+        ]
+        terms_area = st.container() if exact_text_only else st.expander(
+            "Narrow by terms" + (f" · {len(set_terms)} set ({truncate_text(', '.join(set_terms), 40)})" if set_terms else ""),
+            key="narrow_by_terms",
+            icon=":material/filter_alt:",
+        )
+        with terms_area:
+            for field, (label, field_help) in FILTER_WIDGETS.items():
+                _key = f"filter_{field}"
+                if _key not in st.session_state:
+                    st.session_state[_key] = clean_filter_terms(_saved_filter.get(field, []))
+                    # Dates restored from the last session count as left over from an earlier search.
+                    st.session_state[f"searched_dates_{field}"] = date_terms(st.session_state[_key])
+                # Each field is one small box: heading and quick dates, quick terms, then the terms themselves.
+                with st.container(border=True, gap="xsmall", key=f"filter_field_{field}"):
+                    render_filter_heading(field, label, (
+                        f"{field_help}\n\n"
+                        "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
+                        "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
+                        + (
+                            "On the **Literal** route, **Search** returns the matching notes in full."
+                            if exact_text_only
+                            else "On the **Semantic** route, passages are ranked **only within** the matching notes."
+                        )
+                    ))
+                    st.multiselect(
+                        label,
+                        options=st.session_state[_key],
+                        key=_key,
+                        accept_new_options=True,
+                        on_change=persist_search_filter,
+                        placeholder="Type a term, press Enter",
+                        label_visibility="collapsed",
                     )
-                ))
-                st.multiselect(
-                    label,
-                    options=st.session_state[_key],
-                    key=_key,
-                    accept_new_options=True,
-                    on_change=persist_search_filter,
-                    placeholder="Type a term, press Enter",
-                    label_visibility="collapsed",
-                )
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
         if "max_results" not in st.session_state:  # saved between searches and sessions
             st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
@@ -7621,7 +7668,6 @@ with filter_box_col:
                         ),
                     )
                 with filter_btn_col:
-                    find_clicked = False  # Find notes is the Semantic route's
                     filter_only_clicked = st.button(
                         "🔎 Filter search only",
                         help=(
@@ -7688,39 +7734,6 @@ with filter_box_col:
                 )
                 distance_threshold = float(st.session_state[_cutoff_key])
                 distance_map_slot = st.container()
-                # Find, then down-select, then ask: list the notes closest in meaning, untick or 🎯 the ones
-                # you want, and Search answers from those. Search on its own still does it all in one go.
-                with st.container(border=True, gap="xsmall", key="find_notes_box"):
-                    find_query = st.text_input(
-                        "Find notes about",
-                        key="find_notes_query",
-                        placeholder="e.g. pilot pricing discussions",
-                        help=(
-                            "Lists the notes closest in meaning to this (within the filter above), without an LLM "
-                            "answer. Exclude 🚫 or keep 🎯 notes in the list, then **Search** answers your "
-                            "question from the notes you kept. **Max results** is the number of notes."
-                        ),
-                    )
-                    find_clicked = st.button(
-                        "🔎 Find notes",
-                        key="find_notes_button",
-                        use_container_width=True,
-                    )
-                    if found := found_notes(safe_lib):
-                        kept = [s for s in found["sources"] if s not in get_excluded_notes(safe_lib)]
-                        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
-                            st.caption(
-                                f"Found {len(found['sources'])} note(s) about *{found['query']}* · "
-                                f"**Search** asks within the {len(kept)} you kept.",
-                                width="stretch",
-                            )
-                            st.button(
-                                ":material/close:",
-                                key="clear_found_notes",
-                                type="tertiary",
-                                on_click=clear_found_notes,
-                                help="Forget the found notes: **Search** looks through the whole library again.",
-                            )
 
     # Filter-only results are listed here, under the Filter box.
     filter_results_slot = st.container()
