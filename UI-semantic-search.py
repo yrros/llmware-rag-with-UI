@@ -1652,24 +1652,58 @@ def best_guess(question: str, search_filter: dict | None, search_state: dict | N
     return (later or [text for _, text in candidates] or [""])[0]
 
 
+def render_page_title(title: str) -> None:
+    """Title for every page except the main one; its 🧠 goes back to the main screen in the same tab."""
+    st.markdown(
+        f'<h1><a href="./" target="_self" title="Back to RAG Workspace Manager" '
+        f'style="text-decoration:none">🧠</a> {title}</h1>',
+        unsafe_allow_html=True,
+    )
+
+
+# The task executor is the one special link: the service that processes the outbox (e.g. the Salesforce
+# Connector app). It's defined first in Common links, listed first everywhere, and shown on the Actions page.
+EXECUTOR_ROLE = "executor"
+
+
+def ordered_links(library: dict) -> list[dict]:
+    """Common links with the task executor first."""
+    return sorted(library.get("links", []), key=lambda link: link.get("role") != EXECUTOR_ROLE)
+
+
+def executor_link(library: dict) -> dict | None:
+    return next((link for link in library.get("links", []) if link.get("role") == EXECUTOR_ROLE), None)
+
+
+def link_markdown(link: dict, guess: str = "") -> str:
+    """One link as Markdown (opens in a new tab), with its status dot and any best guess filled in."""
+    title, url = link.get("title") or link["url"], link["url"]
+    if BEST_GUESS in url:
+        url = url.replace(BEST_GUESS, quote_plus(guess))
+        title = f"{title}: {guess}" if guess else title
+    title = title.replace("[", "\\[").replace("]", "\\]")
+    return f"{link_status_dot(link['url'])}[{title}]({url.replace(' ', '%20').replace(')', '%29')})"
+
+
 def render_prompt_links(prompt: dict | None, library: dict, guess: str) -> None:
-    """The injected prompt's links, inline, each opening in a new tab."""
+    """The injected prompt's links, inline (task executor first), each opening in a new tab."""
     if not prompt:
         return
-    by_id = {link["id"]: link for link in library.get("links", [])}
-    parts = []
-    for link_id in prompt.get("links", []):
-        link = by_id.get(link_id)
-        if not link or not link.get("url"):
-            continue
-        title, url = link.get("title") or link["url"], link["url"]
-        if BEST_GUESS in url:
-            url = url.replace(BEST_GUESS, quote_plus(guess))
-            title = f"{title}: {guess}" if guess else title
-        title = title.replace("[", "\\[").replace("]", "\\]")
-        parts.append(f"{link_status_dot(link['url'])}[{title}]({url.replace(' ', '%20').replace(')', '%29')})")
+    chosen = set(prompt.get("links", []))
+    parts = [link_markdown(link, guess) for link in ordered_links(library) if link["id"] in chosen and link.get("url")]
     if parts:
         st.markdown(" · ".join(parts))
+
+
+def save_executor_field(field: str) -> None:
+    """Save the task executor's title or address, creating the executor link the first time."""
+    library = load_prompt_library()
+    link = executor_link(library)
+    if link is None:
+        link = {"id": uuid.uuid4().hex[:8], "title": "", "url": "", "role": EXECUTOR_ROLE}
+        library["links"].insert(0, link)
+    link[field] = str(st.session_state.get(f"executor_{field}", "")).strip()
+    save_prompt_library(library)
 
 
 def update_links(change) -> None:
@@ -2223,8 +2257,17 @@ def save_package_edits(path_text: str, entry_key: str, indexes: list[int]) -> No
 def render_actions_page() -> None:
     """Actions page (?page=actions): everything Agents sent to the outbox and what the connector did with it."""
     render_outbox_status(link=False)
-    st.title("Actions")
+    render_page_title("Actions")
     outbox = get_outbox_dir()
+    # The task executor (defined in the prompt library's Common links) processes what's listed here.
+    executor = executor_link(load_prompt_library())
+    if executor and executor.get("url"):
+        st.markdown(
+            f"**Task executor:** {link_markdown(executor)} — processes the outbox; open it to run now or change "
+            "the schedule."
+        )
+    else:
+        st.caption("Set the **Task executor** link in the prompt library's **Common links** to open it from here.")
     st.caption(
         f"Everything Agents have sent to the outbox (`{outbox}`) and what the connector did with it. "
         "Edit a package's text before a connector acts on it, withdraw it to stop a connector acting on it, "
@@ -2581,12 +2624,15 @@ def render_prompt_card(prompt: dict, model_options: list[str], links: list[dict]
                 label_visibility="collapsed",
             )
         if links:
-            titles = {link["id"]: link["title"] for link in links}
+            titles = {
+                link["id"]: ("⚙️ " if link.get("role") == EXECUTOR_ROLE else "🔗 ") + (link["title"] or link["url"])
+                for link in links
+            }
             st.multiselect(
                 "Links",
                 options=list(titles),
                 default=[link_id for link_id in prompt.get("links", []) if link_id in titles],
-                format_func=lambda link_id: f"🔗 {titles.get(link_id, link_id)}",
+                format_func=lambda link_id: titles.get(link_id, link_id),
                 key=f"prompt_links_{prompt_id}",
                 on_change=save_prompt_field,
                 args=(prompt_id, "links"),
@@ -2606,7 +2652,7 @@ def render_prompt_library_page() -> None:
     library = load_prompt_library()
     add_agent_border_style("[class*='st-key-agent_prompt_card_']")
     render_outbox_status()
-    st.title("Prompt library")
+    render_page_title("Prompt library")
     st.caption(
         "Shape what the LLM is told when it answers from your notes. Each request is built in this order: "
         "today's date → About me → corpus prompt → global prompts → your notes and question → the task you pick."
@@ -2615,6 +2661,24 @@ def render_prompt_library_page() -> None:
     links = library.get("links", [])
     with st.expander(f"Common links · {len(links)}", expanded=False, key="prompt_page_links_open",
                      icon=":material/link:"):
+        # The task executor comes first and is defined here; it can't be removed, only cleared.
+        executor = executor_link(library) or {}
+        st.markdown("**⚙️ Task executor**")
+        st.caption(
+            "The service that processes the outbox, e.g. the **Salesforce Connector** app "
+            "(`http://localhost:8503`), where you run it now or set its schedule. It's shown at the top of the "
+            "**Actions** page with 🟢 running / 🔴 not running, and you can attach it to prompts like any link."
+        )
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+            st.text_input("Title", value=executor.get("title", ""), key="executor_title", on_change=save_executor_field,
+                          args=("title",), max_chars=24, width=170, placeholder="Connector",
+                          help="A word or two.")
+            st.text_input("Address", value=executor.get("url", ""), key="executor_url", on_change=save_executor_field,
+                          args=("url",), placeholder="http://localhost:8503")
+            st.markdown(link_status_dot(executor.get("url", "")).strip() or " ", width="content",
+                        help="🟢 running · 🔴 not running (local links only)")
+
+        st.markdown("**🔗 Other links**")
         st.caption(
             "Links you attach to prompts with **Links** on each prompt card. While that prompt is injected they "
             "show under the question in the Ask box and open in a new tab. **Keep titles to a word or two** "
@@ -2623,7 +2687,7 @@ def render_prompt_library_page() -> None:
             "else the first **Must include** filter term, else names in your question). Links to this computer "
             "(localhost) show 🟢 when the service is running and 🔴 when it isn't."
         )
-        for link in links:
+        for link in [link for link in links if link.get("role") != EXECUTOR_ROLE]:
             with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
                 st.text_input(
                     "Title",
@@ -2814,7 +2878,7 @@ def render_prompt_library_page() -> None:
             st.caption("No prompts match." if library["prompts"] else "No prompts yet — add one below.")
         model_options = prompt_model_options()
         for prompt in shown:
-            render_prompt_card(prompt, model_options, library.get("links", []))
+            render_prompt_card(prompt, model_options, ordered_links(library))
 
     with st.container(border=True):
         st.subheader("Add a prompt")
