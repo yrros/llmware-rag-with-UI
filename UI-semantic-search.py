@@ -5369,6 +5369,52 @@ def describe_answer_length(tokens: int) -> str:
     return text + f". For scale, in tokens: {beyond}."
 
 
+LLM_SPEED_KEY = "llm_speed"  # app_settings: {model: {"tokens_per_second", "tokens", "at"}} from the last answer
+SPEED_BENCHMARK_TOKENS = 10000
+
+
+def format_duration(seconds: float) -> str:
+    seconds = round(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} min {seconds:02d} s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes:02d} min"
+
+
+def record_llm_speed(model: str, usage: dict | None) -> None:
+    """Keep the generation speed of the model's latest answer, so the next run can show what to expect."""
+    tokens_per_second = (usage or {}).get("tokens_per_second")
+    if not tokens_per_second:
+        return
+    speeds = dict(load_app_settings().get(LLM_SPEED_KEY) or {})
+    speeds[model] = {
+        "tokens_per_second": round(tokens_per_second, 1),
+        "tokens": (usage or {}).get("output"),
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    save_app_settings({LLM_SPEED_KEY: speeds})
+
+
+def last_llm_speed(model: str) -> dict | None:
+    return (load_app_settings().get(LLM_SPEED_KEY) or {}).get(model)
+
+
+def describe_llm_speed(model: str) -> str:
+    """The model's last-run speed and the time it implies for 10,000 tokens, shown under Search."""
+    record = last_llm_speed(model)
+    if not record:
+        return f"No speed measured yet for `{model}`; it's recorded after its next answer."
+    tokens_per_second = record["tokens_per_second"]
+    when = datetime.datetime.fromisoformat(record["at"]).strftime("%d %b %H:%M")
+    return (
+        f"Last run with `{model}` ({when}): {tokens_per_second:.1f} tokens/s · "
+        f"**{SPEED_BENCHMARK_TOKENS:,} tokens ≈ {format_duration(SPEED_BENCHMARK_TOKENS / tokens_per_second)}**"
+    )
+
+
 @contextmanager
 def llm_progress(slot, label: str):
     """A spinner in `slot` (under the Search button) with a tokens-per-second count beside it.
@@ -6365,6 +6411,28 @@ with filter_box_col:
                 describe_last_text_rescan([resolve_library_registry_name(lib) for lib in rescan_libraries])
             )
 
+            # Distance cutoff is a search setting (which passages count as matches), so it lives here, not in Ask.
+            _cutoff_key = f"search_distance_threshold_{safe_lib}"
+            if _cutoff_key not in st.session_state:
+                st.session_state[_cutoff_key] = float(distance_threshold)
+            st.slider(
+                "Distance cutoff",
+                min_value=DISTANCE_SLIDER_MIN,
+                max_value=DISTANCE_SLIDER_MAX,
+                step=DISTANCE_SLIDER_STEP,
+                key=_cutoff_key,
+                on_change=sync_cutoff_from_search,
+                args=(safe_lib,),
+                help=(
+                    "Semantic matches must be closer than this distance. Lower = stricter, higher = more lax. "
+                    "Same setting as **Relevance cutoff** in the left panel; changes here are saved for this corpus.\n\n"
+                    "After a semantic search the bar below shows where passages were found: "
+                    "**green** is within the cutoff, **amber** is where to raise it to include more."
+                ),
+            )
+            distance_threshold = float(st.session_state[_cutoff_key])
+            distance_map_slot = st.container()
+
     # Filter-only results are listed here, under the Filter box.
     filter_results_slot = st.container()
 
@@ -6447,8 +6515,12 @@ with ask_box_col:
                         "are more varied. Saved for this corpus."
                     ),
                 )
+            speed = last_llm_speed(selected_ollama_model)
             st.caption(
-                f"`{selected_ollama_model}` · up to {llm_max_tokens:,} tokens · temperature {llm_temperature:.2f}"
+                f"`{selected_ollama_model}` · up to {llm_max_tokens:,} tokens"
+                + (f" (≈{format_duration(llm_max_tokens / speed['tokens_per_second'])} at the last run's speed)"
+                   if speed else "")
+                + f" · temperature {llm_temperature:.2f}"
             )
             if not ollama_ok:
                 st.warning(
@@ -6465,34 +6537,16 @@ with ask_box_col:
             llm_max_tokens = int(corpus_config["llm_max_tokens"])
             llm_temperature = float(corpus_config["llm_temperature"])
 
-        _cutoff_key = f"search_distance_threshold_{safe_lib}"
-        if _cutoff_key not in st.session_state:
-            st.session_state[_cutoff_key] = float(distance_threshold)
-        st.slider(
-            "Distance cutoff",
-            min_value=DISTANCE_SLIDER_MIN,
-            max_value=DISTANCE_SLIDER_MAX,
-            step=DISTANCE_SLIDER_STEP,
-            key=_cutoff_key,
-            on_change=sync_cutoff_from_search,
-            args=(safe_lib,),
-            help=(
-                "Semantic matches must be closer than this distance. Lower = stricter, higher = more lax. "
-                "Same setting as **Relevance cutoff** in the left panel; changes here are saved for this corpus.\n\n"
-                "After a semantic search the bar below shows where passages were found: "
-                "**green** is within the cutoff, **amber** is where to raise it to include more."
-            ),
-        )
-        distance_threshold = float(st.session_state[_cutoff_key])
-        distance_map_slot = st.container()
-
         search_col, limit_col = st.columns([2, 1], vertical_alignment="bottom")
         with search_col:
             search_clicked = st.button("🔍 Search", type="primary", use_container_width=True)
         with limit_col:
             result_limit = st.number_input("Max results", min_value=1, max_value=50, value=15)
         # Searching and answering show their progress here, right under the button that started them.
+        # Between runs it shows the selected model's last speed.
         search_progress_slot = st.empty()
+        if use_llm_answer:
+            search_progress_slot.caption(describe_llm_speed(selected_ollama_model))
 
 run_prompts = resolve_run_prompts(prompt_library, corpus_config)
 
@@ -6628,6 +6682,9 @@ elif new_search and (prompt_text or run_filter_only):
                             mark_prompt_used(task_prompt["id"])
                     except Exception as llm_exc:
                         search_state["answer_error"] = str(llm_exc)
+                # Keep this run's speed for the model, and show it under Search now the spinner has gone.
+                record_llm_speed(selected_ollama_model, search_state["usage"])
+                search_progress_slot.caption(describe_llm_speed(selected_ollama_model))
             st.session_state[LAST_SEARCH_KEY] = search_state
 
             if final_results and use_llm_answer and not filter_only_clicked:

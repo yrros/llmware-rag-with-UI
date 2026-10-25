@@ -255,14 +255,15 @@ Results appear under **Sources** as one dropdown per document (documents with se
 
 ### Answer with LLM
 
-The Ask box reads top to bottom: your question → **Answer with LLM** → **Prompt library** → **Ollama model details** → **Distance cutoff** → **Search** (with **Max results**) → progress.
+The Ask box reads top to bottom: your question → **Answer with LLM** → **Prompt library** → **Ollama model details** → **Search** (with **Max results**) → progress. Search settings, including **Distance cutoff**, are in the Filter box's **Advanced search settings**.
 
 - **Answer with LLM** is enabled by default.
 - **Prompt library** — see [Prompt library](#prompt-library) below.
-- **Ollama model details** is folded by default; a line under it shows the model, max tokens and temperature in use. Inside: **Ollama model**, **Max tokens** and **Temperature** (saved per corpus as soon as you move them).
+- **Ollama model details** is folded by default; a line under it shows the model, max tokens (with how long that would take at the model's last measured speed) and temperature in use. Inside: **Ollama model**, **Max tokens** and **Temperature** (saved per corpus as soon as you move them).
 - **Max tokens** goes up to 50,000 (≈37,500 words). Its stops include book lengths for scale — *The Very Hungry Caterpillar*, *Where the Wild Things Are*, *The Tale of Peter Rabbit*, Dr. Seuss's *The Cat in the Hat*, *The Little Prince*, *Winnie-the-Pooh*, *The Old Man and the Sea*, *Animal Farm* and *The Lion, the Witch and the Wardrobe* — and the label and the line under the slider say how long the current setting is (word counts are approximate; English runs at about 0.75 words per token). *The Hobbit* (≈127,000 tokens) and *War and Peace* (≈783,000) are beyond the limit and shown for scale. The limit includes a reasoning model's thinking. Long answers take time (at 20 tokens/s, 50,000 tokens is about 40 minutes) and use more memory: Ollama's context window grows to fit the prompt plus the answer (8k, 16k, 32k or 64k tokens).
-- **Distance cutoff** (same setting as *Relevance cutoff* in the left panel, saved per corpus). After a semantic search, a bar under it shows where passages were found — green is within the cutoff, amber is where to raise it — with a **Set cutoff to …** button to include the closest match.
+- **Distance cutoff** (in the Filter box's **Advanced search settings**; same setting as *Relevance cutoff* in the left panel, saved per corpus) decides which passages count as semantic matches, so it applies with or without an LLM answer. After a semantic search, a bar under it shows where passages were found — green is within the cutoff, amber is where to raise it — with a **Set cutoff to …** button to include the closest match.
 - **Progress** shows right under **Search**: a spinner with the elapsed time while searching and answering, and beside it the generation speed (tokens per second and tokens so far), refreshed every 3 seconds. Answers stream from Ollama, so there's no overall time limit. The answer caption ends with the final tokens per second.
+- **Speed score.** After each answer the model's speed is saved (`llm_speed` in `app_settings.json`, per model) and shown under **Search** between runs, e.g. *Last run with `qwen3:30b` (25 Oct 10:42): 12.4 tokens/s · 10,000 tokens ≈ 13 min 26 s*, for whichever model is selected.
 - Search runs first; Ollama summarises the retrieved chunks—it does not replace retrieval.
 
 ### Prompt library
@@ -409,6 +410,7 @@ On first run, the app may copy data from the legacy location `~/llmware_data/` i
 - `auto_rescan_all_corpora` — default `false`; auto-rescan every visible corpus instead of just the selected one
 - `hide_corpora_enabled` — default `false`; hide corpora marked `hidden` in `corpus_settings.json` from the library list and all-corpora scans
 - `outbox_path` — folder that sent drafts are written to; empty means `outbox/` in the project folder
+- `llm_speed` — per Ollama model, the tokens per second of its last answer (with when, and how many tokens), shown under **Search** as the time for 10,000 tokens
 
 ### In-app constants (`UI-semantic-search.py`)
 
