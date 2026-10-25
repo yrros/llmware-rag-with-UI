@@ -833,6 +833,45 @@ def persist_search_filter() -> None:
     save_app_settings({"search_filter": current})
 
 
+# Quick date buttons under Must include. Notes carry their date as 2026-10-25, and weekly notes are headed
+# "Week#43"; ISO weeks (Monday to Sunday) and ISO week-years, so 29 Dec 2025 is in 2026 Week#1.
+QUICK_DATE_LABELS = {"today": "Today", "yesterday": "Yesterday", "this_week": "This week", "last_week": "Last week"}
+QUICK_DATE_TERM = re.compile(r"^(\d{4}-\d{2}-\d{2}|\d{4}|Week#\d{1,2})$", re.IGNORECASE)
+
+
+def quick_date_terms(kind: str, today: datetime.date) -> list[str]:
+    """Must include terms for a quick date button, e.g. ["2026-10-25"] or ["2026", "Week#43"]."""
+    if kind in ("today", "yesterday"):
+        day = today - datetime.timedelta(days=0 if kind == "today" else 1)
+        return [day.isoformat()]
+    day = today - datetime.timedelta(weeks=0 if kind == "this_week" else 1)
+    year, week, _weekday = day.isocalendar()
+    return [str(year), f"Week#{week}"]
+
+
+def apply_quick_date(kind: str) -> None:
+    """Replace the date terms in Must include (any a button added before) with this button's, then save."""
+    kept = [t for t in st.session_state.get("filter_all", []) if not QUICK_DATE_TERM.match(str(t))]
+    st.session_state["filter_all"] = kept + quick_date_terms(kind, datetime.date.today())
+    persist_search_filter()
+
+
+def render_quick_date_buttons() -> None:
+    today = datetime.date.today()
+    with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
+        st.caption("Must include:")
+        for kind, label in QUICK_DATE_LABELS.items():
+            terms = quick_date_terms(kind, today)
+            st.button(
+                label,
+                key=f"quick_date_{kind}",
+                type="tertiary",
+                on_click=apply_quick_date,
+                args=(kind,),
+                help=f"Puts {' and '.join(f'`{t}`' for t in terms)} in **Must include**, replacing other date terms.",
+            )
+
+
 def clear_search_filter() -> None:
     """Clear Filter button: empty every filter field and drop note exclusions."""
     for field in SEARCH_FILTER_FIELDS:
@@ -7012,6 +7051,8 @@ with filter_box_col:
                     )
                 ),
             )
+            if field == "all":
+                render_quick_date_buttons()
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
         if "max_results" not in st.session_state:  # saved between searches and sessions
             st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)

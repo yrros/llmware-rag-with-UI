@@ -239,6 +239,17 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
    - **Exclude (NOT)** — notes with any of these terms are dropped.
 
    Terms match literally and case-insensitively anywhere in the note or its file name (`2026-10` matches `2026-10-19`). With a question, semantic search ranks passages only within the matching notes. Filters are saved between sessions.
+
+   **Quick dates**, under **Must include**, put date terms in for you, replacing any date terms already there (other terms stay):
+
+   | Button | Adds (on Sunday 25 October 2026) |
+   |---|---|
+   | **Today** | `2026-10-25` |
+   | **Yesterday** | `2026-10-24` |
+   | **This week** | `2026` and `Week#43` |
+   | **Last week** | `2026` and `Week#42` |
+
+   Days match notes that contain the date as `YYYY-MM-DD`. Weeks match notes headed `Week#NN` in that year, using ISO weeks (Monday to Sunday; 29 Dec 2025 is 2026 `Week#1`). The year is its own term rather than a month, so a week that spans two months still matches. Because terms match anywhere, `Week#4` also matches `Week#40`–`Week#49`, which only matters in weeks 1–9.
 3. Enter your question in **What would you like to ask?**
 4. Click **Search**.
 
