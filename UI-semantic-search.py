@@ -836,8 +836,8 @@ def persist_search_filter() -> None:
 # Quick date buttons under Must include. Notes carry their date as 2026-10-25, and weekly notes are headed
 # "Week#43"; ISO weeks (Monday to Sunday) and ISO week-years, so 29 Dec 2025 is in 2026 Week#1.
 QUICK_DATE_LABELS = {
-    "today": "Today", "yesterday": "Yesterday", "this_week": "This week", "last_week": "Last week",
-    "this_month": "This month", "last_month": "Last month",
+    "today": "Today", "yesterday": "-1 day", "this_week": "This week", "last_week": "-1 week",
+    "this_month": "This month", "last_month": "-1 month",
 }
 # Any date-like term, typed or added by a button: 2026-10-25, 2026-10, 2026, 2026/10/25, 2026/10, 25/10/2026,
 # 25-10-2026, Week#43 / Week 43. A quick date button removes the ones left over from the last search.

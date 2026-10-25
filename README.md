@@ -240,16 +240,16 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
 
    Terms match literally and case-insensitively anywhere in the note, its file name or the folders it's in (`2026-10` matches `2026-10-19`; `Clients-Prospects` matches every note in a folder of that name, and `Clients/Prospects` or `Clients > Prospects` match nested folders). A note whose file name appears in two folders of a library can't be placed, so only its text and name are matched. With a question, semantic search ranks passages only within the matching notes. Filters are saved between sessions.
 
-   Each field sits in its own small box: its heading, quick dates and quick search terms (rounded chips), then its terms. **Quick dates** sit on the heading line of **Must include**, **Any of** and **Exclude**, and put date terms into that field. Clicks add up until you search, so **Today** then **Yesterday** in **Any of** finds notes from either day. After a search, the next click first takes out the dates that were in that field for the search (and dates restored when the app starts), whether a button added them or you typed them (`2026-10-25`, `2026-10`, `2026`, `2026/10/25`, `25/10/2026`, `Week#43`…). Other terms, and the other two fields, stay as they are:
+   Each field sits in its own small box: its heading, quick dates and quick search terms (rounded chips), then its terms. **Quick dates** sit on the heading line of **Must include**, **Any of** and **Exclude**, and put date terms into that field. Clicks add up until you search, so **Today** then **-1 day** in **Any of** finds notes from either day. After a search, the next click first takes out the dates that were in that field for the search (and dates restored when the app starts), whether a button added them or you typed them (`2026-10-25`, `2026-10`, `2026`, `2026/10/25`, `25/10/2026`, `Week#43`…). Other terms, and the other two fields, stay as they are:
 
    | Button | Adds to Must include (on Sunday 25 October 2026) | Adds to Any of / Exclude |
    |---|---|---|
    | **Today** | `2026-10-25` | the same |
-   | **Yesterday** | `2026-10-24` | the same |
+   | **-1 day** | `2026-10-24` | the same |
    | **This week** | `2026` and `Week#43` | the 7 dates `2026-10-19` … `2026-10-25` |
-   | **Last week** | `2026` and `Week#42` | the 7 dates `2026-10-12` … `2026-10-18` |
+   | **-1 week** | `2026` and `Week#42` | the 7 dates `2026-10-12` … `2026-10-18` |
    | **This month** | `2026-10` | the same |
-   | **Last month** | `2026-09` | the same |
+   | **-1 month** | `2026-09` | the same |
 
    Days match notes that contain the date as `YYYY-MM-DD`, and months every date in that month. In **Must include**, weeks match notes headed `Week#NN` in that year, using ISO weeks (Monday to Sunday; 29 Dec 2025 is 2026 `Week#1`). The year is its own term rather than a month, so a week that spans two months still matches. Because terms match anywhere, `Week#4` also matches `Week#40`–`Week#49`, which only matters in weeks 1–9. In **Any of** and **Exclude** a bare year would match, or exclude, the whole year, so weeks are the seven days instead. A bare four-digit number counts as a year, so a button would take a leftover one out too. Hover a button to see exactly what it puts in.
 
