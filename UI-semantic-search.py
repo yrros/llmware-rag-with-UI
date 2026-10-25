@@ -1781,6 +1781,39 @@ def reference_record_link(record: dict) -> str:
     return f"[Open in {source.title() if source else 'the other system'} ↗]({url})"
 
 
+# Text that must not get links inside it: existing markdown links, inline code and bare addresses.
+LINK_PROTECTED = re.compile(r"(\[[^\]]*\]\([^)]*\)|`[^`]*`|https?://\S+)")
+
+
+def link_opportunity_names(text: str) -> str:
+    """Markdown with each opportunity named in the reference snapshot linked to its page, for display only.
+
+    Names match whole words, ignoring case, longest first; text already in a link or code is left alone.
+    """
+    linked = {r["name"].strip().lower(): r["url"] for r in reference_records()
+              if r["name"].strip() and str(r.get("url") or "").startswith("https://")}
+    if not text or not linked:
+        return text
+    names = sorted(linked, key=len, reverse=True)
+    pattern = re.compile(r"(?<!\w)(" + "|".join(re.escape(n) for n in names) + r")(?!\w)", re.IGNORECASE)
+
+    def link(match: re.Match) -> str:
+        return f"[{match.group(1)}]({linked[match.group(1).lower()]})"
+
+    parts = LINK_PROTECTED.split(text)  # odd positions are the protected pieces
+    return "".join(part if i % 2 else pattern.sub(link, part) for i, part in enumerate(parts))
+
+
+def receipt_links(result: dict) -> list[str]:
+    """Markdown links a connector's receipt gives for one item: the record itself and the record it's on."""
+    links = []
+    for key, label in (("url", f"Open {result.get('object') or 'record'} ↗"), ("related_url", "Open the record it's on ↗")):
+        url = str(result.get(key) or "")
+        if url.startswith("https://"):
+            links.append(f"[{label}]({url})")
+    return links
+
+
 def describe_reference_record(record: dict) -> str:
     parts = [record.get("account") or "", f"stage {record['stage']}" if record.get("stage") else "",
              f"updated {record['last_updated']}" if record.get("last_updated") else ""]
@@ -2438,10 +2471,12 @@ def render_outbox_entry(entry: dict, state: str) -> None:
                 line = describe_staged_item(item)
             except (KeyError, TypeError):
                 line = f"**{staged_item_title(item)}**"
-            st.markdown(f"{RECEIPT_ITEM_ICONS.get(result.get('status'), '⏳' if state == 'waiting' else '')} {line}")
+            icon = RECEIPT_ITEM_ICONS.get(result.get("status"), "⏳" if state == "waiting" else "")
+            st.markdown(f"{icon} {link_opportunity_names(line)}")
             notes_line = []
             if result.get("record_id"):
                 notes_line.append(f"{result.get('object', 'Record')} `{result['record_id']}`")
+            notes_line += receipt_links(result)
             if result.get("message"):
                 notes_line.append(result["message"])
             candidates = ", ".join(
@@ -4305,7 +4340,7 @@ def render_discussion_body(
             st.caption("No follow-up questions yet.")
         for turn in discussion:
             with st.chat_message(turn["role"]):
-                st.markdown(turn["content"])
+                st.markdown(link_opportunity_names(turn["content"]))
                 if turn.get("model"):
                     st.caption(f"`{turn['model']}`")
                 # Every turn can be copied. When the model was sent more than is shown (a step's prompt, or
@@ -4650,10 +4685,12 @@ def render_sent_status(batch: dict) -> bool:
         message += f" {receipt['error']}"
     (st.success if receipt["status"] == "done" else st.warning)(message)
     for result in receipt.get("items", []):
-        if result["status"] in DONE_ITEM_STATUSES:
-            continue
         index = result["index"]
         title = staged_item_title(batch["items"][index]) if index < len(batch["items"]) else f"Item {index + 1}"
+        if result["status"] in DONE_ITEM_STATUSES:
+            if links := receipt_links(result):  # done: just where to see it
+                st.caption(f"{title}: " + " · ".join(links))
+            continue
         candidates = ", ".join(c["name"] for c in result.get("candidates", []))
         st.caption(f"{title}: {result['message']}" + (f" Possible matches: {candidates}." if candidates else ""))
     return False
@@ -4752,7 +4789,7 @@ def render_agent_panel(
                 for index, item in enumerate(staged["items"]):
                     item_col, remove_col = st.columns([0.92, 0.08])
                     with item_col:
-                        st.markdown(describe_staged_item(item))
+                        st.markdown(link_opportunity_names(describe_staged_item(item)))
                         render_reference_picker(agent, index, item)
                     with remove_col:
                         st.button(
@@ -4858,7 +4895,7 @@ def render_search_results(
     with main_col:
         if search_state["answer"]:
             st.subheader("Answer")
-            st.markdown(search_state["answer"])
+            st.markdown(link_opportunity_names(search_state["answer"]))
             render_copy_buttons([
                 ("Copy answer", search_state["answer"]),
                 ("Copy question", search_state.get("question", "")),
