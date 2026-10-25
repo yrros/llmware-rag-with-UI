@@ -2734,12 +2734,22 @@ def render_actions_page() -> None:
     if (linked := st.query_params.get("package")) and "actions_query" not in st.session_state:
         st.session_state["actions_query"] = Path(linked).stem
     with st.container(horizontal=True, vertical_alignment="bottom"):
-        query = st.text_input(
-            "Filter",
-            key="actions_query",
-            placeholder="Search subjects, titles, prompts, owners and messages",
-            icon=":material/search:",
-        )
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="xsmall"):
+            query = st.text_input(
+                "Filter",
+                key="actions_query",
+                placeholder="Search subjects, titles, prompts, owners and messages",
+                icon=":material/search:",
+            )
+            st.button(
+                ":material/close:",
+                key="actions_clear_query",
+                type="tertiary",
+                on_click=st.session_state.update,
+                kwargs={"actions_query": ""},
+                disabled=not query,
+                help="Clear the filter",
+            )
         st.button("Refresh", icon=":material/refresh:", key="actions_refresh")
     tabs = st.tabs([f"{OUTBOX_STATES[state][0]} ({len(entries[state])})" for state in OUTBOX_STATES])
     for tab, state in zip(tabs, OUTBOX_STATES):
