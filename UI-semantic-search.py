@@ -840,14 +840,18 @@ QUICK_DATE_LABELS = {
     "this_month": "This month", "last_month": "Last month",
 }
 # Any date-like term, typed or added by a button: 2026-10-25, 2026-10, 2026, 2026/10/25, 2026/10, 25/10/2026,
-# 25-10-2026, Week#43 / Week 43. A quick date button removes all of these from Must include first.
+# 25-10-2026, Week#43 / Week 43. A quick date button removes all of these from its field first.
 QUICK_DATE_TERM = re.compile(
     r"^(\d{4}([-/]\d{1,2}){0,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4}|week\s*#?\s*\d{1,2})$", re.IGNORECASE
 )
 
 
-def quick_date_terms(kind: str, today: datetime.date) -> list[str]:
-    """Must include terms for a quick date button, e.g. ["2026-10-25"], ["2026", "Week#43"] or ["2026-10"]."""
+def quick_date_terms(kind: str, today: datetime.date, field: str = "all") -> list[str]:
+    """Terms for a quick date button in a filter field, e.g. ["2026-10-25"] or ["2026-10"].
+
+    A week in Must include (AND) is the year plus "Week#43", as weekly notes are headed. In Any of (OR) and
+    Exclude (NOT) a bare year would match or drop every note that year, so a week there is its seven dates.
+    """
     if kind in ("today", "yesterday"):
         day = today - datetime.timedelta(days=0 if kind == "today" else 1)
         return [day.isoformat()]
@@ -856,30 +860,36 @@ def quick_date_terms(kind: str, today: datetime.date) -> list[str]:
         month = month_start if kind == "this_month" else (month_start - datetime.timedelta(days=1))
         return [f"{month:%Y-%m}"]  # matches every 2026-10-DD date in that month
     day = today - datetime.timedelta(weeks=0 if kind == "this_week" else 1)
-    year, week, _weekday = day.isocalendar()
-    return [str(year), f"Week#{week}"]
+    year, week, weekday = day.isocalendar()
+    if field == "all":
+        return [str(year), f"Week#{week}"]
+    monday = day - datetime.timedelta(days=weekday - 1)
+    return [(monday + datetime.timedelta(days=i)).isoformat() for i in range(7)]
 
 
-def apply_quick_date(kind: str) -> None:
-    """Replace every date term in Must include (typed or from a button) with this button's, then save."""
-    kept = [t for t in st.session_state.get("filter_all", []) if not QUICK_DATE_TERM.match(str(t))]
-    st.session_state["filter_all"] = kept + quick_date_terms(kind, datetime.date.today())
+def apply_quick_date(kind: str, field: str) -> None:
+    """Replace every date term in a filter field (typed or from a button) with this button's, then save."""
+    key = f"filter_{field}"
+    kept = [t for t in st.session_state.get(key, []) if not QUICK_DATE_TERM.match(str(t))]
+    st.session_state[key] = kept + quick_date_terms(kind, datetime.date.today(), field)
     persist_search_filter()
 
 
-def render_quick_date_buttons() -> None:
+def render_filter_heading(field: str, label: str, field_help: str) -> None:
+    """A filter field's heading with its quick date buttons on the same line."""
     today = datetime.date.today()
     with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
-        st.caption("Must include:")
-        for kind, label in QUICK_DATE_LABELS.items():
-            terms = quick_date_terms(kind, today)
+        st.markdown(label, width="content", help=field_help)
+        for kind, button_label in QUICK_DATE_LABELS.items():
+            terms = quick_date_terms(kind, today, field)
+            shown = " and ".join(f"`{t}`" for t in terms) if len(terms) <= 2 else f"`{terms[0]}` … `{terms[-1]}`"
             st.button(
-                label,
-                key=f"quick_date_{kind}",
+                button_label,
+                key=f"quick_date_{field}_{kind}",
                 type="tertiary",
                 on_click=apply_quick_date,
-                args=(kind,),
-                help=f"Puts {' and '.join(f'`{t}`' for t in terms)} in **Must include**, and takes out any other dates there.",
+                args=(kind, field),
+                help=f"Puts {shown} in **{label}**, and takes out any other dates there.",
             )
 
 
@@ -7044,6 +7054,17 @@ with filter_box_col:
             _key = f"filter_{field}"
             if _key not in st.session_state:
                 st.session_state[_key] = clean_filter_terms(_saved_filter.get(field, []))
+            # The heading carries the field's help and its quick date buttons, on one line.
+            render_filter_heading(field, label, (
+                f"{field_help}\n\n"
+                "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
+                "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
+                + (
+                    "On the **Literal** route, **Search** returns the matching notes in full."
+                    if exact_text_only
+                    else "On the **Semantic** route, passages are ranked **only within** the matching notes."
+                )
+            ))
             st.multiselect(
                 label,
                 options=st.session_state[_key],
@@ -7051,19 +7072,8 @@ with filter_box_col:
                 accept_new_options=True,
                 on_change=persist_search_filter,
                 placeholder="Type a term, press Enter",
-                help=(
-                    f"{field_help}\n\n"
-                    "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
-                    "file name, so `2026-10` matches `2026-10-19` but not `2026 … 10`. "
-                    + (
-                        "On the **Literal** route, **Search** returns the matching notes in full."
-                        if exact_text_only
-                        else "On the **Semantic** route, passages are ranked **only within** the matching notes."
-                    )
-                ),
+                label_visibility="collapsed",
             )
-            if field == "all":
-                render_quick_date_buttons()
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
         if "max_results" not in st.session_state:  # saved between searches and sessions
             st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
