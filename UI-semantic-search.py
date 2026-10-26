@@ -1728,6 +1728,8 @@ def normalise_draft_item(item_type: str, item) -> dict:
             priority=priority if priority in TASK_PRIORITIES else "",
             owner=text("owner"),
         )
+        if item.get("allow_duplicate"):  # Create anyway, even if it looks like an open task
+            draft["allow_duplicate"] = True
     else:
         recipients = item.get("to", [])
         if isinstance(recipients, str):
@@ -1752,26 +1754,114 @@ def agent_command(prompt: dict) -> str:
 
 REFERENCE_SCHEMA_ID = "llm-notes-reference/v1"
 REFERENCE_FILE = "opportunities.json"
+REFERENCE_TASKS_FILE = "tasks.json"  # the user's own open tasks
+OPEN_TASKS_PROMPT_LIMIT = 40  # open tasks listed to the model
 REFERENCE_PROMPT_LIMIT = 80  # records listed to the model; the snapshot is newest-updated first
 _reference_cache: dict = {}
 
 
-def load_reference_snapshot() -> dict | None:
-    """The connector's snapshot of open opportunities, or None if there isn't a valid one (re-read when it changes)."""
-    path = get_outbox_dir() / "reference" / REFERENCE_FILE
+def load_reference_file(name: str) -> dict | None:
+    """One of the connector's snapshot files, or None if there isn't a valid one (re-read when it changes)."""
+    path = get_outbox_dir() / "reference" / name
     try:
         stamp = path.stat().st_mtime
     except OSError:
         return None
-    if _reference_cache.get("key") != (str(path), stamp):
+    cached = _reference_cache.setdefault(name, {})
+    if cached.get("key") != (str(path), stamp):
         try:
             snapshot = json.loads(path.read_text())
         except (OSError, ValueError):
             snapshot = None
         if not isinstance(snapshot, dict) or snapshot.get("schema") != REFERENCE_SCHEMA_ID:
             snapshot = None
-        _reference_cache.update(key=(str(path), stamp), snapshot=snapshot)
-    return _reference_cache["snapshot"]
+        cached.update(key=(str(path), stamp), snapshot=snapshot)
+    return cached["snapshot"]
+
+
+def load_reference_snapshot() -> dict | None:
+    """The connector's snapshot of open opportunities, or None if there isn't a valid one."""
+    return load_reference_file(REFERENCE_FILE)
+
+
+def reference_open_tasks() -> list[dict]:
+    """The user's own open tasks from the connector's snapshot (tasks.json), soonest due first."""
+    snapshot = load_reference_file(REFERENCE_TASKS_FILE) or {}
+    return [r for r in snapshot.get("records", []) if isinstance(r, dict) and r.get("kind") == "task" and r.get("subject")]
+
+
+# A staged task that repeats one of the user's open tasks. Same rules as the connector's sfc/duplicates.py, so
+# what's flagged here is what the connector would hold: the subjects' key words, ignoring case, punctuation,
+# title markers, filler, one- and two-letter words and plural s; all must match, or at least two making up 3/4
+# of the shorter subject. Tasks on different records are different actions.
+TASK_FILLER = {
+    "the", "a", "an", "to", "for", "with", "and", "or", "of", "on", "in", "at", "by", "about", "re", "from",
+    "our", "my", "your", "their", "his", "her", "its", "this", "that", "these", "those", "up", "out", "new",
+    "please", "re:", "fw", "fwd",
+}
+TASK_MARKER = re.compile(r"\[[^\]]*\]|^[A-Z0-9_]+:\s*")
+
+
+def task_subject_words(subject: str) -> set[str]:
+    words = set()
+    for word in re.findall(r"[a-z0-9]+", TASK_MARKER.sub(" ", subject or "").lower()):
+        if len(word) <= 2 or word in TASK_FILLER:
+            continue
+        words.add(word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word)
+    return words
+
+
+def same_task_action(new_subject: str, old_subject: str) -> bool:
+    new, old = task_subject_words(new_subject), task_subject_words(old_subject)
+    if not new or not old:
+        return False
+    shared = len(new & old)
+    return new == old or (shared >= 2 and shared / min(len(new), len(old)) >= 0.75)
+
+
+def similar_open_tasks(item: dict) -> list[dict]:
+    """The user's open tasks a staged task looks like (none for other item types)."""
+    if item.get("type") != "task":
+        return []
+    on = str((item.get("related_to") or {}).get("name", "")).strip().lower()
+    return [
+        task for task in reference_open_tasks()
+        if not (on and task.get("related") and task["related"].strip().lower() != on)
+        and same_task_action(item.get("subject", ""), task["subject"])
+    ]
+
+
+def describe_open_task(task: dict) -> str:
+    """'“Send pricing” · due 2026-10-27 · Not Started · on Acme pilot · [Open Task ↗](…)'."""
+    parts = [f"“{task['subject']}”", f"due {task['due_date']}" if task.get("due_date") else "no due date",
+             task.get("status") or "", f"on {task['related']}" if task.get("related") else ""]
+    if str(task.get("url") or "").startswith("https://"):
+        parts.append(f"[Open Task ↗]({task['url']})")
+    return " · ".join(p for p in parts if p)
+
+
+def open_tasks_prompt_text(prompts: list[dict], records: list[dict]) -> str:
+    """The user's open tasks, for Agents that create tasks, so they don't propose one again (empty otherwise).
+
+    Tasks on the opportunities the notes mention come first, then the soonest due, up to OPEN_TASKS_PROMPT_LIMIT.
+    """
+    if not any(get_prompt_output_type(p) in ("task", "next_step") for p in prompts):
+        return ""
+    tasks = reference_open_tasks()
+    if not tasks:
+        return ""
+    mentioned = {str(r.get(k) or "").strip().lower() for r in records for k in ("name", "account")} - {""}
+    tasks = sorted(tasks, key=lambda t: (t.get("related", "").strip().lower() not in mentioned,))[:OPEN_TASKS_PROMPT_LIMIT]
+    lines = "\n".join(
+        f"- {t['subject']} (" + ", ".join(p for p in (
+            f"due {t['due_date']}" if t.get("due_date") else "", t.get("status", ""), f"on {t['related']}" if t.get("related") else ""
+        ) if p) + ")"
+        for t in tasks
+    )
+    return (
+        "These are my open tasks already in the connected system. Don't propose a task that repeats one of them; "
+        f"if an action is already covered by one, say so instead.\n{lines}"
+    )
 
 
 def reference_records() -> list[dict]:
@@ -1903,10 +1993,13 @@ def build_agent_task_prompt(prompts: list[dict], results: list) -> str:
     Several Agents (e.g. SF_Next_Step and SF_Tasks) become parts of one request, each answered under its own
     heading, with the items numbered across all parts.
     """
-    reference = reference_prompt_text(notes_reference_records(results))
+    mentioned = notes_reference_records(results)
+    reference = reference_prompt_text(mentioned)
+    open_tasks = open_tasks_prompt_text(prompts, mentioned)
     tail = (
         " Ask me the questions you need answered to do that well, and don't guess anything the notes don't say."
         + (f" Say which opportunity each item belongs to.\n\n{reference}" if reference else "")
+        + (f"\n\n{open_tasks}" if open_tasks else "")
     )
     if len(prompts) == 1:
         prompt = prompts[0]
@@ -2179,7 +2272,9 @@ def stage_agent_items(
     """
     item_type = get_prompt_output_type(prompt)
     messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
-    reference = reference_prompt_text(notes_reference_records(discussion_results(search_state)))
+    mentioned = notes_reference_records(discussion_results(search_state))
+    reference = reference_prompt_text(mentioned)
+    open_tasks = open_tasks_prompt_text([prompt], mentioned)
     only_part = (
         f"This covers only part {part[0]} of {part[1]} ({prompt['name']}): give only that part's records; "
         "the other parts are staged separately.\n\n" if part else ""
@@ -2191,6 +2286,7 @@ def stage_agent_items(
             "Include only the items I selected or agreed, with the details we agreed, and leave out anything "
             f"I said to ignore. {STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
             + (f"\n\n{reference}" if reference else "")
+            + (f"\n\n{open_tasks}" if open_tasks else "")
         ),
     })
     reply, _usage = chat_with_ollama(
@@ -2259,8 +2355,9 @@ def build_handoff_package(
     search_state: dict, prompts: list[dict], staged: dict, source_notes: list[tuple[str, Path | None]]
 ) -> dict:
     return {
-        # v1 unless the package holds updates or mixed items, so connectors that only read v1 keep working.
-        "schema": HANDOFF_SCHEMA_V2_ID if staged["type"] in ("update", "mixed") else HANDOFF_SCHEMA_ID,
+        # v1 unless the package holds updates, mixed items or Create anyway, so v1-only connectors keep working.
+        "schema": HANDOFF_SCHEMA_V2_ID if staged["type"] in ("update", "mixed")
+        or any(item.get("allow_duplicate") for item in staged["items"]) else HANDOFF_SCHEMA_ID,
         "id": staged["id"],
         "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "item_type": staged["type"],
@@ -2357,7 +2454,7 @@ PACKAGE_STATUS = {
     "": ("❔", "no receipt"),
 }
 RECEIPT_ITEM_ICONS = {
-    "created": "✅", "updated": "✅", "exists": "✅", "needs_match": "⚠️", "invalid": "⚠️", "stale": "⚠️",
+    "created": "✅", "updated": "✅", "exists": "✅", "needs_match": "⚠️", "invalid": "⚠️", "stale": "⚠️", "duplicate": "⚠️",
     "skipped": "⏭️", "error": "❌",
 }
 DONE_ITEM_STATUSES = ("created", "updated", "exists")  # receipt item statuses meaning it went through
@@ -2419,6 +2516,33 @@ def move_outbox_package(path_text: str, destination: str, action: str) -> None:
             receipt.unlink()
     path.replace(target_dir / path.name)
     st.session_state["actions_notice"] = f"{action} `{path.name}`."
+
+
+def describe_candidate(candidate: dict) -> str:
+    """A receipt's candidate record: its name linked to it when the connector gave a link, plus its id and details."""
+    name, url = candidate.get("name", "?"), str(candidate.get("url") or "")
+    text = f"[{name} ↗]({url})" if url.startswith("https://") else f"{name} (`{candidate.get('id', '?')}`)"
+    return text + (f" ({candidate['detail']})" if candidate.get("detail") else "")
+
+
+def create_anyway_and_retry(path_text: str, index: int) -> None:
+    """Mark a held duplicate task Create anyway (a v2 field) and send its package back to the outbox."""
+    path = Path(path_text)
+    if not path.is_file():
+        st.session_state["actions_notice"] = f"`{path.name}` has already moved; the list is refreshed."
+        return
+    package = json.loads(path.read_text())
+    package["items"][index]["allow_duplicate"] = True
+    package["schema"] = HANDOFF_SCHEMA_V2_ID  # v2 is v1 plus update items, mixed packages and Create anyway
+    try:
+        validate_handoff_package(package)
+    except Exception as exc:
+        st.session_state["actions_notice"] = f"Not changed: the package wouldn't be valid ({exc})."
+        return
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(json.dumps(package, indent=2, ensure_ascii=False))
+    temp.replace(path)
+    move_outbox_package(path_text, "", "Create anyway: sent back to the outbox:")
 
 
 def delete_withdrawn_packages(path_texts: list[str]) -> None:
@@ -2509,13 +2633,23 @@ def render_outbox_entry(entry: dict, state: str) -> None:
             notes_line += receipt_links(result)
             if result.get("message"):
                 notes_line.append(result["message"])
-            candidates = ", ".join(
-                f"{c.get('name', '?')} (`{c.get('id', '?')}`)" for c in result.get("candidates", []) if isinstance(c, dict)
-            )
+            candidates = ", ".join(describe_candidate(c) for c in result.get("candidates", []) if isinstance(c, dict))
             if candidates:
-                notes_line.append(f"Possible matches: {candidates}")
+                notes_line.append(
+                    f"{'Looks like' if result.get('status') == 'duplicate' else 'Possible matches'}: {candidates}"
+                )
             if notes_line:
                 st.caption(" · ".join(notes_line))
+            if state == "failed" and result.get("status") == "duplicate":
+                st.button(
+                    "Create anyway and retry",
+                    key=f"actions_create_anyway_{state}_{entry['path'].name}_{index}",
+                    icon=":material/content_copy:",
+                    on_click=create_anyway_and_retry,
+                    args=(str(entry["path"]), index),
+                    help="Create this task even though it looks like an open one, and send the package back to the "
+                    "outbox. Anything already created isn't created twice.",
+                )
         if state == "failed":
             st.caption(
                 "If a record needs choosing, choose it in the connector (it then retries by itself). After a "
@@ -4629,8 +4763,8 @@ def describe_staged_item(item: dict) -> str:
 def unstage_item(agent: dict, index: int) -> None:
     agent["staged"]["items"].pop(index)
     # Item positions shift, so drop the record pickers' remembered choices for this staging.
-    prefix = f"agent_ref_{agent['staged']['id']}_"
-    for key in [k for k in st.session_state if str(k).startswith(prefix)]:
+    prefixes = (f"agent_ref_{agent['staged']['id']}_", f"agent_dup_{agent['staged']['id']}_")
+    for key in [k for k in st.session_state if str(k).startswith(prefixes)]:
         del st.session_state[key]
 
 
@@ -4696,6 +4830,34 @@ def render_reference_picker(agent: dict, index: int, item: dict) -> None:
         args=(agent, index, widget_key),
         label_visibility="collapsed",
         help="Open opportunities from the connector's reference snapshot. The connector links to the one you choose.",
+    )
+
+
+def set_allow_duplicate(agent: dict, index: int, widget_key: str) -> None:
+    item = agent["staged"]["items"][index]
+    if st.session_state.get(widget_key):
+        item["allow_duplicate"] = True
+    else:
+        item.pop("allow_duplicate", None)
+
+
+def render_duplicate_check(agent: dict, index: int, item: dict) -> None:
+    """Under a staged task: the open tasks it looks like, and Create anyway (else the connector holds it)."""
+    matches = similar_open_tasks(item)
+    if not matches:
+        return
+    st.caption(
+        "⚠ Looks like an open task of yours, so the connector will hold it unless you tick **Create anyway**:  \n"
+        + "  \n".join(describe_open_task(task) for task in matches[:3])
+    )
+    widget_key = f"agent_dup_{agent['staged']['id']}_{index}"
+    st.checkbox(
+        "Create anyway",
+        value=bool(item.get("allow_duplicate")),
+        key=widget_key,
+        on_change=set_allow_duplicate,
+        args=(agent, index, widget_key),
+        help="Create this task even though it looks like one you already have.",
     )
 
 
@@ -4766,8 +4928,9 @@ def render_sent_status(batch: dict) -> bool:
             if links := receipt_links(result):  # done: just where to see it
                 st.caption(f"{title}: " + " · ".join(links))
             continue
-        candidates = ", ".join(c["name"] for c in result.get("candidates", []))
-        st.caption(f"{title}: {result['message']}" + (f" Possible matches: {candidates}." if candidates else ""))
+        candidates = ", ".join(describe_candidate(c) for c in result.get("candidates", []))
+        label = "Looks like" if result["status"] == "duplicate" else "Possible matches"
+        st.caption(f"{title}: {result['message']}" + (f" {label}: {candidates}." if candidates else ""))
     return False
 
 
@@ -4866,6 +5029,7 @@ def render_agent_panel(
                     with item_col:
                         st.markdown(link_opportunity_names(describe_staged_item(item)))
                         render_reference_picker(agent, index, item)
+                        render_duplicate_check(agent, index, item)
                     with remove_col:
                         st.button(
                             ":material/close:",

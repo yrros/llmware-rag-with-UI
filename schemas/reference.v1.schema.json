@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "llm-notes-reference/v1",
   "title": "LLM Notes reference snapshot (v1)",
-  "description": "A small read-only copy of current records in another system, written by a connector to <outbox>/reference/ for RAG Workspace Manager to read. The notes app never contacts that system; it uses the snapshot to pick real record names and show their current state. Each refresh overwrites the file.",
+  "description": "A small read-only copy of current records in another system, written by a connector to <outbox>/reference/ for RAG Workspace Manager to read. The notes app never contacts that system; it uses the snapshot to pick real record names and show their current state. Each refresh overwrites the file. opportunities.json holds open opportunities; tasks.json holds the user's own open tasks.",
   "type": "object",
   "required": [
     "schema",
@@ -36,60 +36,104 @@
     "records": {
       "type": "array",
       "items": {
-        "type": "object",
-        "required": [
-          "kind",
-          "id",
-          "name",
-          "account",
-          "stage",
-          "next_step",
-          "last_updated",
-          "last_activity",
-          "description"
-        ],
-        "additionalProperties": false,
-        "properties": {
-          "kind": {
-            "enum": [
-              "opportunity"
-            ]
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "id",
+              "name",
+              "account",
+              "stage",
+              "next_step",
+              "last_updated",
+              "last_activity",
+              "description"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "opportunity"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string",
+                "description": "The record's exact name, used as a related_to name hint."
+              },
+              "account": {
+                "type": "string",
+                "description": "The prospect or customer, or empty."
+              },
+              "stage": {
+                "type": "string"
+              },
+              "next_step": {
+                "type": "string",
+                "description": "The record's current next step, or empty."
+              },
+              "last_updated": {
+                "type": "string",
+                "description": "YYYY-MM-DD the record last changed."
+              },
+              "last_activity": {
+                "type": "string",
+                "description": "YYYY-MM-DD of the latest task or event, or empty."
+              },
+              "description": {
+                "type": "string",
+                "description": "Trimmed to 2000 characters."
+              },
+              "url": {
+                "type": "string",
+                "description": "The record's web page, for the notes app to link to. Optional."
+              }
+            }
           },
-          "id": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string",
-            "description": "The record's exact name, used as a related_to name hint."
-          },
-          "account": {
-            "type": "string",
-            "description": "The prospect or customer, or empty."
-          },
-          "stage": {
-            "type": "string"
-          },
-          "next_step": {
-            "type": "string",
-            "description": "The record's current next step, or empty."
-          },
-          "last_updated": {
-            "type": "string",
-            "description": "YYYY-MM-DD the record last changed."
-          },
-          "last_activity": {
-            "type": "string",
-            "description": "YYYY-MM-DD of the latest task or event, or empty."
-          },
-          "description": {
-            "type": "string",
-            "description": "Trimmed to 2000 characters."
-          },
-          "url": {
-            "type": "string",
-            "description": "The record's web page, for the notes app to link to. Optional."
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "id",
+              "subject",
+              "due_date",
+              "status",
+              "related"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "task"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "due_date": {
+                "type": "string",
+                "description": "YYYY-MM-DD, or empty."
+              },
+              "status": {
+                "type": "string"
+              },
+              "related": {
+                "type": "string",
+                "description": "Name of the record it's on (e.g. the Opportunity or contact), or empty."
+              },
+              "url": {
+                "type": "string",
+                "description": "The task's page, for the notes app to link to. Optional."
+              }
+            }
           }
-        }
+        ]
       }
     }
   }
