@@ -370,7 +370,7 @@ The snapshot holds customer data, stays in the gitignored outbox folder and is o
 - **Next Step**, signed with today's date and your **Short name** (About me), plus the task title marker, e.g. *2026-10-25-JDOE: waiting on client to respond, will chase on 29 October [AI]*. The staging box shows the new text and the current Next Step from the snapshot (*Now: …*), and warns above 255 characters (the most a Next Step holds) or when no short name is set.
 - **A chase task** on the same opportunity, with the due date from your notes or discussion, and the marker.
 
-**Before you send a Next Step,** the staging box checks it against the snapshot:
+**Before you send a Next Step,** the staging box shows it as a diff: **Now** is the Next Step in the snapshot (or *not known* when the opportunity isn't in it) and **New** is what it will say, with removed words struck through on red and added words on green. It also checks it against the snapshot:
 
 - **Already says this.** The model is shown each opportunity's current Next Step and marks an update that says the same thing; a near word-for-word match is caught too. The item shows **⚠ The current Next Step already says this** with the current text, so you can remove it (and its chase task) with ✕, or keep it to restate it.
 - **Changed since you staged it.** When the snapshot is refreshed after you staged and the Next Step is now different, the item shows **⚠ Changed since you staged this** with the new text. **Replace it anyway** sends yours as a deliberate overwrite of that new text; otherwise the connector holds it (below).

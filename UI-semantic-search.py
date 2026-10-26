@@ -8,6 +8,8 @@ import sys
 import time
 import threading
 import datetime
+import difflib
+import html
 import uuid
 from contextlib import contextmanager
 from functools import lru_cache
@@ -4889,6 +4891,45 @@ def replace_next_step_anyway(agent: dict, index: int) -> None:
         item["previous"] = record.get("next_step", "")
 
 
+DIFF_REMOVED = "background: rgba(255, 75, 75, 0.18); text-decoration: line-through; border-radius: 3px;"
+DIFF_ADDED = "background: rgba(33, 195, 84, 0.22); border-radius: 3px;"
+
+
+def diff_html(old: str, new: str) -> str:
+    """Word-level diff of two field values: removed words struck through on red, added words on green."""
+    before, after = re.findall(r"\S+\s*", old), re.findall(r"\S+\s*", new)
+    parts = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, before, after, autojunk=False).get_opcodes():
+        if op == "equal":
+            parts.append(html.escape("".join(after[j1:j2])))
+            continue
+        if op in ("delete", "replace"):
+            parts.append(f'<span style="{DIFF_REMOVED}">{html.escape("".join(before[i1:i2]).rstrip())}</span> ')
+        if op in ("insert", "replace"):
+            parts.append(f'<span style="{DIFF_ADDED}">{html.escape("".join(after[j1:j2]))}</span>')
+    return "".join(parts)
+
+
+def render_update_diff(item: dict) -> None:
+    """A staged Next Step as a diff: what the field says now (from the snapshot) and what it will say."""
+    name = item["related_to"]["name"] or "no opportunity yet"
+    st.markdown(link_opportunity_names(f"**Next Step** on *{name}*"))
+    new = item["value"]
+    row = 'style="display: flex; gap: 0.5rem;"'
+    label = 'style="flex: 0 0 2.2rem; opacity: 0.6; font-size: 0.85em; padding-top: 0.1em;"'
+    if "previous" in item:
+        now = html.escape(item["previous"]) if item["previous"] else "<i>(empty)</i>"
+        change = diff_html(item["previous"], new)
+    else:  # no snapshot entry: it's replaced whatever it says
+        now, change = "<i>not known (not in the snapshot)</i>", f'<span style="{DIFF_ADDED}">{html.escape(new)}</span>'
+    st.html(
+        f'<div style="line-height: 1.6;"><div {row}><span {label}>Now</span><span>{now}</span></div>'
+        f'<div {row}><span {label}>New</span><span>{change}</span></div></div>'
+    )
+    if len(new) > NEXT_STEP_LIMIT:
+        st.caption(f"⚠ {len(new)} characters: a Next Step holds {NEXT_STEP_LIMIT}, so the connector will hold it.")
+
+
 def render_next_step_checks(agent: dict, index: int, item: dict) -> None:
     """Under a staged Next Step: whether it changed since it was staged, or already says this."""
     if item.get("type") != "update" or "previous" not in item:
@@ -5103,7 +5144,10 @@ def render_agent_panel(
                 for index, item in enumerate(staged["items"]):
                     item_col, remove_col = st.columns([0.92, 0.08])
                     with item_col:
-                        st.markdown(link_opportunity_names(describe_staged_item(item)))
+                        if item["type"] == "update":
+                            render_update_diff(item)
+                        else:
+                            st.markdown(link_opportunity_names(describe_staged_item(item)))
                         render_reference_picker(agent, index, item)
                         render_duplicate_check(agent, index, item)
                         render_next_step_checks(agent, index, item)
