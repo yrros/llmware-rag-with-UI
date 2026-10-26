@@ -1637,7 +1637,8 @@ STRUCTURED_OUTPUT_GUIDES = {
         "`next_step` (one short sentence on where things stand and what happens next, under 200 characters; "
         "no date or initials, they're added for you), `chase_subject` (a short subject for the follow-up task), "
         "`chase_due_date` as YYYY-MM-DD worked out from today's date (or \"\" if the notes give none) and "
-        "`chase_description` (or \"\")."
+        "`chase_description` (or \"\"), and `already_said`: true if the opportunity's current Next Step (listed "
+        "below) already says the same thing, else false."
     ),
 }
 STRUCTURED_RELATED_GUIDE = (
@@ -1691,6 +1692,7 @@ def structured_output_schema(item_type: str) -> dict:
             "chase_subject": {"type": "string"},
             "chase_due_date": {"type": "string"},
             "chase_description": {"type": "string"},
+            "already_said": {"type": "boolean"},
         },
     }[item_type]
     item = {"type": "object", "properties": {**fields, "related_to": related}, "required": [*fields, "related_to"]}
@@ -1968,12 +1970,19 @@ def notes_reference_records(results: list) -> list[dict]:
     return [r for r in records if mentioned(r["name"]) or mentioned(r.get("account") or "")]
 
 
-def reference_prompt_text(records: list[dict]) -> str:
-    """The open opportunities the notes mention, for the model to name in related_to (empty if there are none)."""
+def reference_prompt_text(records: list[dict], next_steps: bool = False) -> str:
+    """The open opportunities the notes mention, for the model to name in related_to (empty if there are none).
+
+    With `next_steps`, each line also gives the opportunity's current Next Step, for Agents that update it.
+    """
     records = records[:REFERENCE_PROMPT_LIMIT]
     if not records:
         return ""
-    lines = "\n".join(f"- {r['name']} ({describe_reference_record(r)})" for r in records)
+    lines = "\n".join(
+        f"- {r['name']} ({describe_reference_record(r)})"
+        + (f" — current Next Step: “{r.get('next_step') or '(empty)'}”" if next_steps else "")
+        for r in records
+    )
     return (
         "These open opportunities in the connected system are mentioned in the notes. Use this list only to "
         "name the record: when an item is about one of them, set related_to.name to its exact name and "
@@ -1994,7 +2003,7 @@ def build_agent_task_prompt(prompts: list[dict], results: list) -> str:
     heading, with the items numbered across all parts.
     """
     mentioned = notes_reference_records(results)
-    reference = reference_prompt_text(mentioned)
+    reference = reference_prompt_text(mentioned, any(get_prompt_output_type(p) == "next_step" for p in prompts))
     open_tasks = open_tasks_prompt_text(prompts, mentioned)
     tail = (
         " Ask me the questions you need answered to do that well, and don't guess anything the notes don't say."
@@ -2219,6 +2228,8 @@ def expand_next_steps(entries: list[dict], marker: dict, short_name: str, today:
         record = find_reference_record(related["name"]) if related["kind"] == "opportunity" else None
         if record is not None:
             update["previous"] = record.get("next_step", "")
+            if entry.get("already_said") is True:
+                update["_already_said"] = True  # the model's view; staging only, never sent
         chase = normalise_draft_item("task", {
             "subject": str(entry.get("chase_subject", "") or "").strip() or f"Chase: {text}",
             "description": str(entry.get("chase_description", "") or "").strip() or text,
@@ -2273,7 +2284,7 @@ def stage_agent_items(
     item_type = get_prompt_output_type(prompt)
     messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
     mentioned = notes_reference_records(discussion_results(search_state))
-    reference = reference_prompt_text(mentioned)
+    reference = reference_prompt_text(mentioned, item_type == "next_step")
     open_tasks = open_tasks_prompt_text([prompt], mentioned)
     only_part = (
         f"This covers only part {part[0]} of {part[1]} ({prompt['name']}): give only that part's records; "
@@ -2371,7 +2382,7 @@ def build_handoff_package(
             "model": staged["model"],
             "notes": [{"file": file, **({"path": str(path)} if path else {})} for file, path in source_notes],
         },
-        "items": staged["items"],
+        "items": [{k: v for k, v in item.items() if not k.startswith("_")} for item in staged["items"]],
     }
 
 
@@ -2527,12 +2538,22 @@ def describe_candidate(candidate: dict) -> str:
 
 def create_anyway_and_retry(path_text: str, index: int) -> None:
     """Mark a held duplicate task Create anyway (a v2 field) and send its package back to the outbox."""
+    change_item_and_retry(path_text, index, lambda item: item.update(allow_duplicate=True), "Create anyway")
+
+
+def overwrite_anyway_and_retry(path_text: str, index: int) -> None:
+    """Drop a held Next Step's `previous`, so the connector overwrites whatever is there now, and retry."""
+    change_item_and_retry(path_text, index, lambda item: item.pop("previous", None), "Overwrite anyway")
+
+
+def change_item_and_retry(path_text: str, index: int, change, action: str) -> None:
+    """Change one item of a failed package (validated, atomic) and send the package back to the outbox."""
     path = Path(path_text)
     if not path.is_file():
         st.session_state["actions_notice"] = f"`{path.name}` has already moved; the list is refreshed."
         return
     package = json.loads(path.read_text())
-    package["items"][index]["allow_duplicate"] = True
+    change(package["items"][index])
     package["schema"] = HANDOFF_SCHEMA_V2_ID  # v2 is v1 plus update items, mixed packages and Create anyway
     try:
         validate_handoff_package(package)
@@ -2542,7 +2563,7 @@ def create_anyway_and_retry(path_text: str, index: int) -> None:
     temp = path.with_name(f".{path.name}.tmp")
     temp.write_text(json.dumps(package, indent=2, ensure_ascii=False))
     temp.replace(path)
-    move_outbox_package(path_text, "", "Create anyway: sent back to the outbox:")
+    move_outbox_package(path_text, "", f"{action}: sent back to the outbox:")
 
 
 def delete_withdrawn_packages(path_texts: list[str]) -> None:
@@ -2649,6 +2670,16 @@ def render_outbox_entry(entry: dict, state: str) -> None:
                     args=(str(entry["path"]), index),
                     help="Create this task even though it looks like an open one, and send the package back to the "
                     "outbox. Anything already created isn't created twice.",
+                )
+            if state == "failed" and result.get("status") == "stale":
+                st.button(
+                    "Overwrite anyway and retry",
+                    key=f"actions_overwrite_anyway_{state}_{entry['path'].name}_{index}",
+                    icon=":material/swap_horiz:",
+                    on_click=overwrite_anyway_and_retry,
+                    args=(str(entry["path"]), index),
+                    help="Replace whatever the Next Step says now with this one, and send the package back to the "
+                    "outbox. Anything already done isn't done twice.",
                 )
         if state == "failed":
             st.caption(
@@ -4763,7 +4794,7 @@ def describe_staged_item(item: dict) -> str:
 def unstage_item(agent: dict, index: int) -> None:
     agent["staged"]["items"].pop(index)
     # Item positions shift, so drop the record pickers' remembered choices for this staging.
-    prefixes = (f"agent_ref_{agent['staged']['id']}_", f"agent_dup_{agent['staged']['id']}_")
+    prefixes = tuple(f"{p}_{agent['staged']['id']}_" for p in ("agent_ref", "agent_dup", "agent_ns_replace"))
     for key in [k for k in st.session_state if str(k).startswith(prefixes)]:
         del st.session_state[key]
 
@@ -4787,6 +4818,7 @@ def set_staged_related(agent: dict, index: int, widget_key: str) -> None:
             item["previous"] = record.get("next_step", "")
         else:
             item.pop("previous", None)
+        item.pop("_already_said", None)  # it was about the opportunity picked before
 
 
 def render_reference_picker(agent: dict, index: int, item: dict) -> None:
@@ -4839,6 +4871,50 @@ def set_allow_duplicate(agent: dict, index: int, widget_key: str) -> None:
         item["allow_duplicate"] = True
     else:
         item.pop("allow_duplicate", None)
+
+
+NEXT_STEP_SIGNATURE = re.compile(r"\d{4}-\d{2}-\d{2}(-[A-Za-z0-9]+)?:\s*")  # "2026-10-25-JDOE: "
+
+
+def same_next_step(new_value: str, current: str) -> bool:
+    """True when a Next Step says what the current one does, by key words, ignoring dates, initials and marker."""
+    return same_task_action(NEXT_STEP_SIGNATURE.sub(" ", new_value), NEXT_STEP_SIGNATURE.sub(" ", current))
+
+
+def replace_next_step_anyway(agent: dict, index: int) -> None:
+    """The user saw the Next Step it changed to and still wants theirs: the connector checks against that now."""
+    item = agent["staged"]["items"][index]
+    record = find_reference_record(item["related_to"]["name"])
+    if record is not None:
+        item["previous"] = record.get("next_step", "")
+
+
+def render_next_step_checks(agent: dict, index: int, item: dict) -> None:
+    """Under a staged Next Step: whether it changed since it was staged, or already says this."""
+    if item.get("type") != "update" or "previous" not in item:
+        return
+    record = find_reference_record(item["related_to"]["name"])
+    if record is None:
+        return
+    current = record.get("next_step", "")
+    if current != item["previous"]:
+        st.caption(
+            f"⚠ Changed since you staged this: the Next Step is now “{current or '(empty)'}”. The connector would "
+            "hold yours as changed since staged, unless you choose **Replace it anyway**."
+        )
+        st.button(
+            "Replace it anyway",
+            key=f"agent_ns_replace_{agent['staged']['id']}_{index}",
+            icon=":material/swap_horiz:",
+            on_click=replace_next_step_anyway,
+            args=(agent, index),
+            help="Overwrite the Next Step it has now with yours.",
+        )
+    elif current and (item.get("_already_said") or same_next_step(item["value"], current)):
+        st.caption(
+            f"⚠ The current Next Step already says this: “{current}”. Remove it with ✕ (and its chase task, if you "
+            "don't need one) unless you want to restate it."
+        )
 
 
 def render_duplicate_check(agent: dict, index: int, item: dict) -> None:
@@ -5030,6 +5106,7 @@ def render_agent_panel(
                         st.markdown(link_opportunity_names(describe_staged_item(item)))
                         render_reference_picker(agent, index, item)
                         render_duplicate_check(agent, index, item)
+                        render_next_step_checks(agent, index, item)
                     with remove_col:
                         st.button(
                             ":material/close:",
