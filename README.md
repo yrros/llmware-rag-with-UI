@@ -224,7 +224,7 @@ On first run — and after `./reset_rag.sh` — the app shows a three-step guide
 2. Open **Advanced — Indexing & Embeddings** if you want to change the embedding model or relevance cutoff.
 3. Click **Re-index (full rebuild)** for a new corpus, or **Rescan (incremental)** to pick up new, edited and deleted notes.
 
-The sidebar groups these under **This corpus**. Below them, **All corpora** has **⚡ Rescan all corpora**, which rescans every visible corpus in turn (see [Rescan vs Re-index](#rescan-vs-re-index)).
+The sidebar groups these under **This corpus**. Beside **⚡ Rescan** is **⚡ Rescan all corpora**, which rescans every visible corpus in turn, also incrementally (see [Rescan vs Re-index](#rescan-vs-re-index)).
 
 Progress appears in the sidebar: a live progress bar during the scan, then a persistent summary (docs, blocks, vectors, model used).
 
@@ -240,16 +240,16 @@ Progress appears in the sidebar: a live progress bar during the scan, then a per
 
    Terms match literally and case-insensitively anywhere in the note, its file name or the folders it's in (`2026-10` matches `2026-10-19`; `Clients-Prospects` matches every note in a folder of that name, and `Clients/Prospects` or `Clients > Prospects` match nested folders). A note whose file name appears in two folders of a library can't be placed, so only its text and name are matched. With a question, semantic search ranks passages only within the matching notes. Filters are saved between sessions.
 
-   **Quick dates** sit on the heading line of **Must include**, **Any of** and **Exclude**, and put date terms into that field. Clicks add up until you search, so **Today** then **Yesterday** in **Any of** finds notes from either day. After a search, the next click first takes out the dates that were in that field for the search (and dates restored when the app starts), whether a button added them or you typed them (`2026-10-25`, `2026-10`, `2026`, `2026/10/25`, `25/10/2026`, `Week#43`…). Other terms, and the other two fields, stay as they are:
+   Each field sits in its own small box: its heading, quick dates and quick search terms (rounded chips), then its terms. **Quick dates** sit on the heading line of **Must include**, **Any of** and **Exclude**, and put date terms into that field. Clicks add up until you search, so **Today** then **-1 day** in **Any of** finds notes from either day. After a search, the next click first takes out the dates that were in that field for the search (and dates restored when the app starts), whether a button added them or you typed them (`2026-10-25`, `2026-10`, `2026`, `2026/10/25`, `25/10/2026`, `Week#43`…). Other terms, and the other two fields, stay as they are:
 
    | Button | Adds to Must include (on Sunday 25 October 2026) | Adds to Any of / Exclude |
    |---|---|---|
    | **Today** | `2026-10-25` | the same |
-   | **Yesterday** | `2026-10-24` | the same |
-   | **This week** | `2026` and `Week#43` | the 7 dates `2026-10-19` … `2026-10-25` |
-   | **Last week** | `2026` and `Week#42` | the 7 dates `2026-10-12` … `2026-10-18` |
-   | **This month** | `2026-10` | the same |
-   | **Last month** | `2026-09` | the same |
+   | **-1 day** | `2026-10-24` | the same |
+   | **This wk** | `2026` and `Week#43` | the 7 dates `2026-10-19` … `2026-10-25` |
+   | **-1 wk** | `2026` and `Week#42` | the 7 dates `2026-10-12` … `2026-10-18` |
+   | **This mnth** | `2026-10` | the same |
+   | **-1 mnth** | `2026-09` | the same |
 
    Days match notes that contain the date as `YYYY-MM-DD`, and months every date in that month. In **Must include**, weeks match notes headed `Week#NN` in that year, using ISO weeks (Monday to Sunday; 29 Dec 2025 is 2026 `Week#1`). The year is its own term rather than a month, so a week that spans two months still matches. Because terms match anywhere, `Week#4` also matches `Week#40`–`Week#49`, which only matters in weeks 1–9. In **Any of** and **Exclude** a bare year would match, or exclude, the whole year, so weeks are the seven days instead. A bare four-digit number counts as a year, so a button would take a leftover one out too. Hover a button to see exactly what it puts in.
 
@@ -263,8 +263,10 @@ The search area is split into a **Filter** box (left) and an **Ask** box (right)
 
 | Route | What **Search** does | Settings shown |
 |-------|----------------------|----------------|
-| **Semantic (meaning)** | Ranks passages by meaning using the embeddings. Filter terms narrow which notes it looks in. | **Distance cutoff** (how close a match must be) and, after a search, the match bar. |
+| **Semantic (meaning)** | Ranks passages by meaning using the embeddings. Filter terms narrow which notes it looks in. | **Find notes about** (below), the filter folded into **Narrow by terms** (its title says how many terms are set), **Distance cutoff** (how close a match must be) and, after a search, the match bar. |
 | **Literal (exact text)** — button reads **Ask (filtered only)** | Returns the notes that match the filter terms, in full. Much faster; the question is only used for the LLM answer. | **Search all libraries**, **🔎 Filter search only**, **🔄 Rescan → Filter search**. |
+
+**Find, down-select, then ask (Semantic route).** At the top of the Filter box, under the route switch, type what the notes are about in **Find notes about** and click **🔎 Find notes** (under **Narrow by terms**, so you can narrow first): it lists the notes closest in meaning (within **Narrow by terms**, if set; **Max results** is the number of notes), grouped by folder, without an LLM answer. Tick **🚫** to drop a note or click **🎯** to keep just the ones you pick, then type your question and click **Search**: passages are ranked by your question **only within the found notes you kept**. A line under the box says how many that is; its **×** forgets the found notes, so **Search** looks through the whole library again (so does **Clear Filter**). To do it all in one go, skip **Find notes** and just **Search**.
 
 The route is saved between sessions. **🔎 Filter search only** (Literal route) lists the matching notes under the Filter box without an LLM answer, keeping your question for later. Notes are grouped under 📁 headings with their folder path (e.g. `Notes > Clients-Prospects > Acme`), sorted by path, with the number of notes in each; notes whose folder isn't known come last. Tick **🚫** beside a listed note to exclude it from the next **Search** (semantic ranking and LLM answer); excluded notes stay in the filter list, crossed out, and **Clear exclusions** in the Filter box resets them for the session. A full **Search** shows the answer, sources and discussion full-width below both boxes.
 
