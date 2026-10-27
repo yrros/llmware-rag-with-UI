@@ -5300,16 +5300,23 @@ def full_llm_output(search_state: dict) -> str:
     return "\n\n".join(parts)
 
 
-def render_copy_buttons(buttons: list[tuple[str, str]]) -> None:
-    """A row of small copy buttons, one per (label, text), in a single component iframe."""
+def render_copy_buttons(buttons: list[tuple[str, str]], fit: bool = False) -> None:
+    """A row of small copy buttons, one per (label, text), in a single component iframe.
+
+    `fit` sizes the iframe to its buttons, so other elements can sit beside it on the same line.
+    """
     buttons = [(label, text) for label, text in buttons if text and text.strip()]
     if not buttons:
         return
     payload = json.dumps([text for _label, text in buttons]).replace("</", "<\\/")
     labels = json.dumps([label for label, _text in buttons]).replace("</", "<\\/")
+    # About 7px a character at 12px, plus the icon, padding and border; the body's side margins add 16px.
+    # The row fills the frame's height with the buttons centred, so they aren't cut off at the bottom.
+    width = sum(len(label) * 7 + 48 for label, _text in buttons) + 6 * (len(buttons) - 1) + 16 if fit else None
     components.html(
         f"""
-<div id="row" style="display:flex;gap:6px"></div>
+<style>body{{margin:0 8px}}</style>
+<div id="row" style="display:flex;gap:6px;height:32px;align-items:center"></div>
 <script>
 const texts = {payload};
 const labels = {labels};
@@ -5337,6 +5344,7 @@ labels.forEach((label, i) => {{
 }});
 </script>
 """,
+        width=width,
         height=32,
     )
 
@@ -5595,26 +5603,23 @@ def render_follow_up_discussion(
     # heading), ready to paste into a flow or a test.
     render_copy_buttons([("Copy task prompt", search_state.get("task_prompt", ""))])
 
-    view_col, popout_col, big_col = st.columns(3)
-    with big_col:
-        st.button(
-            "⤢ Last reply on big screen",
-            key="big_screen_last",
-            use_container_width=True,
-            disabled=not any(turn["role"] == "assistant" for turn in search_state["discussion"]),
-            on_click=set_big_screen,
-            args=(search_state, "last"),
-            help="Show the latest reply in the main output area; it keeps following new replies.",
-        )
-    with view_col:
+    # Sized to their labels, so a narrow panel wraps the row instead of cutting the labels short.
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
         expanded = st.toggle(
             "Expand",
             key="discussion_expanded",
             help="Make the discussion panel much taller. For very long conversations, use **Pop out**.",
         )
-    with popout_col:
-        if st.button("⤢ Pop out", use_container_width=True, help="Open the discussion in a large window."):
+        if st.button("⤢ Pop out", help="Open the discussion in a large window."):
             show_discussion_dialog(search_state, model_name, max_tokens, temperature, corpus_prompt)
+        st.button(
+            "⤢ Last reply on big screen",
+            key="big_screen_last",
+            disabled=not any(turn["role"] == "assistant" for turn in search_state["discussion"]),
+            on_click=set_big_screen,
+            args=(search_state, "last"),
+            help="Show the latest reply in the main output area; it keeps following new replies.",
+        )
 
     render_discussion_body(
         search_state,
@@ -5655,25 +5660,27 @@ def render_discussion_body(
                 buttons = [("Copy", turn["content"])]
                 if turn.get("prompt") and turn["prompt"] != turn["content"]:
                     buttons.append(("Copy prompt sent", turn["prompt"]))
-                render_copy_buttons(buttons)
-                if turn["role"] == "assistant":
-                    on_big_screen = big_screen_turn(search_state)
-                    if on_big_screen and on_big_screen[0] == index:
-                        st.caption("Showing on the big screen")
-                    elif in_dialog:
-                        # A full rerun closes the pop-out so the reply can be read in the main area.
-                        if st.button("⤢ Big screen", key=f"{key_prefix}_big_screen_{index}", type="tertiary"):
-                            set_big_screen(search_state, index)
-                            st.rerun()
-                    else:
-                        st.button(
-                            "⤢ Big screen",
-                            key=f"{key_prefix}_big_screen_{index}",
-                            type="tertiary",
-                            on_click=set_big_screen,
-                            args=(search_state, index),
-                            help="Show this reply in the main output area.",
-                        )
+                # Copy and Big screen share one line.
+                with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                    render_copy_buttons(buttons, fit=True)
+                    if turn["role"] == "assistant":
+                        on_big_screen = big_screen_turn(search_state)
+                        if on_big_screen and on_big_screen[0] == index:
+                            st.caption("Showing on the big screen", width="content")
+                        elif in_dialog:
+                            # A full rerun closes the pop-out so the reply can be read in the main area.
+                            if st.button("⤢ Big screen", key=f"{key_prefix}_big_screen_{index}", type="tertiary"):
+                                set_big_screen(search_state, index)
+                                st.rerun()
+                        else:
+                            st.button(
+                                "⤢ Big screen",
+                                key=f"{key_prefix}_big_screen_{index}",
+                                type="tertiary",
+                                on_click=set_big_screen,
+                                args=(search_state, index),
+                                help="Show this reply in the main output area.",
+                            )
 
     with st.container(border=True):
         # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
