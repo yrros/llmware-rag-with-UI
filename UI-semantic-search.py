@@ -1528,6 +1528,7 @@ def load_prompt_library() -> dict:
         library.setdefault("profile", {"text": "", "enabled": True})
         library.setdefault("prompts", [])
         library.setdefault("links", [])  # common links: [{"id", "title", "url"}]; prompts pick theirs by id
+        library.setdefault("references", [])  # reference documents: [{"id", "title", "notes", "last_used"?}]
         for prompt in library["prompts"]:
             # Libraries saved before Agent existed: prompts that already drafted output become Agents.
             prompt.setdefault("agent", prompt.get("output", "text") in DRAFT_OUTPUT_TYPES and not prompt.get("global"))
@@ -1536,6 +1537,7 @@ def load_prompt_library() -> dict:
             prompt.setdefault("command", DEFAULT_AGENT_COMMANDS.get(prompt.get("output", ""), ""))
             prompt.setdefault("model", "")
             prompt.setdefault("links", [])
+            prompt.setdefault("references", [])  # reference documents sent whenever this prompt is used
         return library
     return save_prompt_library(
         {
@@ -1606,8 +1608,11 @@ def truncate_text(text: str, limit: int = 60) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def build_prompt_context(corpus_prompt: str = "", profile_text: str = "", global_texts=()) -> str:
-    """Preamble sent ahead of the notes: today's date, About me, corpus prompt, global prompts."""
+def build_prompt_context(corpus_prompt: str = "", profile_text: str = "", global_texts=(), references=()) -> str:
+    """Preamble sent ahead of the notes: today's date, About me, corpus prompt, global prompts, reference documents.
+
+    `references` is [(short title, text)].
+    """
     parts = [f"Today's date: {datetime.date.today():%A %d %B %Y}."]
     if profile_text.strip():
         parts.append(f"About the person asking (the owner of these notes):\n{profile_text.strip()}")
@@ -1620,6 +1625,12 @@ def build_prompt_context(corpus_prompt: str = "", profile_text: str = "", global
     standing = [text.strip() for text in global_texts if text.strip()]
     if standing:
         parts.append("Always follow these instructions:\n" + "\n".join(f"- {text}" for text in standing))
+    documents = [(title, text) for title, text in references if text.strip()]
+    if documents:
+        parts.append(
+            "Reference documents (background to use when answering; they are not the notes being asked about):\n\n"
+            + "\n\n".join(f"=== {title} ===\n{text.strip()}" for title, text in documents)
+        )
     return "\n\n".join(parts)
 
 
@@ -2162,6 +2173,341 @@ def render_prompt_links(prompts: list[dict], library: dict, guess: str) -> None:
     parts = [link_markdown(link, guess) for link in ordered_links(library) if link["id"] in chosen and link.get("url")]
     if parts:
         st.markdown(" · ".join(parts))
+
+
+# --- Reference documents: notes sent to the LLM as background, attached to prompts or added for one question --
+
+REFERENCE_PAGE_URL = "?page=reference"
+REFERENCE_DOC_CHAR_LIMIT = 20_000  # characters of one reference document (its notes together) sent to the model
+REFERENCE_RECENT = 5
+REFERENCE_ROW_CHARS = 46  # about what fits on the Ask box's Reference row; titles that would overflow are left out
+EXPORT_STATE_FILE = ".notes-export-state.json"  # the Notes exporter's {Apple Notes ID: file} map
+ACTIVE_REFERENCES_KEY = "active_reference_ids"  # documents added in the Ask box for this session's questions
+
+
+def reference_documents(library: dict | None = None) -> list[dict]:
+    return (library or load_prompt_library()).get("references", [])
+
+
+def find_reference_document(ref_id: str | None, library: dict | None = None) -> dict | None:
+    return next((r for r in reference_documents(library) if r["id"] == ref_id), None) if ref_id else None
+
+
+def reference_label(ref: dict) -> str:
+    return ref.get("title") or "Untitled document"
+
+
+def reference_note_key(note: dict) -> str:
+    return note.get("note_id") or note.get("path", "")
+
+
+def update_reference_documents(change) -> None:
+    library = load_prompt_library()
+    library["references"] = change([dict(ref) for ref in library.get("references", [])])
+    save_prompt_library(library)
+
+
+def add_reference_document() -> None:
+    update_reference_documents(lambda refs: refs + [{"id": uuid.uuid4().hex[:8], "title": "", "notes": []}])
+
+
+def delete_reference_document(ref_id: str) -> None:
+    """Delete a reference document and detach it from every prompt and from the Ask box."""
+    library = load_prompt_library()
+    library["references"] = [ref for ref in library.get("references", []) if ref["id"] != ref_id]
+    for prompt in library["prompts"]:
+        prompt["references"] = [i for i in prompt.get("references", []) if i != ref_id]
+    save_prompt_library(library)
+    remove_active_reference(ref_id)
+
+
+def save_reference_title(ref_id: str) -> None:
+    title = str(st.session_state.get(f"reference_title_{ref_id}", "")).strip()
+    update_reference_documents(lambda refs: [{**ref, "title": title} if ref["id"] == ref_id else ref for ref in refs])
+
+
+def toggle_reference_note(ref_id: str, note: dict) -> None:
+    """Add a note to a reference document, or take it out if it's already there."""
+    def change(refs: list[dict]) -> list[dict]:
+        for ref in refs:
+            if ref["id"] == ref_id:
+                notes = ref.get("notes", [])
+                there = any(reference_note_key(n) == reference_note_key(note) for n in notes)
+                ref["notes"] = [n for n in notes if reference_note_key(n) != reference_note_key(note)] if there \
+                    else notes + [note]
+        return refs
+    update_reference_documents(change)
+
+
+def remove_reference_note(ref_id: str, key: str) -> None:
+    update_reference_documents(lambda refs: [
+        {**ref, "notes": [n for n in ref.get("notes", []) if reference_note_key(n) != key]} if ref["id"] == ref_id
+        else ref for ref in refs
+    ])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def export_state_paths(corpus_root: str) -> tuple[str, dict[str, str]]:
+    """(the Notes exporter's output folder, {Apple Notes ID: file path in it}) from its state file in the corpus
+    root or up to three folders above; empty when there's none (notes not exported with the exporter)."""
+    if not corpus_root:
+        return "", {}
+    folder = Path(corpus_root).expanduser().resolve()
+    for candidate in [folder, *list(folder.parents)[:3]]:
+        state = candidate / EXPORT_STATE_FILE
+        if state.is_file():
+            try:
+                notes = json.loads(state.read_text()).get("notes") or {}
+            except (OSError, ValueError):
+                return "", {}
+            return str(candidate), {nid: e["path"] for nid, e in notes.items() if isinstance(e, dict) and e.get("path")}
+    return "", {}
+
+
+def reference_note_path(note: dict) -> Path | None:
+    """Where a reference note is now: found by its Apple Notes ID (so renames and moves keep it), else its path."""
+    folder, paths = export_state_paths(str(get_corpus_root_path() or ""))
+    if note.get("note_id") in paths:
+        path = Path(folder) / paths[note["note_id"]]
+        if path.is_file():
+            return path
+    path = Path(note.get("path") or "")
+    return path if note.get("path") and path.is_file() else None
+
+
+def reference_note_for_path(path: Path) -> dict:
+    """A reference note record for a note file: its Apple Notes ID (when the exporter has it), title and path."""
+    folder, paths = export_state_paths(str(get_corpus_root_path() or ""))
+    note_id = ""
+    if folder:
+        try:
+            rel = path.resolve().relative_to(Path(folder)).as_posix()
+        except ValueError:
+            rel = ""
+        note_id = next((nid for nid, file in paths.items() if file == rel), "")
+    return {"note_id": note_id, "title": path.stem, "path": str(path)}
+
+
+def reference_note_folder(path: Path) -> str:
+    """'Clients > Prospects > Acme' for a note file, relative to the corpus root."""
+    root = get_corpus_root_path()
+    try:
+        parts = path.parent.resolve().relative_to(Path(root).resolve()).parts if root else ()
+    except ValueError:
+        parts = (path.parent.name,)
+    return FOLDER_PATH_SEPARATOR.join(parts)
+
+
+def reference_document_text(ref: dict) -> tuple[str, list[str]]:
+    """A reference document's notes as one text for the model (trimmed to the limit), and the notes not found."""
+    parts, missing = [], []
+    for note in ref.get("notes", []):
+        path = reference_note_path(note)
+        try:
+            parts.append(path.read_text(errors="ignore").strip())
+        except (AttributeError, OSError):
+            missing.append(note.get("title") or reference_note_key(note))
+    text = "\n\n".join(parts)
+    if len(text) > REFERENCE_DOC_CHAR_LIMIT:
+        text = text[:REFERENCE_DOC_CHAR_LIMIT].rstrip() + "\n[… trimmed]"
+    return text, missing
+
+
+def run_reference_documents(tasks: list[dict], library: dict) -> list[dict]:
+    """This run's reference documents: those of the injected prompts, then those added in the Ask box."""
+    ids = [i for task in tasks for i in task.get("references", [])] + list(st.session_state.get(ACTIVE_REFERENCES_KEY, []))
+    found = (find_reference_document(i, library) for i in dict.fromkeys(ids))
+    return [ref for ref in found if ref and ref.get("notes")]
+
+
+def mark_references_used(ref_ids: list[str]) -> None:
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    update_reference_documents(lambda refs: [{**ref, "last_used": now} if ref["id"] in ref_ids else ref for ref in refs])
+
+
+def recent_reference_documents(library: dict) -> list[dict]:
+    """Up to five most recently used documents, leaving out any whose title would push the row past one line."""
+    used = sorted((r for r in reference_documents(library) if r.get("last_used")), key=lambda r: r["last_used"],
+                  reverse=True)[:REFERENCE_RECENT]
+    shown, width = [], 0
+    for ref in used:
+        cost = len(reference_label(ref)) + 4  # a chip's padding
+        if width + cost <= REFERENCE_ROW_CHARS:
+            shown.append(ref)
+            width += cost
+    return shown
+
+
+def toggle_active_reference(ref_id: str) -> None:
+    active = list(st.session_state.get(ACTIVE_REFERENCES_KEY, []))
+    st.session_state[ACTIVE_REFERENCES_KEY] = [i for i in active if i != ref_id] if ref_id in active else active + [ref_id]
+
+
+def remove_active_reference(ref_id: str) -> None:
+    st.session_state[ACTIVE_REFERENCES_KEY] = [i for i in st.session_state.get(ACTIVE_REFERENCES_KEY, []) if i != ref_id]
+
+
+def pick_reference_from_finder() -> None:
+    ref_id = st.session_state.get("reference_finder")
+    if ref_id and ref_id not in st.session_state.get(ACTIVE_REFERENCES_KEY, []):
+        toggle_active_reference(ref_id)
+    st.session_state["reference_finder"] = None
+
+
+def reference_view_link(ref: dict) -> str:
+    """An HTML link opening a reference document in its own tab."""
+    return (f'<a href="{REFERENCE_PAGE_URL}&ref={ref["id"]}" target="_blank" rel="noopener">'
+            f"📄 {html.escape(reference_label(ref))}</a>")
+
+
+def render_ask_reference_row(library: dict, tasks: list[dict]) -> None:
+    """Ask box: reference documents for this question — recent ones as chips, a finder for the rest, and what
+    will be sent (with those the injected prompts bring)."""
+    refs = reference_documents(library)
+    if not refs:
+        return
+    active = list(st.session_state.get(ACTIVE_REFERENCES_KEY, []))
+    from_prompts = {i: task["name"] for task in tasks for i in task.get("references", [])}
+    with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
+        st.caption("Reference:")
+        for ref in recent_reference_documents(library):
+            st.button(
+                reference_label(ref),
+                key=f"use_reference_{ref['id']}",
+                type="primary" if ref["id"] in active or ref["id"] in from_prompts else "secondary",
+                on_click=toggle_active_reference,
+                args=(ref["id"],),
+                disabled=ref["id"] in from_prompts and ref["id"] not in active,
+                help=f"Sent with {from_prompts[ref['id']]}." if ref["id"] in from_prompts
+                else "Send this reference document with your question.",
+            )
+        labels = {ref["id"]: reference_label(ref) for ref in refs}
+        st.selectbox(
+            "Find a reference document",
+            options=list(labels),
+            index=None,
+            format_func=labels.get,
+            key="reference_finder",
+            on_change=pick_reference_from_finder,
+            placeholder="Find a reference document…",
+            label_visibility="collapsed",
+        )
+    sending = run_reference_documents(tasks, library)
+    if sending:
+        st.markdown(
+            "Sending: " + " · ".join(
+                reference_view_link(ref) + (f" <small>({html.escape(from_prompts[ref['id']])})</small>"
+                                            if ref["id"] in from_prompts else "")
+                for ref in sending
+            ),
+            unsafe_allow_html=True,
+        )
+        for ref in sending:
+            if ref["id"] in active and ref["id"] not in {r["id"] for r in recent_reference_documents(library)}:
+                st.button(f"✕ {reference_label(ref)}", key=f"drop_reference_{ref['id']}", type="tertiary",
+                          on_click=remove_active_reference, args=(ref["id"],), help="Don't send this one")
+
+
+def render_reference_documents_section(library: dict) -> None:
+    """Prompt library: the reference documents, each a short title and its notes (folded)."""
+    refs = library.get("references", [])
+    with st.expander(
+        f"Reference documents · {len(refs)}",
+        expanded=st.query_params.get("section") == "references",
+        key="prompt_page_references_open",
+        icon=":material/description:",
+    ):
+        st.caption(
+            "Notes the LLM gets as background, e.g. a process overview. Give each document a short title, pick its "
+            "notes in the search page (**Choose notes**, new tab) and check them with **Open**. Attach documents to "
+            "prompts with **Reference documents** on each card, and they're sent whenever that prompt is used; or "
+            "add one for a question in the Ask box. A note is kept by its Apple Notes ID (the code shown), so "
+            f"renaming or moving it keeps the link. Up to {REFERENCE_DOC_CHAR_LIMIT:,} characters of each document "
+            "are sent."
+        )
+        for ref in refs:
+            with st.container(border=True, key=f"reference_card_{ref['id']}"):
+                with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+                    st.text_input("Short title", value=ref.get("title", ""), key=f"reference_title_{ref['id']}",
+                                  on_change=save_reference_title, args=(ref["id"],), max_chars=40,
+                                  placeholder="e.g. PoC types")
+                    st.link_button("Choose notes", f"?pick={ref['id']}", icon=":material/open_in_new:",
+                                   help="Opens the search page in a new tab to add or remove this document's notes.")
+                    st.link_button("Open", f"{REFERENCE_PAGE_URL}&ref={ref['id']}", icon=":material/visibility:",
+                                   disabled=not ref.get("notes"), help="Read its notes, as the LLM gets them.")
+                    st.button(":material/delete:", key=f"reference_delete_{ref['id']}", type="tertiary",
+                              on_click=delete_reference_document, args=(ref["id"],),
+                              help="Delete this reference document and detach it from prompts.")
+                if not ref.get("notes"):
+                    st.caption("No notes yet: **Choose notes** opens the search page to pick them.")
+                for note in ref.get("notes", []):
+                    path = reference_note_path(note)
+                    code = f" · `{note['note_id'][:8]}`" if note.get("note_id") else " · (no Apple Notes ID: kept by path)"
+                    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                        if path:
+                            st.markdown(f"📄 {md_escape_text(path.stem)} · {reference_note_folder(path)}{code}",
+                                        width="stretch")
+                        else:
+                            st.markdown(f"⚠ *{md_escape_text(note.get('title', 'a note'))}* wasn't found: deleted, or "
+                                        "no longer exported?", width="stretch")
+                        st.button(":material/close:", key=f"reference_note_drop_{ref['id']}_{reference_note_key(note)}",
+                                  type="tertiary", on_click=remove_reference_note,
+                                  args=(ref["id"], reference_note_key(note)), help="Take this note out")
+                if ref.get("notes"):
+                    text, _missing = reference_document_text(ref)
+                    st.caption(f"{len(text):,} characters sent" + (
+                        f" (trimmed to {REFERENCE_DOC_CHAR_LIMIT:,})" if text.endswith("[… trimmed]") else ""))
+        st.button("Add reference document", icon=":material/add:", key="reference_add", on_click=add_reference_document)
+
+
+def md_escape_text(text: str) -> str:
+    return re.sub(r"([\\`*_{}\[\]<>#|~])", r"\\\1", text)
+
+
+def render_reference_page() -> None:
+    """?page=reference&ref=<id>: a reference document's notes in full, opened in its own tab."""
+    library = load_prompt_library()
+    ref = find_reference_document(st.query_params.get("ref"), library)
+    render_page_title("Reference document")
+    if ref is None:
+        st.warning("This reference document doesn't exist (any more).")
+        return
+    text, missing = reference_document_text(ref)
+    st.subheader(reference_label(ref))
+    st.caption(f"{len(ref.get('notes', []))} note(s) · {len(text):,} characters sent to the LLM"
+               + (f", trimmed to {REFERENCE_DOC_CHAR_LIMIT:,}" if text.endswith("[… trimmed]") else ""))
+    for note in ref.get("notes", []):
+        path = reference_note_path(note)
+        with st.container(border=True):
+            if path is None:
+                st.warning(f"Not found: *{md_escape_text(note.get('title', 'a note'))}* — deleted, or no longer exported?")
+                continue
+            modified = datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%a %d %b %Y %H:%M")
+            st.caption(f"{reference_note_folder(path)} · modified {modified}"
+                       + (f" · Apple Notes ID `{note['note_id']}`" if note.get("note_id") else ""))
+            st.markdown(path.read_text(errors="ignore"))
+
+
+def render_pick_panel(ref: dict) -> None:
+    """Search page in pick mode (?pick=<id>): the Ask box becomes the reference document being filled."""
+    ref = find_reference_document(ref["id"]) or ref  # re-read: notes are added from the list below
+    with st.container(border=True):
+        st.markdown(f"**Choosing notes for:** {md_escape_text(reference_label(ref))}")
+        st.caption(
+            "Find notes with the Filter box (**Find notes** or **Filter search only**), then **Add** them in the list "
+            "under it. Changes are saved straight away; close this tab when you're done."
+        )
+        for note in ref.get("notes", []):
+            path = reference_note_path(note)
+            with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                st.markdown(f"📄 {md_escape_text(path.stem if path else note.get('title', 'a note'))}"
+                            + ("" if path else " — ⚠ not found"), width="stretch")
+                st.button(":material/close:", key=f"pick_drop_{reference_note_key(note)}", type="tertiary",
+                          on_click=remove_reference_note, args=(ref["id"], reference_note_key(note)))
+        if ref.get("notes"):
+            st.link_button("Open", f"{REFERENCE_PAGE_URL}&ref={ref['id']}", icon=":material/visibility:")
+        else:
+            st.caption("No notes yet.")
 
 
 def save_executor_field(field: str) -> None:
@@ -3023,8 +3369,8 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
         value = value if value in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
     elif field == "model":
         value = str(value or "")
-    elif field == "links":
-        value = [str(link_id) for link_id in (value or [])]
+    elif field in ("links", "references"):
+        value = [str(item_id) for item_id in (value or [])]
     else:
         value = str(value or "").strip()
         if not value:
@@ -3197,7 +3543,9 @@ def render_agent_workflow_editor(prompt: dict) -> None:
     )
 
 
-def render_prompt_card(prompt: dict, model_options: list[str], links: list[dict] = ()) -> None:
+def render_prompt_card(
+    prompt: dict, model_options: list[str], links: list[dict] = (), references: list[dict] = ()
+) -> None:
     prompt_id = prompt["id"]
     agent = is_agent_prompt(prompt)
     # The key gives the card a CSS class; Agent cards get a blue border (see render_prompt_library_page).
@@ -3327,6 +3675,21 @@ def render_prompt_card(prompt: dict, model_options: list[str], links: list[dict]
                 help="Shown as links under the question in the Ask box while this prompt is injected. "
                 "Add links in **Common links** at the top of this page.",
             )
+        if references:
+            ref_titles = {ref["id"]: "📄 " + reference_label(ref) for ref in references}
+            st.multiselect(
+                "Reference documents",
+                options=list(ref_titles),
+                default=[ref_id for ref_id in prompt.get("references", []) if ref_id in ref_titles],
+                format_func=lambda ref_id: ref_titles.get(ref_id, ref_id),
+                key=f"prompt_references_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "references"),
+                placeholder="Reference documents to send with this prompt",
+                label_visibility="collapsed",
+                help="Sent to the LLM as background whenever this prompt is used, Agent or not. "
+                "Make them in **Reference documents** at the top of this page.",
+            )
         if agent:
             render_agent_workflow_editor(prompt)
         if prompt.get("last_used"):
@@ -3422,6 +3785,8 @@ def render_prompt_library_page() -> None:
                     on_change=save_quick_search_terms,
                     max_chars=60,
                 )
+
+    render_reference_documents_section(library)
 
     outbox = get_outbox_dir()
     waiting = len(pending_outbox_files(outbox))
@@ -3601,7 +3966,7 @@ def render_prompt_library_page() -> None:
             st.caption("No prompts match." if library["prompts"] else "No prompts yet — add one below.")
         model_options = prompt_model_options()
         for prompt in shown:
-            render_prompt_card(prompt, model_options, ordered_links(library))
+            render_prompt_card(prompt, model_options, ordered_links(library), reference_documents(library))
 
     with st.container(border=True):
         st.subheader("Add a prompt")
@@ -3749,7 +4114,8 @@ def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
 
 # The Recent and Starred prompt buttons, about a quarter smaller than a normal button; the text keeps its size.
 PROMPT_CHIP_STYLE = """<style>
-[class*="st-key-use_prompt_"] button, [class*="st-key-use_agent_prompt_"] button {
+[class*="st-key-use_prompt_"] button, [class*="st-key-use_agent_prompt_"] button,
+[class*="st-key-use_reference_"] button {
   min-height: 1.875rem !important; padding: 0.05rem 0.55rem !important;
 }
 </style>"""
@@ -3846,6 +4212,7 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
                 )
             else:
                 st.caption("No task prompts yet — add some with **Manage**.")
+        render_ask_reference_row(library, active)
 
 
 def render_prompt_library_sidebar(corpus_config: dict) -> None:
@@ -4697,7 +5064,7 @@ def render_library_counts(search_state: dict) -> None:
                 )
 
 
-def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str) -> None:
+def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str, pick: dict | None = None) -> None:
     """The notes gathered by Find notes and Filter search only, one row per note, most recent hit first.
 
     Each row has the colour of the route that found the note last: blue semantic, orange literal.
@@ -4748,13 +5115,13 @@ def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str) -
             route = routes[(blocks[0].get("_safe_lib", safe_lib), file_source)]
             with st.container(key=f"gathered_{route}_{row}"):
                 render_filter_result_row(library, file_source, blocks, listed, library_folder, safe_lib,
-                                         {"uploads_dirs": ()})
+                                         {"uploads_dirs": ()}, pick)
             row += 1
 
 
 def render_filter_result_row(
     library: str, file_source: str, blocks: list, listed: list, library_folder: Path, safe_lib: str,
-    search_state: dict,
+    search_state: dict, pick: dict | None = None,
 ) -> None:
     """One note in the Filter search list: exclude box, target button and an expander with the note."""
     note_lib = blocks[0].get("_safe_lib", safe_lib)
@@ -4763,6 +5130,21 @@ def render_filter_result_row(
     label = (f"~~{name}~~ · excluded" if excluded else name) + (
         f"  ·  {library}" if library and not blocks[0].get("_folder_path") else ""
     )
+    if pick is not None:  # pick mode: add this note to the reference document, or take it out
+        found = resolve_source_path(file_source, blocks[0].get("_library_folder", library_folder),
+                                    blocks[0].get("_uploads_dirs", search_state["uploads_dirs"]))
+        if found is not None:
+            note = reference_note_for_path(found)
+            ref = find_reference_document(pick["id"]) or pick
+            added = any(reference_note_key(n) == reference_note_key(note) for n in ref.get("notes", []))
+            st.button(
+                f"✓ In {reference_label(ref)} — remove" if added else f"Add to {reference_label(ref)}",
+                key=f"pick_toggle_{note_lib}_{file_source}",
+                type="primary" if not added else "secondary",
+                icon=":material/remove:" if added else ":material/add:",
+                on_click=toggle_reference_note,
+                args=(ref["id"], note),
+            )
     check_col, target_col, help_col, note_col = st.columns([1, 1, 0.6, 9.4])
     with check_col:
         checkbox_key = exclude_checkbox_key(note_lib, file_source)
@@ -7443,6 +7825,9 @@ if st.query_params.get("page") == "prompts":
 if st.query_params.get("page") == "actions":
     render_actions_page()
     st.stop()
+if st.query_params.get("page") == "reference":
+    render_reference_page()
+    st.stop()
 
 render_outbox_status()
 st.title("🧠 RAG Workspace Manager")
@@ -7886,6 +8271,14 @@ st.caption(
     f"{get_embedding_model_summary(selected_embedding_model)}"
 )
 
+# ?pick=<reference document id>: the search page is used to choose that document's notes (no LLM).
+pick_ref = find_reference_document(st.query_params.get("pick"))
+if st.query_params.get("pick") and pick_ref is None:
+    st.warning("That reference document doesn't exist (any more). Close this tab.")
+elif pick_ref is not None:
+    st.info(f"Choosing notes for the reference document **{md_escape_text(reference_label(pick_ref))}**: "
+            "gather notes with the Filter box, then **Add** them in the list under it.")
+
 filter_box_col, ask_box_col = st.columns(2, gap="medium")
 
 with filter_box_col:
@@ -8127,125 +8520,134 @@ if default_ollama not in ollama_model_options:
 prompt_library = load_prompt_library()
 
 with ask_box_col:
-    with st.container(border=True):
-        st.markdown("**Ask**")
-        if "question_text" not in st.session_state:
-            st.session_state["question_text"] = str(load_app_settings().get("last_question", ""))
-        install_select_question_on_focus()
-        prompt_text = st.text_area(
-            QUESTION_LABEL,
-            height=100,
-            key="question_text",
-            on_change=persist_question,
-            help="Saved locally and restored when the page is reloaded.",
-        )
-        # The injected prompt's links (e.g. Salesforce, the connector app), between the question and its token.
-        last_search_state = st.session_state.get(LAST_SEARCH_KEY)
-        render_prompt_links(
-            resolve_run_prompts(prompt_library, corpus_config)["tasks"],
-            prompt_library,
-            best_guess(prompt_text, search_filter, last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
-        )
-        render_injected_prompt_token(prompt_library)
-        # Top to bottom: question → Answer with LLM → prompt library → model details → cutoff → Search → progress.
-        use_llm_answer = st.checkbox(
-            "Answer with LLM",
-            value=True,
-            key="use_llm_answer",
-            help=(
-                "**Semantic search** finds relevant note chunks using embedding vectors. "
-                "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
-                "Search still runs first; the LLM does not replace retrieval."
-            ),
-        )
-
-        if use_llm_answer:
-            render_ask_prompt_panel(prompt_library, corpus_config)
-            # A task prompt with its own model preselects it. The box has no key, so its default changes with
-            # the prompt; picking another model here overrides it for this run.
-            prompt_model = first_prompt_model(resolve_run_prompts(prompt_library, corpus_config)["tasks"])
-            answer_model = prompt_model if prompt_model in ollama_model_options else default_ollama
-            tokens_key = f"llm_max_tokens_{safe_lib}"
-            saved_tokens = int(st.session_state.get(tokens_key, corpus_config["llm_max_tokens"]))
-            with st.expander("Ollama model details", expanded=False, key="ask_model_details", icon=":material/tune:"):
-                selected_ollama_model = st.selectbox(
-                    "Ollama model",
-                    options=ollama_model_options,
-                    index=ollama_model_options.index(answer_model),
-                    help="Generative model that writes the final answer.",
-                )
-                llm_max_tokens = st.select_slider(
-                    "Max tokens",
-                    options=max_tokens_options(saved_tokens),
-                    value=min(max(saved_tokens, TOKEN_STEPS[0]), LLM_MAX_TOKENS_LIMIT),
-                    format_func=format_max_tokens,
-                    key=tokens_key,
-                    on_change=persist_llm_tuning,
-                    args=(safe_lib,),
-                    help=(
-                        "Maximum length of the answer, including a reasoning model's thinking. The stops include "
-                        "book lengths for scale. Long answers take a while (at 20 tokens/s, 50,000 tokens is about "
-                        "40 minutes) and use more memory, because Ollama's context window grows to fit them. "
-                        "Saved for this corpus."
-                    ),
-                )
-                st.caption(describe_answer_length(llm_max_tokens))
-                llm_temperature = st.slider(
-                    "Temperature",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(corpus_config["llm_temperature"]),
-                    step=0.05,
-                    key=f"llm_temperature_{safe_lib}",
-                    on_change=persist_llm_tuning,
-                    args=(safe_lib,),
-                    help=(
-                        "Controls creativity. Lower values (e.g. 0.2) stay closer to your notes; higher values "
-                        "are more varied. Saved for this corpus."
-                    ),
-                )
-            speed = last_llm_speed(selected_ollama_model)
-            st.caption(
-                f"`{selected_ollama_model}` · up to {llm_max_tokens:,} tokens"
-                + (f" (≈{format_duration(llm_max_tokens / speed['tokens_per_second'])} at the last run's speed)"
-                   if speed else "")
-                + f" · temperature {llm_temperature:.2f}"
-            )
-            if not ollama_ok:
-                st.warning(
-                    f"Ollama is not reachable at `{OLLAMA_HOST}:{OLLAMA_PORT}`. "
-                    "Run `./start_app.sh` or `ollama serve`, then `ollama pull llama3.2:3b`."
-                )
-            elif selected_ollama_model not in installed_ollama_models:
-                st.warning(
-                    f"Model `{selected_ollama_model}` is not installed locally. "
-                    f"Run `ollama pull {selected_ollama_model}`."
-                )
-        else:
-            selected_ollama_model = default_ollama
-            llm_max_tokens = int(corpus_config["llm_max_tokens"])
-            llm_temperature = float(corpus_config["llm_temperature"])
-
-        search_clicked = st.button(
-            "🔍 Ask (filtered only)" if exact_text_only else "🔍 Search",
-            type="primary",
-            use_container_width=True,
-            help="Uses the route chosen in the Filter box: "
-            + (
-                "**Literal**: answers your question from the notes "
-                + ("you gathered and kept" if gathered_notes(safe_lib) else "matching the filter terms")
-                + ", sent in full."
-                if exact_text_only
-                else "**Semantic**: passages ranked by meaning"
-                + (" within the notes you gathered and kept." if gathered_notes(safe_lib) else ".")
-            )
-            + f" Returns at most {result_limit} results (**Max results**, in the Filter box).",
-        )
-        # Searching and answering show their progress here, right under the button that started them.
-        # Between runs it shows the selected model's last speed.
+    if pick_ref is not None:
+        # Pick mode: no LLM; the Ask box shows the reference document being filled from the list.
+        render_pick_panel(pick_ref)
+        prompt_text, search_clicked, use_llm_answer = "", False, False
+        selected_ollama_model = default_ollama
+        llm_max_tokens = int(corpus_config["llm_max_tokens"])
+        llm_temperature = float(corpus_config["llm_temperature"])
         search_progress_slot = st.empty()
-        if use_llm_answer:
-            search_progress_slot.caption(describe_llm_speed(selected_ollama_model))
+    else:
+        with st.container(border=True):
+            st.markdown("**Ask**")
+            if "question_text" not in st.session_state:
+                st.session_state["question_text"] = str(load_app_settings().get("last_question", ""))
+            install_select_question_on_focus()
+            prompt_text = st.text_area(
+                QUESTION_LABEL,
+                height=100,
+                key="question_text",
+                on_change=persist_question,
+                help="Saved locally and restored when the page is reloaded.",
+            )
+            # The injected prompt's links (e.g. Salesforce, the connector app), between the question and its token.
+            last_search_state = st.session_state.get(LAST_SEARCH_KEY)
+            render_prompt_links(
+                resolve_run_prompts(prompt_library, corpus_config)["tasks"],
+                prompt_library,
+                best_guess(prompt_text, search_filter, last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
+            )
+            render_injected_prompt_token(prompt_library)
+            # Top to bottom: question → Answer with LLM → prompt library → model details → cutoff → Search → progress.
+            use_llm_answer = st.checkbox(
+                "Answer with LLM",
+                value=True,
+                key="use_llm_answer",
+                help=(
+                    "**Semantic search** finds relevant note chunks using embedding vectors. "
+                    "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
+                    "Search still runs first; the LLM does not replace retrieval."
+                ),
+            )
+
+            if use_llm_answer:
+                render_ask_prompt_panel(prompt_library, corpus_config)
+                # A task prompt with its own model preselects it. The box has no key, so its default changes with
+                # the prompt; picking another model here overrides it for this run.
+                prompt_model = first_prompt_model(resolve_run_prompts(prompt_library, corpus_config)["tasks"])
+                answer_model = prompt_model if prompt_model in ollama_model_options else default_ollama
+                tokens_key = f"llm_max_tokens_{safe_lib}"
+                saved_tokens = int(st.session_state.get(tokens_key, corpus_config["llm_max_tokens"]))
+                with st.expander("Ollama model details", expanded=False, key="ask_model_details", icon=":material/tune:"):
+                    selected_ollama_model = st.selectbox(
+                        "Ollama model",
+                        options=ollama_model_options,
+                        index=ollama_model_options.index(answer_model),
+                        help="Generative model that writes the final answer.",
+                    )
+                    llm_max_tokens = st.select_slider(
+                        "Max tokens",
+                        options=max_tokens_options(saved_tokens),
+                        value=min(max(saved_tokens, TOKEN_STEPS[0]), LLM_MAX_TOKENS_LIMIT),
+                        format_func=format_max_tokens,
+                        key=tokens_key,
+                        on_change=persist_llm_tuning,
+                        args=(safe_lib,),
+                        help=(
+                            "Maximum length of the answer, including a reasoning model's thinking. The stops include "
+                            "book lengths for scale. Long answers take a while (at 20 tokens/s, 50,000 tokens is about "
+                            "40 minutes) and use more memory, because Ollama's context window grows to fit them. "
+                            "Saved for this corpus."
+                        ),
+                    )
+                    st.caption(describe_answer_length(llm_max_tokens))
+                    llm_temperature = st.slider(
+                        "Temperature",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=float(corpus_config["llm_temperature"]),
+                        step=0.05,
+                        key=f"llm_temperature_{safe_lib}",
+                        on_change=persist_llm_tuning,
+                        args=(safe_lib,),
+                        help=(
+                            "Controls creativity. Lower values (e.g. 0.2) stay closer to your notes; higher values "
+                            "are more varied. Saved for this corpus."
+                        ),
+                    )
+                speed = last_llm_speed(selected_ollama_model)
+                st.caption(
+                    f"`{selected_ollama_model}` · up to {llm_max_tokens:,} tokens"
+                    + (f" (≈{format_duration(llm_max_tokens / speed['tokens_per_second'])} at the last run's speed)"
+                       if speed else "")
+                    + f" · temperature {llm_temperature:.2f}"
+                )
+                if not ollama_ok:
+                    st.warning(
+                        f"Ollama is not reachable at `{OLLAMA_HOST}:{OLLAMA_PORT}`. "
+                        "Run `./start_app.sh` or `ollama serve`, then `ollama pull llama3.2:3b`."
+                    )
+                elif selected_ollama_model not in installed_ollama_models:
+                    st.warning(
+                        f"Model `{selected_ollama_model}` is not installed locally. "
+                        f"Run `ollama pull {selected_ollama_model}`."
+                    )
+            else:
+                selected_ollama_model = default_ollama
+                llm_max_tokens = int(corpus_config["llm_max_tokens"])
+                llm_temperature = float(corpus_config["llm_temperature"])
+
+            search_clicked = st.button(
+                "🔍 Ask (filtered only)" if exact_text_only else "🔍 Search",
+                type="primary",
+                use_container_width=True,
+                help="Uses the route chosen in the Filter box: "
+                + (
+                    "**Literal**: answers your question from the notes "
+                    + ("you gathered and kept" if gathered_notes(safe_lib) else "matching the filter terms")
+                    + ", sent in full."
+                    if exact_text_only
+                    else "**Semantic**: passages ranked by meaning"
+                    + (" within the notes you gathered and kept." if gathered_notes(safe_lib) else ".")
+                )
+                + f" Returns at most {result_limit} results (**Max results**, in the Filter box).",
+            )
+            # Searching and answering show their progress here, right under the button that started them.
+            # Between runs it shows the selected model's last speed.
+            search_progress_slot = st.empty()
+            if use_llm_answer:
+                search_progress_slot.caption(describe_llm_speed(selected_ollama_model))
 
 run_prompts = resolve_run_prompts(prompt_library, corpus_config)
 
@@ -8360,6 +8762,7 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
             search_corpus_prompt = "" if search_all_libraries else run_prompts["corpus"]
             tasks = run_prompts["tasks"]
             agents = [task for task in tasks if is_agent_prompt(task)]
+            run_references = run_reference_documents(tasks, prompt_library) if use_llm_answer else []
             search_state = {
                 "filter_only": listing,
                 "route": route,
@@ -8384,13 +8787,15 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
                     search_corpus_prompt,
                     run_prompts["profile"],
                     [p["text"] for p in run_prompts["globals"]],
+                    [(reference_label(ref), reference_document_text(ref)[0]) for ref in run_references],
                 ),
                 # An Agent's first answer comes from its collection prompt (step 1), told where it's heading.
                 "task_prompt": (
                     build_agent_task_prompt(agents, final_results) if agents
                     else tasks[0]["text"] if tasks else ""
                 ),
-                "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt),
+                "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt)
+                + [f"Reference: {reference_label(ref)}" for ref in run_references],
                 "library_display": selected_lib if state_library == safe_lib else "All libraries",
                 "id": uuid.uuid4().hex[:8],  # keys this search's per-note widgets
                 "left_out_notes": [],
@@ -8420,6 +8825,8 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
                         )
                         for task in tasks:
                             mark_prompt_used(task["id"])
+                        if run_references:
+                            mark_references_used([ref["id"] for ref in run_references])
                     except Exception as llm_exc:
                         search_state["answer_error"] = str(llm_exc)
                 # Keep this run's speed for the model, and show it under Search now the spinner has gone.
@@ -8457,7 +8864,7 @@ with filter_results_slot:
     if current_search and last_search.get("filter_only") and not last_search["results"]:
         st.warning(last_search["notice"] or "No notes match the filter.")
     if gathered := gathered_notes(safe_lib):
-        render_gathered_notes(gathered, library_folder, safe_lib)
+        render_gathered_notes(gathered, library_folder, safe_lib, pick_ref)
 if current_search and not last_search.get("filter_only"):
     # The answer and its sources, in the colour of the route that found them.
     with st.container(key=f"results_{last_search.get('route', 'semantic')}"):
