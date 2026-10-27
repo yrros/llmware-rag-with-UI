@@ -5234,6 +5234,49 @@ def persist_follow_up_model(safe_lib: str) -> None:
     save_corpus_config(safe_lib, {"follow_up_model": st.session_state.get(f"follow_up_model_{safe_lib}")})
 
 
+def set_big_screen(search_state: dict, choice: int | str | None) -> None:
+    """Show a discussion reply in the main output area: a turn index, "last" (follows new replies) or None."""
+    search_state["big_screen"] = choice
+
+
+def big_screen_turn(search_state: dict) -> tuple[int, dict] | None:
+    """The discussion reply chosen for the main output area, as (index, turn), or None for the answer."""
+    choice = search_state.get("big_screen")
+    discussion = search_state.get("discussion") or []
+    replies = [i for i, turn in enumerate(discussion) if turn["role"] == "assistant"]
+    if choice == "last" and replies:
+        return replies[-1], discussion[replies[-1]]
+    if isinstance(choice, int) and choice in replies:
+        return choice, discussion[choice]
+    return None
+
+
+def render_big_screen_reply(search_state: dict, index: int, turn: dict) -> None:
+    """A discussion reply in the main output area, with the question that led to it and the way back."""
+    discussion = search_state["discussion"]
+    replies = [i for i, t in enumerate(discussion) if t["role"] == "assistant"]
+    number = replies.index(index) + 1
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.subheader("Discussion reply", width="content")
+        render_copy_buttons([("Copy all output", full_llm_output(search_state))])
+    following = " · follows new replies" if search_state.get("big_screen") == "last" else ""
+    model = f" · `{turn['model']}`" if turn.get("model") else ""
+    st.caption(f"Reply {number} of {len(replies)} from the discussion{model}{following}")
+    asked = discussion[index - 1]["content"] if index and discussion[index - 1]["role"] == "user" else ""
+    if asked:
+        with st.expander("Question asked"):
+            st.markdown(asked)
+    st.markdown(link_opportunity_names(turn["content"]))
+    render_copy_buttons([("Copy reply", turn["content"]), ("Copy all output", full_llm_output(search_state))])
+    st.button(
+        "↩ Back to the answer",
+        key="big_screen_back",
+        on_click=set_big_screen,
+        args=(search_state, None),
+        help="Show the first answer here again; the reply stays in the discussion.",
+    )
+
+
 def render_copy_button(text: str, label: str = "Copy") -> None:
     """Small button that copies `text` to the clipboard (component iframes may write to it)."""
     render_copy_buttons([(label, text)])
@@ -5552,7 +5595,17 @@ def render_follow_up_discussion(
     # heading), ready to paste into a flow or a test.
     render_copy_buttons([("Copy task prompt", search_state.get("task_prompt", ""))])
 
-    view_col, popout_col = st.columns(2)
+    view_col, popout_col, big_col = st.columns(3)
+    with big_col:
+        st.button(
+            "⤢ Last reply on big screen",
+            key="big_screen_last",
+            use_container_width=True,
+            disabled=not any(turn["role"] == "assistant" for turn in search_state["discussion"]),
+            on_click=set_big_screen,
+            args=(search_state, "last"),
+            help="Show the latest reply in the main output area; it keeps following new replies.",
+        )
     with view_col:
         expanded = st.toggle(
             "Expand",
@@ -5592,7 +5645,7 @@ def render_discussion_body(
     with st.container(height=height, border=True, autoscroll=True):
         if not discussion:
             st.caption("No follow-up questions yet.")
-        for turn in discussion:
+        for index, turn in enumerate(discussion):
             with st.chat_message(turn["role"]):
                 st.markdown(link_opportunity_names(turn["content"]))
                 if turn.get("model"):
@@ -5603,6 +5656,24 @@ def render_discussion_body(
                 if turn.get("prompt") and turn["prompt"] != turn["content"]:
                     buttons.append(("Copy prompt sent", turn["prompt"]))
                 render_copy_buttons(buttons)
+                if turn["role"] == "assistant":
+                    on_big_screen = big_screen_turn(search_state)
+                    if on_big_screen and on_big_screen[0] == index:
+                        st.caption("Showing on the big screen")
+                    elif in_dialog:
+                        # A full rerun closes the pop-out so the reply can be read in the main area.
+                        if st.button("⤢ Big screen", key=f"{key_prefix}_big_screen_{index}", type="tertiary"):
+                            set_big_screen(search_state, index)
+                            st.rerun()
+                    else:
+                        st.button(
+                            "⤢ Big screen",
+                            key=f"{key_prefix}_big_screen_{index}",
+                            type="tertiary",
+                            on_click=set_big_screen,
+                            args=(search_state, index),
+                            help="Show this reply in the main output area.",
+                        )
 
     with st.container(border=True):
         # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
@@ -5628,6 +5699,7 @@ def render_discussion_body(
 
     if discussion and st.button("Clear discussion", key=f"{key_prefix}_clear", use_container_width=True):
         discussion.clear()
+        search_state["big_screen"] = None
         st.rerun(scope=rerun_scope)
 
     if submitted and follow_up.strip():
@@ -6301,7 +6373,14 @@ def render_search_results(
     main_col, chat_col = st.columns([3, 2], gap="large")
 
     with main_col:
-        if search_state["answer"]:
+        on_big_screen = big_screen_turn(search_state)
+        if on_big_screen:
+            render_big_screen_reply(search_state, *on_big_screen)
+            if search_state["answer"]:
+                with st.expander("Answer"):
+                    st.markdown(link_opportunity_names(search_state["answer"]))
+                    render_copy_buttons([("Copy answer", search_state["answer"])])
+        elif search_state["answer"]:
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.subheader("Answer", width="content")
                 render_copy_buttons([("Copy all output", full_llm_output(search_state))])
