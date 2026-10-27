@@ -2468,8 +2468,10 @@ def render_reference_documents_section(library: dict) -> None:
                     st.text_input("Short title", value=ref.get("title", ""), key=f"reference_title_{ref['id']}",
                                   on_change=save_reference_title, args=(ref["id"],), max_chars=40,
                                   placeholder="e.g. PoC types")
-                    st.link_button("Choose notes", f"?pick={ref['id']}", icon=":material/open_in_new:",
-                                   help="Opens the search page in a new tab to add or remove this document's notes.")
+                    st.button("Choose notes", key=f"reference_choose_{ref['id']}", icon=":material/search:",
+                              on_click=go_to_pick, args=(ref["id"],),
+                              help="Goes to the search page to add or remove this document's notes; **Done** "
+                              "brings you back here.")
                     if st.button("Open", key=f"reference_open_{ref['id']}", icon=":material/visibility:",
                                  disabled=not ref.get("notes"), help="Read its notes, as the LLM gets them."):
                         reference_popup(ref["id"])
@@ -2623,14 +2625,32 @@ def render_reference_document_body(ref: dict, height: int | None = None) -> None
             st.markdown(path.read_text(errors="ignore"))
 
 
+def go_to_pick(ref_id: str) -> None:
+    """Choose notes: the search page in pick mode, in this tab."""
+    st.query_params.from_dict({"pick": ref_id})
+
+
+def return_from_pick() -> None:
+    """Done: back to the prompt library's Reference documents, showing the document's notes."""
+    close_document_popup()
+    st.session_state["prompt_page_references_open"] = True
+    st.query_params.from_dict({"page": "prompts", "section": "references"})
+
+
+def render_pick_done(ref: dict, key: str) -> None:
+    st.button("✓ Done — back to Reference documents", key=key, type="primary", icon=":material/arrow_back:",
+              on_click=return_from_pick, use_container_width=True,
+              help=f"Goes back to the prompt library, where **{reference_label(ref)}** shows the notes you chose.")
+
+
 def render_pick_panel(ref: dict) -> None:
-    """Search page in pick mode (?pick=<id>): the Ask box becomes the reference document being filled."""
+    """Search page in pick mode (?pick=<id>): the reference document being filled, under the Filter box."""
     ref = find_reference_document(ref["id"]) or ref  # re-read: notes are added from the list below
-    with st.container(border=True):
+    with st.container(border=True, key="pick_panel"):
         st.markdown(f"**Choosing notes for:** {md_escape_text(reference_label(ref))}")
         st.caption(
-            "Find notes with the Filter box (**Find notes** or **Filter search only**), then **Add** them in the list "
-            "under it. Changes are saved straight away; close this tab when you're done."
+            "Find notes with the Filter box above (**Find notes** or **Filter search only**), then **Add** them in "
+            "the list below. Changes are saved straight away; **Done** takes you back to Reference documents."
         )
         for note in ref.get("notes", []):
             path = reference_note_path(note)
@@ -2639,11 +2659,12 @@ def render_pick_panel(ref: dict) -> None:
                             + ("" if path else " — ⚠ not found"), width="stretch")
                 st.button(":material/close:", key=f"pick_drop_{reference_note_key(note)}", type="tertiary",
                           on_click=remove_reference_note, args=(ref["id"], reference_note_key(note)))
-        if ref.get("notes"):
-            if st.button("Open", key="pick_panel_open", icon=":material/visibility:"):
-                reference_popup(ref["id"])
-        else:
+        if not ref.get("notes"):
             st.caption("No notes yet.")
+        with st.container(horizontal=True, vertical_alignment="center"):
+            if ref.get("notes") and st.button("Open", key="pick_panel_open", icon=":material/visibility:"):
+                reference_popup(ref["id"])
+            render_pick_done(ref, "pick_done_top")
 
 
 def save_executor_field(field: str) -> None:
@@ -5370,6 +5391,8 @@ def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str, p
                 render_filter_result_row(library, file_source, blocks, listed, library_folder, safe_lib,
                                          {"uploads_dirs": ()}, pick)
             row += 1
+    if pick is not None:
+        render_pick_done(pick, "pick_done_bottom")
 
 
 def render_filter_result_row(
@@ -8563,7 +8586,8 @@ elif pick_ref is not None:
     st.info(f"Choosing notes for the reference document **{md_escape_text(reference_label(pick_ref))}**: "
             "gather notes with the Filter box, then **Add** them in the list under it.")
 
-filter_box_col, ask_box_col = st.columns(2, gap="medium")
+# Pick mode is one column: Filter box, the document being filled, then the results to add from.
+filter_box_col, ask_box_col = (st.container(), st.container()) if pick_ref is not None else st.columns(2, gap="medium")
 
 with filter_box_col:
     with st.container(border=True, key="filter_box"):
@@ -8805,8 +8829,7 @@ prompt_library = load_prompt_library()
 
 with ask_box_col:
     if pick_ref is not None:
-        # Pick mode: no LLM; the Ask box shows the reference document being filled from the list.
-        render_pick_panel(pick_ref)
+        # Pick mode: no LLM; the document being filled is shown under the Filter box instead.
         prompt_text, search_clicked, use_llm_answer, scope_clicked = "", False, False, False
         selected_ollama_model = default_ollama
         llm_max_tokens = int(corpus_config["llm_max_tokens"])
@@ -9164,6 +9187,8 @@ current_search = bool(last_search and last_search["library"] in (safe_lib, ALL_L
 answering = current_search and not last_search.get("filter_only")
 gathered = gathered_notes(safe_lib)
 with filter_results_slot:
+    if pick_ref is not None:
+        render_pick_panel(pick_ref)
     if current_search and last_search.get("filter_only") and not last_search["results"]:
         st.warning(last_search["notice"] or "No notes match the filter.")
     if gathered and not answering:
