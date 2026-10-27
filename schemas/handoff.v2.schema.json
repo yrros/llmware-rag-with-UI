@@ -212,6 +212,10 @@
         },
         "related_to": {
           "$ref": "#/$defs/related_to"
+        },
+        "allow_duplicate": {
+          "type": "boolean",
+          "description": "Create it even if it looks like one of the user's open tasks (the user chose Create anyway). Optional; false when absent."
         }
       }
     },
