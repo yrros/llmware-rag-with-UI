@@ -897,14 +897,20 @@ QUICK_SEARCH_TERM_SLOTS = 5
 # Each route has its colour: the Filter box takes the selected route's, and results the colour of the route that
 # found them (gathered notes the route that found them last).
 ROUTE_TINTS = {"semantic": "28, 131, 225", "literal": "255, 140, 0"}  # blue, orange
+LLM_TINT = "33, 195, 84"  # light green: the Ask box and the LLM's answer
+AGENT_TINT = "28, 131, 225"  # a harder blue for an Agent's workflow and actions
 
 
 def route_tint_style(route: str) -> str:
     rows = "".join(
-        f'[class*="st-key-gathered_{name}_"], .st-key-results_{name} {{ background: rgba({rgb}, 0.10); '
-        f"border-radius: 0.5rem; }}"
+        f'[class*="st-key-gathered_{name}_"] {{ background: rgba({rgb}, 0.10); border-radius: 0.5rem; }}'
         for name, rgb in ROUTE_TINTS.items()
     )
+    # The LLM side in green (the Ask box and the answer), an Agent's workflow inside it in a harder blue.
+    llm = (f'.st-key-ask_box, [class*="st-key-results_"] {{ background: rgba({LLM_TINT}, 0.10) !important; }}'
+           '[class*="st-key-results_"] { padding: 0.5rem 0.9rem; border-radius: 0.75rem; }'
+           f".st-key-agent_panel {{ background: rgba({AGENT_TINT}, 0.16) !important; }}"
+           f".st-key-agent_staging {{ background: rgba({AGENT_TINT}, 0.10) !important; }}")
     # The route switch: each option in its colour, lightly when not chosen and a few shades deeper when it is.
     switch = "".join(
         f'.st-key-route_switch button[role="radio"]:nth-of-type({n}) {{ background: rgba({rgb}, 0.10) !important; '
@@ -916,7 +922,7 @@ def route_tint_style(route: str) -> str:
         for n, rgb in enumerate(ROUTE_TINTS.values(), 1)  # same order as SEARCH_ROUTES: semantic, literal
     )
     return (f"<style>.st-key-filter_box {{ background: rgba({ROUTE_TINTS[route]}, 0.06) !important; }}"
-            f'[class*="st-key-gathered_"] {{ padding: 0.1rem 0.4rem; }}{rows}{switch}</style>')
+            f'[class*="st-key-gathered_"] {{ padding: 0.1rem 0.4rem; }}{rows}{llm}{switch}</style>')
 
 
 # Filter fields as small rounded boxes, and their quick dates and quick terms as rounded chips.
@@ -8550,7 +8556,7 @@ with ask_box_col:
         llm_temperature = float(corpus_config["llm_temperature"])
         search_progress_slot = st.empty()
     else:
-        with st.container(border=True):
+        with st.container(border=True, key="ask_box"):  # green, like the answer (route_tint_style)
             st.markdown("**Ask**")
             if "question_text" not in st.session_state:
                 st.session_state["question_text"] = str(load_app_settings().get("last_question", ""))
@@ -8896,13 +8902,20 @@ if last_search and last_search["library"] == safe_lib and last_search.get("dista
         if abs(last_search.get("cutoff", distance_threshold) - distance_threshold) > 1e-6:
             st.caption("Cutoff changed — **Search** again to apply it.")
 current_search = bool(last_search and last_search["library"] in (safe_lib, ALL_LIBRARIES_KEY))
+answering = current_search and not last_search.get("filter_only")
+gathered = gathered_notes(safe_lib)
 with filter_results_slot:
     if current_search and last_search.get("filter_only") and not last_search["results"]:
         st.warning(last_search["notice"] or "No notes match the filter.")
-    if gathered := gathered_notes(safe_lib):
+    if gathered and not answering:
         render_gathered_notes(gathered, library_folder, safe_lib, pick_ref)
-if current_search and not last_search.get("filter_only"):
-    # The answer and its sources, in the colour of the route that found them.
+if answering:
+    # Moved on to the LLM: the in-scope notes fold into one full-width bar, and the answer shows below in green.
+    if gathered:
+        kept = len(kept_gathered_notes(gathered))
+        with st.expander(f"In scope · {len(gathered['notes'])} note(s), {kept} kept", icon=":material/filter_list:",
+                         key="in_scope_folded"):
+            render_gathered_notes(gathered, library_folder, safe_lib, pick_ref)
     with st.container(key=f"results_{last_search.get('route', 'semantic')}"):
         render_search_results(
             last_search,
