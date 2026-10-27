@@ -8488,7 +8488,15 @@ _migrated_tables = migrate_all_legacy_vectors()
 # ---------------------------------------------------------------------------
 # PAGE SETUP
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="RAG Workspace Manager", layout="wide")
+# Each sub-page names its purpose in the browser tab.
+PAGE_TITLES = {
+    "prompts": "RAG - Prompt library",
+    "actions": "RAG - Actions",
+    "configure": "RAG - Configure",
+    "reference": "RAG - Reference document",
+}
+st.set_page_config(page_title=PAGE_TITLES.get(st.query_params.get("page"), "RAG Workspace Manager"),
+                   layout="wide")
 # Starts the background auto-rescan thread once per server process.
 get_text_rescan_scheduler()
 if st.query_params.get("page") == "prompts":
