@@ -3868,6 +3868,26 @@ def render_prompt_card(
                 st.caption(f"Last used {prompt['last_used'].replace('T', ' ')}")
 
 
+PROMPT_SECTIONS_SETTING = "prompt_sections_open"  # {"task": bool, "agent": bool}; both open by default
+PROMPT_SECTION_KEYS = {"task": "task_prompts", "agent": "agent_prompts"}
+
+
+def persist_prompt_section(section: str) -> None:
+    opened = dict(load_app_settings().get(PROMPT_SECTIONS_SETTING) or {})
+    opened[section] = bool(st.session_state.get(PROMPT_SECTION_KEYS[section]))
+    save_app_settings({PROMPT_SECTIONS_SETTING: opened})
+
+
+def prompt_section(section: str, title: str, icon: str):
+    """The Task prompts or Agent prompts section: collapsible, open until closed, remembered."""
+    key = PROMPT_SECTION_KEYS[section]
+    if key not in st.session_state:
+        st.session_state[key] = (load_app_settings().get(PROMPT_SECTIONS_SETTING) or {}).get(section, True)
+    if st.query_params.get("prompt"):  # an Agent's Edit prompt workflow link: show the card it opens
+        st.session_state[key] = True
+    return st.expander(title, key=key, icon=icon, on_change=persist_prompt_section, args=(section,))
+
+
 def render_prompt_section_cards(
     section: str, prompts: list[dict], library: dict, model_options: list[str], empty: str
 ) -> None:
@@ -4111,8 +4131,7 @@ def render_prompt_library_page() -> None:
 
     render_reference_documents_section(library)
 
-    with st.container(border=True):
-        st.subheader("Task prompts")
+    with prompt_section("task", "Task prompts", ":material/checklist:"):
         st.caption(
             "Pick a task in the Ask panel to tell the LLM what to write from the notes. Tick **Global** to "
             "send a prompt with every request instead. Tick **Agent** to make it a workflow that ends by sending "
@@ -4163,10 +4182,12 @@ def render_prompt_library_page() -> None:
         render_prompt_section_cards("task", tasks, library, model_options,
                                     "No task prompts match." if library["prompts"] else "No prompts yet — add one below.")
 
-    st.html(f"<style>.st-key-agent_prompts {{ --section: {AGENT_TINT}; border: 1px solid rgb({AGENT_TINT}) !important; }}"
-            f".st-key-agent_prompts h3 {{ color: rgb({AGENT_TINT}); }}{section_shading_css()}</style>")
-    with st.container(border=True, key="agent_prompts"):
-        st.subheader("Agent prompts")
+    # The Agent section's own expander (not the cards inside it) gets the blue outline and heading.
+    st.html(f"<style>.st-key-agent_prompts {{ --section: {AGENT_TINT}; }}"
+            f".st-key-agent_prompts details:not(details details) {{ border: 1px solid rgb({AGENT_TINT}) !important; }}"
+            f".st-key-agent_prompts details:not(details details) > summary {{ color: rgb({AGENT_TINT}); "
+            f"font-weight: 600; }}{section_shading_css()}</style>")
+    with prompt_section("agent", "Agent prompts", ":material/smart_toy:"):
         st.caption(
             "Prompts with **Agent** ticked: workflows that end by sending a note, tasks, an email or a Next Step "
             "to the outbox. Untick **Agent** to move one to Task prompts. The search above covers both sections."
