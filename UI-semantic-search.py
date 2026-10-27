@@ -3926,8 +3926,27 @@ def render_prompt_section_cards(
                   on_click=set_prompts_open, args=(ids, True))
         st.button("Collapse all", key=f"prompts_collapse_{section}", icon=":material/unfold_less:", type="tertiary",
                   on_click=set_prompts_open, args=(ids, False))
-    for prompt in prompts:
-        render_prompt_card(prompt, model_options, ordered_links(library), reference_documents(library))
+    for index, prompt in enumerate(prompts):
+        # The card, with ↑ / ↓ beside it to move it within its section.
+        with st.container(horizontal=True, vertical_alignment="top", gap="xsmall"):
+            render_prompt_card(prompt, model_options, ordered_links(library), reference_documents(library))
+            with st.container(horizontal=True, gap=None, width="content"):
+                st.button(":material/arrow_upward:", key=f"prompt_up_{prompt['id']}", type="tertiary",
+                          disabled=index == 0, on_click=swap_prompts, args=(prompt["id"], ids[index - 1]),
+                          help="Move up")
+                st.button(":material/arrow_downward:", key=f"prompt_down_{prompt['id']}", type="tertiary",
+                          disabled=index == len(prompts) - 1, on_click=swap_prompts,
+                          args=(prompt["id"], ids[min(index + 1, len(ids) - 1)]), help="Move down")
+
+
+def swap_prompts(first_id: str, second_id: str) -> None:
+    """Swap two prompts' places in the library (its order is the order everywhere prompts are listed)."""
+    library = load_prompt_library()
+    order = [p["id"] for p in library["prompts"]]
+    if first_id in order and second_id in order and first_id != second_id:
+        i, j = order.index(first_id), order.index(second_id)
+        library["prompts"][i], library["prompts"][j] = library["prompts"][j], library["prompts"][i]
+        save_prompt_library(library)
 
 
 # --- Export and import of all settings (no note content) --------------------------------------------------
@@ -8342,6 +8361,28 @@ def gathered_full_notes(gathered: dict, keys: list[tuple[str, str]]) -> list[dic
     return blocks
 
 
+def literal_matches(
+    search_filter: dict, safe_lib: str, library_folder: Path, corpus_root: Path | None, libraries: list[str] | None
+) -> set[tuple[str, str]]:
+    """(library key, file) of every note the filter terms match now, minus excluded ones: what Ask (filtered
+    only) answers from (up to Max results). `libraries`: all of them, when Search all libraries is ticked."""
+    targets = ([(resolve_library_registry_name(lib), resolve_library_content_path(corpus_root, lib)) for lib in libraries]
+               if libraries and corpus_root else [(safe_lib, library_folder)])
+    # Each library's filter carries its excluded notes, so the cache below sees exclusions change.
+    return set(_literal_matches(tuple(
+        (key, str(folder), json.dumps(with_exclusions(search_filter, key), sort_keys=True)) for key, folder in targets
+    ), str(corpus_root or "")))
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _literal_matches(targets: tuple, corpus_root: str) -> list[tuple[str, str]]:
+    found = []
+    for lib_key, folder, filter_json in targets:
+        lib_filter = with_path_matches(json.loads(filter_json), lib_key, Path(folder), Path(corpus_root) if corpus_root else None)
+        found += [(lib_key, source) for source in find_matching_sources(lib_key, lib_filter)]
+    return found
+
+
 def share_context(gathered: dict, keys: list[tuple[str, str]], budget: int) -> tuple[list[dict], int]:
     """The blocks of these in-scope notes, each note cut to an equal share of `budget` characters, so all of
     them reach the LLM. Returns (blocks, how many notes were trimmed)."""
@@ -9263,8 +9304,17 @@ with ask_box_col:
                 llm_max_tokens = int(corpus_config["llm_max_tokens"])
                 llm_temperature = float(corpus_config["llm_temperature"])
 
+            # Literal route: how many notes Ask (filtered only) would send, to compare with the in-scope notes.
+            literal = (literal_matches(search_filter, safe_lib, library_folder, corpus_root_path,
+                                       scan_libraries if search_all_libraries and not is_single_corpus_mode() else None)
+                       if exact_text_only and has_positive_filter_terms(search_filter) else None)
+            literal_count = (
+                "" if literal is None else
+                f" · {result_limit} of {len(literal)} notes" if len(literal) > result_limit
+                else f" · {len(literal)} note{'' if len(literal) == 1 else 's'}"
+            )
             search_clicked = st.button(
-                "🔍 Ask (filtered only)" if exact_text_only else "🔍 Search",
+                f"🔍 Ask (filtered only){literal_count}" if exact_text_only else "🔍 Search",
                 type="primary",
                 use_container_width=True,
                 help="Uses the route chosen in the Filter box: "
@@ -9278,10 +9328,11 @@ with ask_box_col:
             )
             _in_scope = gathered_notes(safe_lib)
             _kept_in_scope = kept_gathered_notes(_in_scope) if _in_scope else []
-            scope_clicked = st.button(
+            # Only worth offering when the in-scope notes aren't just what Ask (filtered only) sends anyway.
+            same_as_filtered = literal is not None and len(literal) <= result_limit and set(_kept_in_scope) == literal
+            scope_clicked = bool(_kept_in_scope) and not same_as_filtered and st.button(
                 f"🗂 Ask about in-scope notes ({len(_kept_in_scope)})",
                 use_container_width=True,
-                disabled=not _kept_in_scope,
                 help="Answers your question from every note in **In scope** (under the Filter box) that you haven't "
                 "excluded, e.g. *list the actions* across two companies' conversations. Each note gets an equal "
                 "share of the LLM's context.",
