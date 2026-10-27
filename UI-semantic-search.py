@@ -9171,25 +9171,29 @@ with filter_box_col:
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
         if "max_results" not in st.session_state:  # saved between searches and sessions
             st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
-        result_limit = st.number_input(
-            "Max results",
-            min_value=1,
-            max_value=50,
-            key="max_results",
-            on_change=persist_max_results,
-            width=160,
-            help="The most passages (Semantic route) or notes (Literal route) a search returns. Saved for next time.",
-        )
         install_filter_commit_on_blur()
         install_tooltip_hide_on_click()
         install_save_flash()
         search_filter = get_search_filter_from_widgets()
-        if is_filter_active(search_filter):
-            st.caption(f"Filter: {describe_search_filter(search_filter)}")
-        if count_excluded_notes():
-            excluded_col, clear_col = st.columns([3, 1.4], vertical_alignment="center")
-            excluded_col.caption(f"🚫 {count_excluded_notes()} note(s) excluded from **Search**.")
-            clear_col.button("Clear exclusions", on_click=clear_excluded_notes, use_container_width=True)
+        # One line: Max results, then what the filter and exclusions leave out, with Clear exclusions rightmost.
+        st.html("<style>.st-key-max_results_row{flex-wrap:nowrap}"
+                ".st-key-max_results_row>div{min-width:0}</style>")
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key="max_results_row"):
+            result_limit = st.number_input(
+                "Max results",
+                min_value=1,
+                max_value=50,
+                key="max_results",
+                on_change=persist_max_results,
+                width=110,
+                help="The most passages (Semantic route) or notes (Literal route) a search returns. Saved for next time.",
+            )
+            # The filter takes the free space and wraps within it, so the rest stays on this line.
+            st.caption(f"Filter: {describe_search_filter(search_filter)}" if is_filter_active(search_filter) else "")
+            if count_excluded_notes():
+                st.caption(f"🚫 {count_excluded_notes()} excluded", width="content",
+                           help=f"{count_excluded_notes()} note(s) excluded from **Search**.")
+                st.button("Clear exclusions", type="tertiary", on_click=clear_excluded_notes)
 
         with st.container(border=True):
             st.markdown(
