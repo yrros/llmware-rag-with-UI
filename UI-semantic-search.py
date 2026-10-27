@@ -4717,6 +4717,24 @@ def render_copy_button(text: str, label: str = "Copy") -> None:
     render_copy_buttons([(label, text)])
 
 
+def full_llm_output(search_state: dict) -> str:
+    """Everything the LLM wrote for this search, as Markdown: the question, the answer and the discussion."""
+    parts = []
+    if search_state.get("question"):
+        parts.append("## Question\n\n" + search_state["question"].strip())
+    parts.append("## Answer\n\n" + (search_state.get("answer") or "").strip())
+    turns = []
+    for turn in search_state.get("discussion") or []:
+        if turn["role"] == "user":
+            turns.append("**You:** " + turn["content"].strip())
+        else:
+            model = f" (`{turn['model']}`)" if turn.get("model") else ""
+            turns.append(f"**LLM**{model}:\n\n" + turn["content"].strip())
+    if turns:
+        parts.append("## Discussion\n\n" + "\n\n".join(turns))
+    return "\n\n".join(parts)
+
+
 def render_copy_buttons(buttons: list[tuple[str, str]]) -> None:
     """A row of small copy buttons, one per (label, text), in a single component iframe."""
     buttons = [(label, text) for label, text in buttons if text and text.strip()]
@@ -5682,9 +5700,12 @@ def render_search_results(
 
     with main_col:
         if search_state["answer"]:
-            st.subheader("Answer")
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.subheader("Answer", width="content")
+                render_copy_buttons([("Copy all output", full_llm_output(search_state))])
             st.markdown(link_opportunity_names(search_state["answer"]))
             render_copy_buttons([
+                ("Copy all output", full_llm_output(search_state)),
                 ("Copy answer", search_state["answer"]),
                 ("Copy question", search_state.get("question", "")),
                 ("Copy task prompt", search_state.get("task_prompt", "")),
