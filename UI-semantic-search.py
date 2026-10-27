@@ -2163,7 +2163,7 @@ def render_follow_up_context(search_state: dict, key_prefix: str) -> None:
     with st.container(horizontal=True, vertical_alignment="center", gap="xsmall", key=f"{key_prefix}_add_context"):
         st.caption("📎 Add context:", width="content")
         st.button(
-            "☁️ Salesforce",
+            "☁️ Salesforce ✓" if on else "☁️ Salesforce",
             key=f"{key_prefix}_salesforce_context",
             type="primary" if on else "secondary",
             disabled=not snapshot or (not records and not on),
@@ -2516,11 +2516,11 @@ def render_ask_reference_row(library: dict, tasks: list[dict]) -> None:
     from_prompts = {i: task["name"] for task in tasks for i in task.get("references", [])}
     salesforce_on = bool(load_app_settings().get(SALESFORCE_CONTEXT_SETTING))
     salesforce_prompts = [task["name"] for task in tasks if task.get("salesforce")]
-    with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
+    with st.container(horizontal=True, vertical_alignment="center", gap="xsmall", key="ask_reference_row"):
         st.caption("Reference:")
         if snapshot:
             st.button(
-                "☁️ Salesforce",
+                "☁️ Salesforce ✓" if salesforce_on or salesforce_prompts else "☁️ Salesforce",
                 key="use_salesforce_context",
                 type="primary" if salesforce_on or salesforce_prompts else "secondary",
                 on_click=toggle_ask_salesforce_context,
@@ -2532,7 +2532,7 @@ def render_ask_reference_row(library: dict, tasks: list[dict]) -> None:
             )
         for ref in recent_reference_documents(library):
             st.button(
-                reference_label(ref),
+                reference_label(ref) + (" ✓" if ref["id"] in active or ref["id"] in from_prompts else ""),
                 key=f"use_reference_{ref['id']}",
                 type="primary" if ref["id"] in active or ref["id"] in from_prompts else "secondary",
                 on_click=toggle_active_reference,
@@ -2554,12 +2554,16 @@ def render_ask_reference_row(library: dict, tasks: list[dict]) -> None:
                 label_visibility="collapsed",
             )
     sending = run_reference_documents(tasks, library)
-    if sending:
+    salesforce_sending = bool(snapshot) and (salesforce_on or bool(salesforce_prompts))
+    if sending or salesforce_sending:
         st.markdown(
             "Sending: " + " · ".join(
-                reference_view_link(ref) + (f" <small>({html.escape(from_prompts[ref['id']])})</small>"
-                                            if ref["id"] in from_prompts else "")
-                for ref in sending
+                (["☁️ Salesforce records"
+                  + (f" <small>({html.escape(', '.join(salesforce_prompts))})</small>"
+                     if salesforce_prompts and not salesforce_on else "")] if salesforce_sending else [])
+                + [reference_view_link(ref) + (f" <small>({html.escape(from_prompts[ref['id']])})</small>"
+                                               if ref["id"] in from_prompts else "")
+                   for ref in sending]
             ),
             unsafe_allow_html=True,
         )
@@ -4767,8 +4771,13 @@ def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
 # The Recent and Starred prompt buttons, about a quarter smaller than a normal button; the text keeps its size.
 PROMPT_CHIP_STYLE = """<style>
 [class*="st-key-use_prompt_"] button, [class*="st-key-use_agent_prompt_"] button,
-[class*="st-key-use_reference_"] button {
+[class*="st-key-use_reference_"] button, .st-key-use_salesforce_context button {
   min-height: 1.875rem !important; padding: 0.05rem 0.55rem !important;
+}
+/* Section shading paints every button alike, so a chip that's switched on gets a firm outline and bold text. */
+.st-key-ask_reference_row button[data-testid="stBaseButton-primary"],
+[class*="_add_context"] button[data-testid="stBaseButton-primary"] {
+  box-shadow: inset 0 0 0 2px currentColor !important; font-weight: 600 !important;
 }
 </style>"""
 
