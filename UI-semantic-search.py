@@ -2105,7 +2105,7 @@ def build_agent_task_prompt(prompts: list[dict], results: list) -> str:
     )
 
 
-# --- Common links: attached to prompts, shown under the question while a prompt is injected -------------
+# --- Links (Task executor settings on the Configure page): attached to prompts, shown under the question ------
 
 BEST_GUESS = "{best_guess}"  # in a link's address: replaced by the app's best guess at what you're looking for
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -2179,12 +2179,12 @@ def render_page_title(title: str) -> None:
 
 
 # The task executor is the one special link: the service that processes the outbox (e.g. the Salesforce
-# Connector app). It's defined first in Common links, listed first everywhere, and shown on the Actions page.
+# Connector app). It's defined first in Task executor settings, listed first everywhere, and on the Actions page.
 EXECUTOR_ROLE = "executor"
 
 
 def ordered_links(library: dict) -> list[dict]:
-    """Common links with the task executor first."""
+    """The links (Task executor settings) with the task executor first."""
     return sorted(library.get("links", []), key=lambda link: link.get("role") != EXECUTOR_ROLE)
 
 
@@ -3400,7 +3400,7 @@ def render_actions_page() -> None:
     render_outbox_status(link=False)
     render_page_title("Actions")
     outbox = get_outbox_dir()
-    # The task executor (defined in the prompt library's Common links) processes what's listed here.
+    # The task executor (defined in Task executor settings on the Configure page) processes what's listed here.
     executor = executor_link(load_prompt_library())
     if executor and executor.get("url"):
         st.markdown(
@@ -3408,7 +3408,8 @@ def render_actions_page() -> None:
             "the schedule."
         )
     else:
-        st.caption("Set the **Task executor** link in the prompt library's **Common links** to open it from here.")
+        st.caption(f"Set the **Task executor** in **Task executor settings** on the [Configure]({CONFIGURE_PAGE_URL}) "
+                   "page to open it from here.")
     st.caption(
         f"Everything Agents have sent to the outbox (`{outbox}`) and what the connector did with it. "
         "Edit a package's text before a connector acts on it, withdraw it to stop a connector acting on it, "
@@ -3465,6 +3466,7 @@ def render_actions_page() -> None:
 
 
 PROMPT_LIBRARY_PAGE_URL = "?page=prompts"
+CONFIGURE_PAGE_URL = "?page=configure"
 
 
 def save_title_marker() -> None:
@@ -3843,7 +3845,7 @@ def render_prompt_card(
                     placeholder="Links to show when this prompt is used",
                     label_visibility="collapsed",
                     help="Shown as links under the question in the Ask box while this prompt is injected. "
-                    "Add links in **Common links** at the top of this page.",
+                    "Add links in **Task executor settings** on the Configure page.",
                 )
             if references:
                 ref_titles = {ref["id"]: "📄 " + reference_label(ref) for ref in references}
@@ -3883,20 +3885,19 @@ def render_prompt_section_cards(
         render_prompt_card(prompt, model_options, ordered_links(library), reference_documents(library))
 
 
-def render_prompt_library_page() -> None:
-    """Prompt library page (opened in its own tab): About me, corpus prompt, task prompts."""
+def render_configure_page() -> None:
+    """Configure page (?page=configure): the task executor and other links, the outbox and the title marker."""
     library = load_prompt_library()
-    add_agent_border_style("[class*='st-key-agent_prompt_card_'] [data-testid='stExpander'] details")
     render_outbox_status()
-    render_page_title("Prompt library")
+    render_page_title("Configure")
     st.caption(
-        "Shape what the LLM is told when it answers from your notes. Each request is built in this order: "
-        "today's date → About me → corpus prompt → global prompts → your notes and question → the task you pick."
+        "Where Agents send their drafts and what processes them. The prompts themselves are in the "
+        f"[Prompt library]({PROMPT_LIBRARY_PAGE_URL})."
     )
 
     links = library.get("links", [])
-    with st.expander(f"Common links · {len(links)}", expanded=False, key="prompt_page_links_open",
-                     icon=":material/link:"):
+    with st.expander(f"Task executor settings · {len(links)} link{'' if len(links) == 1 else 's'}", expanded=True,
+                     key="prompt_page_links_open", icon=":material/link:"):
         # The task executor comes first and is defined here; it can't be removed, only cleared.
         executor = executor_link(library) or {}
         st.markdown("**⚙️ Task executor**")
@@ -3950,36 +3951,11 @@ def render_prompt_library_page() -> None:
                           on_click=delete_link, args=(link["id"],), help="Remove this link, from every prompt too")
         st.button("Add link", icon=":material/add:", key="link_add", on_click=add_link)
 
-    quick_terms = (library.get("quick_search_terms") or [])[:QUICK_SEARCH_TERM_SLOTS]
-    quick_terms += [""] * (QUICK_SEARCH_TERM_SLOTS - len(quick_terms))
-    with st.expander(
-        f"Quick search filters · {sum(1 for t in quick_terms if t.strip())} of {QUICK_SEARCH_TERM_SLOTS}",
-        expanded=st.query_params.get("section") == "quick_search",
-        key="prompt_page_quick_search_open",
-        icon=":material/bolt:",
-    ):
-        st.caption(
-            "Terms you filter by often, e.g. a customer or a folder such as `Clients-Prospects`. They show as "
-            "buttons under the quick dates on each filter field (**Must include**, **Any of**, **Exclude**); a "
-            "click adds the term to that field. Terms also match the folders notes are in. Saved as you type."
-        )
-        with st.container(horizontal=True, gap="small"):
-            for i, term in enumerate(quick_terms):
-                st.text_input(
-                    f"Term {i + 1}",
-                    value=term,
-                    key=f"quick_search_term_{i}",
-                    on_change=save_quick_search_terms,
-                    max_chars=60,
-                )
-
-    render_reference_documents_section(library)
-
     outbox = get_outbox_dir()
     waiting = len(pending_outbox_files(outbox))
     with st.expander(
         f"Outbox · {waiting} waiting",
-        expanded=False,
+        expanded=True,
         key="prompt_page_outbox_open",
         icon=":material/outbox:",
     ):
@@ -4000,7 +3976,7 @@ def render_prompt_library_page() -> None:
     marker = get_title_marker(library)
     with st.expander(
         "Task title marker · " + (f"“{marker['text']}”" if marker["text"] else "off"),
-        expanded=False,
+        expanded=True,
         key="prompt_page_title_marker_open",
         icon=":material/label:",
     ):
@@ -4027,6 +4003,20 @@ def render_prompt_library_page() -> None:
             )
         if marker["text"]:
             st.caption(f"Example: **{marked_title('Follow up with Acme on the pilot', marker)}**")
+
+
+def render_prompt_library_page() -> None:
+    """Prompt library page (opened in its own tab): About me, corpus prompt, task prompts."""
+    library = load_prompt_library()
+    add_agent_border_style("[class*='st-key-agent_prompt_card_'] [data-testid='stExpander'] details")
+    render_outbox_status()
+    render_page_title("Prompt library")
+    st.caption(
+        "Shape what the LLM is told when it answers from your notes. Each request is built in this order: "
+        "today's date → About me → corpus prompt → global prompts → reference documents → your notes and question "
+        "→ the task you pick. Links, the outbox and the title marker are on the "
+        f"[Configure]({CONFIGURE_PAGE_URL}) page."
+    )
 
     profile = library["profile"]
     profile_on = bool(profile.get("enabled", True) and str(profile.get("text", "")).strip())
@@ -4095,6 +4085,31 @@ def render_prompt_library_page() -> None:
             )
             safe_corpus = resolve_library_registry_name(corpus)
             render_corpus_prompt_editor(safe_corpus, get_corpus_config(safe_corpus))
+
+    quick_terms = (library.get("quick_search_terms") or [])[:QUICK_SEARCH_TERM_SLOTS]
+    quick_terms += [""] * (QUICK_SEARCH_TERM_SLOTS - len(quick_terms))
+    with st.expander(
+        f"Quick search filters · {sum(1 for t in quick_terms if t.strip())} of {QUICK_SEARCH_TERM_SLOTS}",
+        expanded=st.query_params.get("section") == "quick_search",
+        key="prompt_page_quick_search_open",
+        icon=":material/bolt:",
+    ):
+        st.caption(
+            "Terms you filter by often, e.g. a customer or a folder such as `Clients-Prospects`. They show as "
+            "buttons under the quick dates on each filter field (**Must include**, **Any of**, **Exclude**); a "
+            "click adds the term to that field. Terms also match the folders notes are in. Saved as you type."
+        )
+        with st.container(horizontal=True, gap="small"):
+            for i, term in enumerate(quick_terms):
+                st.text_input(
+                    f"Term {i + 1}",
+                    value=term,
+                    key=f"quick_search_term_{i}",
+                    on_change=save_quick_search_terms,
+                    max_chars=60,
+                )
+
+    render_reference_documents_section(library)
 
     with st.container(border=True):
         st.subheader("Task prompts")
@@ -4424,6 +4439,14 @@ def render_prompt_library_sidebar(corpus_config: dict) -> None:
             f"Global prompts: **{global_count}** · Task prompts: **{task_count}** (Agents: **{agent_count}**)  \n"
             "Opens in a new tab."
         ),
+    )
+    st.sidebar.link_button(
+        "Configure",
+        CONFIGURE_PAGE_URL,
+        icon=":material/settings:",
+        width="stretch",
+        help="Task executor settings (the connector and other links), the outbox and the task title marker. "
+        "Opens in a new tab.",
     )
 
 
@@ -8061,6 +8084,9 @@ if st.query_params.get("page") == "prompts":
     st.stop()
 if st.query_params.get("page") == "actions":
     render_actions_page()
+    st.stop()
+if st.query_params.get("page") == "configure":
+    render_configure_page()
     st.stop()
 if st.query_params.get("page") == "reference":
     render_reference_page()
