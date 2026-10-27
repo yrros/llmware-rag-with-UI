@@ -4280,6 +4280,7 @@ def render_configure_page() -> None:
             st.caption(f"Example: **{marked_title('Follow up with Acme on the pilot', marker)}**")
 
     render_settings_transfer_section()
+    install_save_flash()
 
 
 def render_prompt_library_page() -> None:
@@ -4520,6 +4521,7 @@ def render_prompt_library_page() -> None:
 
     install_filter_commit_on_blur()
     install_tooltip_hide_on_click()
+    install_save_flash()
 
 
 ACTIVE_TASK_PROMPTS_KEY = "active_task_prompt_ids"
@@ -5310,6 +5312,80 @@ if (page.__filterCommitOnBlurVersion !== 2) {
     input.dispatchEvent(new page.KeyboardEvent("keydown", enter));
   }, true);
 }
+</script>
+""",
+        height=0,
+    )
+
+
+# Text boxes that save when you leave them (their on_change saves), by widget key or key prefix.
+SAVE_ON_BLUR_KEYS = (
+    "corpus_prompt_", "corpus_root_path_input", "max_results", "connector_config_path_input",
+    "exporter_config_path_input", "outbox_path_input", "question_text", "executor_title", "executor_url",
+    "link_title_", "link_url_", "profile_short_name", "profile_text", "prompt_command_", "prompt_text_",
+    "prompt_name_", "prompt_step_text_", "prompt_step_name_", "quick_search_term_", "reference_title_",
+    "title_marker_text",
+)
+NOT_SAVED_WHEN_EMPTY = ("prompt_name_", "prompt_text_", "prompt_command_")  # an empty one keeps the old value
+
+
+def install_save_flash() -> None:
+    """Flash a text box green with a 'Saved' tag when leaving it (or Enter) saved a change."""
+    keys = json.dumps(SAVE_ON_BLUR_KEYS)
+    keep = json.dumps(NOT_SAVED_WHEN_EMPTY)
+    components.html(
+        f"""
+<script>
+const page = window.parent;
+const doc = page.document;
+if (page.__saveFlashVersion !== 1) {{
+  page.__saveFlashVersion = 1;
+  const keys = {keys}, keepIfEmpty = {keep}, green = "33, 195, 84";
+  const style = doc.createElement("style");
+  style.textContent = ".save-flash {{ position: absolute; pointer-events: none; z-index: 1000; border-radius: 0.5rem; "
+    + `border: 2px solid rgb(${{green}}); background: rgba(${{green}}, 0.18); transition: opacity 0.6s ease; }}`
+    + ".save-flash span {{ position: absolute; right: 6px; top: -11px; font: 600 11px -apple-system, sans-serif; "
+    + `color: #fff; background: rgb(${{green}}); border-radius: 999px; padding: 1px 8px; }}`;
+  doc.head.appendChild(style);
+  // The saving key a field belongs to (e.g. "prompt_text_"), or null for boxes that don't save.
+  const savingKey = (el) => {{
+    const box = el instanceof page.Element ? el.closest('[class*="st-key-"]') : null;
+    const key = box && [...box.classList].find((c) => c.startsWith("st-key-"));
+    return key ? keys.find((k) => key.slice(7).startsWith(k)) || null : null;
+  }};
+  const isField = (el) => el instanceof page.HTMLTextAreaElement
+    || (el instanceof page.HTMLInputElement && ["text", "number", ""].includes(el.type));
+  const flash = (el) => {{
+    const field = el.closest('[data-testid="stTextInputRootElement"], [data-testid="stTextAreaRootElement"], '
+      + '[data-testid="stNumberInputContainer"]') || el;
+    const r = field.getBoundingClientRect();
+    const mark = doc.createElement("div");
+    mark.className = "save-flash";
+    mark.innerHTML = "<span>✓ Saved</span>";
+    Object.assign(mark.style, {{ left: `${{r.left + page.scrollX - 2}}px`, top: `${{r.top + page.scrollY - 2}}px`,
+                                 width: `${{r.width + 4}}px`, height: `${{r.height + 4}}px` }});
+    doc.body.appendChild(mark);
+    setTimeout(() => (mark.style.opacity = "0"), 1100);
+    setTimeout(() => mark.remove(), 1800);
+  }};
+  const before = new page.WeakMap();
+  const check = (el) => {{
+    const key = savingKey(el);
+    if (!key || !before.has(el) || before.get(el) === el.value) return;
+    before.set(el, el.value);
+    if (!el.value.trim() && keepIfEmpty.includes(key)) return;  // not saved
+    flash(el);
+  }};
+  doc.addEventListener("focusin", (event) => {{
+    if (isField(event.target)) before.set(event.target, event.target.value);
+  }}, true);
+  doc.addEventListener("focusout", (event) => {{ if (isField(event.target)) check(event.target); }}, true);
+  doc.addEventListener("keydown", (event) => {{
+    if (event.key === "Enter" && event.target instanceof page.HTMLInputElement && isField(event.target)) {{
+      setTimeout(() => check(event.target), 0);
+    }}
+  }}, true);
+}}
 </script>
 """,
         height=0,
@@ -8971,6 +9047,7 @@ with filter_box_col:
         )
         install_filter_commit_on_blur()
         install_tooltip_hide_on_click()
+        install_save_flash()
         search_filter = get_search_filter_from_widgets()
         if is_filter_active(search_filter):
             st.caption(f"Filter: {describe_search_filter(search_filter)}")
