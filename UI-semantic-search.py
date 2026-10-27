@@ -1531,6 +1531,7 @@ def new_prompt_record(
     agent: bool = False,
     output: str = "text",
     model: str = "",
+    references=None,
 ) -> dict:
     return {
         "id": uuid.uuid4().hex[:12],
@@ -1542,6 +1543,7 @@ def new_prompt_record(
         "steps": [],  # Agent workflow steps between the collection prompt (text) and the command
         "command": DEFAULT_AGENT_COMMANDS.get(output, "") if agent else "",
         "model": model,  # empty: use whichever model is selected
+        "references": list(references or []),  # reference documents sent whenever this prompt is used
         "tags": clean_filter_terms(tags or []),
         "starred": bool(starred),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -3602,6 +3604,8 @@ def add_prompt_from_form() -> None:
             agent=agent,
             output=st.session_state.get("new_prompt_output", DEFAULT_AGENT_OUTPUT) if agent else "text",
             model=st.session_state.get("new_prompt_model") or "",
+            references=[ref_id for ref_id in st.session_state.get("new_prompt_references", [])
+                        if find_reference_document(ref_id, library)],
         )
     )
     save_prompt_library(library)
@@ -4261,6 +4265,21 @@ def render_prompt_library_page() -> None:
                     placeholder="Add a tag, press Enter",
                     label_visibility="collapsed",
                 )
+            references = reference_documents(library)
+            if references:
+                ref_titles = {ref["id"]: "📄 " + reference_label(ref) for ref in references}
+                st.multiselect(
+                    "Reference documents",
+                    options=list(ref_titles),
+                    format_func=ref_titles.get,
+                    key="new_prompt_references",
+                    placeholder="Reference documents to send with this prompt",
+                    help="Sent to the LLM as background whenever this prompt is used, Agent or not. You can change "
+                    "them later on the prompt's card.",
+                )
+            else:
+                st.caption("No reference documents yet: make them in **Reference documents** above, then attach "
+                           "them here or on the prompt's card.")
             st.form_submit_button("Add prompt", type="primary", icon=":material/add:", on_click=add_prompt_from_form)
         if error := st.session_state.pop("add_prompt_error", None):
             st.warning(error)
