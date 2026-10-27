@@ -894,6 +894,31 @@ def apply_quick_date(kind: str, field: str) -> None:
 
 
 QUICK_SEARCH_TERM_SLOTS = 5
+# Each route has its colour: the Filter box takes the selected route's, and results the colour of the route that
+# found them (gathered notes the route that found them last).
+ROUTE_TINTS = {"semantic": "28, 131, 225", "literal": "255, 140, 0"}  # blue, orange
+
+
+def route_tint_style(route: str) -> str:
+    rows = "".join(
+        f'[class*="st-key-gathered_{name}_"], .st-key-results_{name} {{ background: rgba({rgb}, 0.10); '
+        f"border-radius: 0.5rem; }}"
+        for name, rgb in ROUTE_TINTS.items()
+    )
+    # The route switch: each option in its colour, lightly when not chosen and a few shades deeper when it is.
+    switch = "".join(
+        f'.st-key-route_switch button[role="radio"]:nth-of-type({n}) {{ background: rgba({rgb}, 0.10) !important; '
+        f"color: rgb({rgb}) !important; border-color: rgba({rgb}, 0.45) !important; }}"
+        f'.st-key-route_switch button[role="radio"]:nth-of-type({n})[aria-checked="true"] {{ '
+        f"background: rgba({rgb}, 0.34) !important; color: inherit !important; "
+        f"border-color: rgb({rgb}) !important; font-weight: 600; }}"
+        f'.st-key-route_switch button[role="radio"]:nth-of-type({n}):hover {{ border-color: rgb({rgb}) !important; }}'
+        for n, rgb in enumerate(ROUTE_TINTS.values(), 1)  # same order as SEARCH_ROUTES: semantic, literal
+    )
+    return (f"<style>.st-key-filter_box {{ background: rgba({ROUTE_TINTS[route]}, 0.06) !important; }}"
+            f'[class*="st-key-gathered_"] {{ padding: 0.1rem 0.4rem; }}{rows}{switch}</style>')
+
+
 # Filter fields as small rounded boxes, and their quick dates and quick terms as rounded chips.
 FILTER_FIELD_STYLE = """<style>
 [class*="st-key-filter_field_"] { padding: 0.45rem 0.7rem 0.6rem !important; border-radius: 0.75rem !important; }
@@ -965,12 +990,12 @@ def render_filter_heading(field: str, label: str, field_help: str) -> None:
 
 
 def clear_search_filter() -> None:
-    """Clear Filter button: empty every filter field and drop note exclusions and found notes."""
+    """Clear Filter button: empty every filter field and drop note exclusions and gathered notes."""
     for field in SEARCH_FILTER_FIELDS:
         st.session_state[f"filter_{field}"] = []
     save_app_settings({"search_filter": {field: [] for field in SEARCH_FILTER_FIELDS}})
     clear_excluded_notes()
-    clear_found_notes()
+    clear_gathered_notes()
 
 
 def switch_to_library(library: str) -> None:
@@ -4156,8 +4181,11 @@ def render_source_document(
         render_full_document(file_source, path, safe_lib)
 
 
-def render_full_document(file_source: str, path: Path | None, safe_lib: str) -> None:
-    """Full note text (from disk, or rebuilt from the index) plus a download button."""
+def render_full_document(file_source: str, path: Path | None, safe_lib: str, where: str = "sources") -> None:
+    """Full note text (from disk, or rebuilt from the index) plus a download button.
+
+    `where` keeps the button's key unique when a note is shown twice (gathered notes and an answer's sources).
+    """
     text = ""
     from_index = False
     if path and path.suffix.lower() in TEXT_PREVIEW_EXTENSIONS:
@@ -4192,7 +4220,7 @@ def render_full_document(file_source: str, path: Path | None, safe_lib: str) -> 
                 f"Download {path.name}",
                 data=path.read_bytes(),
                 file_name=path.name,
-                key=f"download::{safe_lib}::{file_source}",
+                key=f"download::{where}::{safe_lib}::{file_source}",
             )
         except OSError:
             pass
@@ -4669,22 +4697,29 @@ def render_library_counts(search_state: dict) -> None:
                 )
 
 
-def render_filter_results(search_state: dict, library_folder: Path, safe_lib: str) -> None:
-    """Compact list of notes from a Filter search only run, one expandable row per note."""
-    results = search_state["results"]
-    if not results:
-        st.warning(search_state["notice"] or "No notes match the filter.")
-        return
+def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str) -> None:
+    """The notes gathered by Find notes and Filter search only, one row per note, most recent hit first.
 
-    render_library_counts(search_state)
+    Each row has the colour of the route that found the note last: blue semantic, orange literal.
+    """
+    keys = list(reversed(gathered["notes"]))
+    results = [block for key in keys for block in gathered["notes"][key]["blocks"]]
+    routes = {key: gathered["notes"][key]["route"] for key in keys}
+    render_library_counts({"library_counts": gathered["library_counts"], "results": results})
 
     notes: dict[tuple[str, str], list[dict]] = {}
     for result in results:
         notes.setdefault((result.get("_library", ""), str(result.get("file_source", ""))), []).append(result)
-    st.markdown(f"**{len(notes)} matching note(s)**")
+    by_route = {route: sum(1 for r in routes.values() if r == route) for route in ROUTE_TINTS}
+    kept = kept_gathered_notes(gathered)
+    st.markdown(
+        f"**{len(notes)} note(s) gathered** · {by_route['semantic']} by meaning (blue), "
+        f"{by_route['literal']} by exact text (orange)"
+    )
     st.caption(
-        "Your question was not sent to the LLM. Tick **🚫** to exclude a note, or click **🎯** to keep "
-        "just that note (and any others you 🎯), then click **Search** to run the full workflow on the rest."
+        "Find notes and Filter search only add to this list; a note found again takes the colour of the latest "
+        f"search. Tick **🚫** to exclude a note or click **🎯** to keep just the ones you pick: **Search** (or "
+        f"**Ask**) answers from the {len(kept)} you kept. **Clear results** starts over."
     )
     listed = [
         (blocks[0].get("_safe_lib", safe_lib), file_source)
@@ -4706,10 +4741,15 @@ def render_filter_results(search_state: dict, library_folder: Path, safe_lib: st
     folders: dict[str, list] = {}
     for note_key, blocks in notes.items():
         folders.setdefault(blocks[0].get("_folder_path", ""), []).append((note_key, blocks))
+    row = 0
     for folder in sorted(folders, key=lambda path: (not path, path.lower())):
         st.markdown(f"📁 **{folder or 'Folder not known'}** · {len(folders[folder])}")
         for (library, file_source), blocks in folders[folder]:
-            render_filter_result_row(library, file_source, blocks, listed, library_folder, safe_lib, search_state)
+            route = routes[(blocks[0].get("_safe_lib", safe_lib), file_source)]
+            with st.container(key=f"gathered_{route}_{row}"):
+                render_filter_result_row(library, file_source, blocks, listed, library_folder, safe_lib,
+                                         {"uploads_dirs": ()})
+            row += 1
 
 
 def render_filter_result_row(
@@ -4749,7 +4789,7 @@ def render_filter_result_row(
             note_uploads = blocks[0].get("_uploads_dirs", search_state["uploads_dirs"])
             path = resolve_source_path(file_source, note_folder, note_uploads)
             st.caption(str(path) if path else f"Source: `{file_source}`")
-            render_full_document(file_source, path, note_lib)
+            render_full_document(file_source, path, note_lib, "gathered")
 
 
 RECEIPT_STATUS_TEXT = {
@@ -7243,7 +7283,7 @@ def filtered_semantic_search(
     )
 
 
-FOUND_NOTES_KEY = "found_notes"  # {"library", "query", "sources"} from the Semantic route's Find notes
+GATHERED_KEY = "gathered_notes"  # notes listed by Find notes (semantic) and Filter search only (literal), built up
 
 
 def find_notes(
@@ -7266,13 +7306,58 @@ def find_notes(
     return [p for p in passages if str(p.get("file_source", "")) in notes], notice, nearest
 
 
-def found_notes(safe_lib: str) -> dict | None:
-    found = st.session_state.get(FOUND_NOTES_KEY)
-    return found if found and found["library"] == safe_lib else None
+def gathered_notes(safe_lib: str) -> dict | None:
+    """The notes gathered for this library: {"library", "seq", "notes", "library_counts"}, or None.
+
+    `notes` maps (library key, file source) to {"route", "seq", "blocks"}, oldest hit first; a note found
+    again moves to the end and takes the route (semantic or literal) of that search.
+    """
+    gathered = st.session_state.get(GATHERED_KEY)
+    return gathered if gathered and gathered["library"] == safe_lib and gathered["notes"] else None
 
 
-def clear_found_notes() -> None:
-    st.session_state.pop(FOUND_NOTES_KEY, None)
+def gather_results(
+    safe_lib: str, results: list, route: str, library_counts: list | None = None, uploads_dirs: tuple = ()
+) -> None:
+    """Add a listing's notes to the gathered notes, marked with the route that found them."""
+    gathered = st.session_state.get(GATHERED_KEY)
+    if not gathered or gathered["library"] != safe_lib:
+        gathered = {"library": safe_lib, "seq": 0, "notes": {}, "library_counts": []}
+    gathered["seq"] += 1
+    by_note: dict[tuple[str, str], list[dict]] = {}
+    for block in results:
+        block.setdefault("_uploads_dirs", uploads_dirs)  # where its attachments are, for the note's preview
+        by_note.setdefault((block.get("_safe_lib", safe_lib), str(block.get("file_source", ""))), []).append(block)
+    for key, blocks in by_note.items():
+        gathered["notes"].pop(key, None)
+        gathered["notes"][key] = {"route": route, "seq": gathered["seq"], "blocks": blocks}
+    if library_counts:
+        gathered["library_counts"] = library_counts
+    st.session_state[GATHERED_KEY] = gathered
+
+
+def kept_gathered_notes(gathered: dict) -> list[tuple[str, str]]:
+    """Gathered notes not excluded with 🚫, most recent hit first."""
+    return [key for key in reversed(gathered["notes"]) if key[1] not in get_excluded_notes(key[0])]
+
+
+def gathered_full_notes(gathered: dict, keys: list[tuple[str, str]]) -> list[dict]:
+    """Every block of these gathered notes: literal listings hold whole notes, semantic ones only passages."""
+    blocks: list[dict] = []
+    for key in keys:
+        entry = gathered["notes"][key]
+        blocks += entry["blocks"] if entry["route"] == "literal" else load_note_blocks(key[0], [key[1]])
+    return blocks
+
+
+def clear_gathered_notes() -> None:
+    st.session_state.pop(GATHERED_KEY, None)
+
+
+def clear_search_results() -> None:
+    """Clear results button: the gathered notes and the last search's results (and its discussion)."""
+    clear_gathered_notes()
+    st.session_state.pop(LAST_SEARCH_KEY, None)
 
 
 def perform_search(
@@ -7804,8 +7889,8 @@ st.caption(
 filter_box_col, ask_box_col = st.columns(2, gap="medium")
 
 with filter_box_col:
-    with st.container(border=True):
-        title_col, clear_filter_col = st.columns([3, 1.2], vertical_alignment="center")
+    with st.container(border=True, key="filter_box"):
+        title_col, clear_filter_col, clear_results_col = st.columns([2.4, 1.2, 1.2], vertical_alignment="center")
         title_col.markdown("**Filter**")
         clear_filter_col.button(
             "Clear Filter",
@@ -7813,25 +7898,35 @@ with filter_box_col:
             use_container_width=True,
             help="Remove all filter terms and note exclusions.",
         )
+        clear_results_col.button(
+            "Clear results",
+            on_click=clear_search_results,
+            use_container_width=True,
+            disabled=not (gathered_notes(safe_lib) or st.session_state.get(LAST_SEARCH_KEY)),
+            help="Clear the gathered notes and the last results, so **Search** looks through the whole library "
+            "again. Filter terms and exclusions stay.",
+        )
         # Two routes into the notes: semantic (vector) search or literal text matching. The controls below
         # follow the route; the Ask box's Search button uses it too.
         if "search_route" not in st.session_state:
             st.session_state["search_route"] = saved_search_route()
-        st.segmented_control(
-            "Search route",
-            options=list(SEARCH_ROUTES),
-            format_func=SEARCH_ROUTES.get,
-            key="search_route",
-            on_change=persist_search_route,
-            width="stretch",
-            help=(
-                "**Semantic** ranks passages by meaning (embeddings); filter terms narrow which notes it "
-                "looks in, and **Distance cutoff** sets how close a match must be.\n\n"
-                "**Literal** returns the notes that match the filter terms, in full. Much faster, works "
-                "across libraries, and the question is only used for the LLM answer."
-            ),
-        )
+        with st.container(key="route_switch"):  # coloured per route by route_tint_style
+            st.segmented_control(
+                "Search route",
+                options=list(SEARCH_ROUTES),
+                format_func=SEARCH_ROUTES.get,
+                key="search_route",
+                on_change=persist_search_route,
+                width="stretch",
+                help=(
+                    "**Semantic** ranks passages by meaning (embeddings); filter terms narrow which notes it "
+                    "looks in, and **Distance cutoff** sets how close a match must be.\n\n"
+                    "**Literal** returns the notes that match the filter terms, in full. Much faster, works "
+                    "across libraries, and the question is only used for the LLM answer."
+                ),
+            )
         exact_text_only = st.session_state.get("search_route") == "literal"
+        st.html(route_tint_style("literal" if exact_text_only else "semantic"))
         find_clicked = False
         find_query = ""
         if not exact_text_only:
@@ -7844,25 +7939,11 @@ with filter_box_col:
                     placeholder="e.g. pilot pricing discussions",
                     help=(
                         "Lists the notes closest in meaning to this (within **Narrow by terms**, if set), without an LLM "
-                        "answer. Exclude 🚫 or keep 🎯 notes in the list, then **Search** answers your "
-                        "question from the notes you kept. **Max results** is the number of notes."
+                        "answer, and adds them to the results under this box (in blue). Exclude 🚫 or keep 🎯 notes "
+                        "there, then **Search** answers your question from the notes you kept. **Max results** is "
+                        "the number of notes."
                     ),
                 )
-                if found := found_notes(safe_lib):
-                    kept = [s for s in found["sources"] if s not in get_excluded_notes(safe_lib)]
-                    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
-                        st.caption(
-                            f"Found {len(found['sources'])} note(s) about *{found['query']}* · "
-                            f"**Search** asks within the {len(kept)} you kept.",
-                            width="stretch",
-                        )
-                        st.button(
-                            ":material/close:",
-                            key="clear_found_notes",
-                            type="tertiary",
-                            on_click=clear_found_notes,
-                            help="Forget the found notes: **Search** looks through the whole library again.",
-                        )
         _saved_filter = load_app_settings().get("search_filter") or {}
         FILTER_WIDGETS = {
             "all": (
@@ -8151,10 +8232,12 @@ with ask_box_col:
             use_container_width=True,
             help="Uses the route chosen in the Filter box: "
             + (
-                "**Literal**: answers your question from the notes matching the filter terms, sent in full."
+                "**Literal**: answers your question from the notes "
+                + ("you gathered and kept" if gathered_notes(safe_lib) else "matching the filter terms")
+                + ", sent in full."
                 if exact_text_only
                 else "**Semantic**: passages ranked by meaning"
-                + (" within the notes you found and kept." if found_notes(safe_lib) else ".")
+                + (" within the notes you gathered and kept." if gathered_notes(safe_lib) else ".")
             )
             + f" Returns at most {result_limit} results (**Max results**, in the Filter box).",
         )
@@ -8173,19 +8256,20 @@ if new_search:
     persist_question()
     remember_searched_dates()
 run_filter_only = filter_only_clicked or (search_clicked and exact_text_only)
-search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode()
+_gathered = gathered_notes(safe_lib)
+ask_gathered = bool(search_clicked and _gathered)  # Search / Ask answers from the gathered notes kept
+search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode() and not ask_gathered
 
 if new_search:
     # A new search replaces the previous results and discussion.
     st.session_state.pop(LAST_SEARCH_KEY, None)
 
-_found = None if exact_text_only else found_notes(safe_lib)
-if new_search and run_filter_only and not has_positive_filter_terms(search_filter):
+if new_search and run_filter_only and not ask_gathered and not has_positive_filter_terms(search_filter):
     st.warning("Add at least one **Must include** or **Any of** term to filter notes.")
 elif find_clicked and not find_query.strip():
     st.warning("Type what the notes are about in **Find notes about** first.")
-elif search_clicked and _found and not set(_found["sources"]) - set(get_excluded_notes(safe_lib)):
-    st.warning("Every found note is excluded: keep at least one, or clear the found notes (**×**) to search them all.")
+elif ask_gathered and not kept_gathered_notes(_gathered):
+    st.warning("Every gathered note is excluded: keep at least one, or **Clear results** to search them all.")
 elif new_search and (prompt_text or run_filter_only or find_clicked):
     final_results = None
     notice = ""
@@ -8214,6 +8298,13 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
 
             if not search_lib:
                 st.error("Library not found. Use **Rescan** or **Re-index** in the left panel first.")
+            elif ask_gathered and exact_text_only:
+                # Literal Ask: the gathered notes kept, in full, most recent hits first.
+                uploads_dirs = get_library_uploads_dirs(search_lib)
+                kept = kept_gathered_notes(_gathered)[:result_limit]
+                final_results = gathered_full_notes(_gathered, kept)
+                if any(lib != safe_lib for lib, _source in kept):
+                    state_library = ALL_LIBRARIES_KEY
             elif run_filter_only:
                 uploads_dirs = get_library_uploads_dirs(search_lib)
                 with search_progress_slot.container(), st.spinner("Searching for exact text…", show_time=True):
@@ -8242,17 +8333,14 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
                             result_limit,
                             distance_threshold,
                         )
-                    st.session_state[FOUND_NOTES_KEY] = {
-                        "library": safe_lib,
-                        "query": find_query.strip(),
-                        "sources": list(dict.fromkeys(str(r.get("file_source", "")) for r in final_results)),
-                    }
                     if not final_results:
                         notice = notice or f"No notes found about *{find_query.strip()}*."
                 else:
                     run_filter = with_exclusions(search_filter, safe_lib)
-                    if found := found_notes(safe_lib):
-                        run_filter["include_sources"] = found["sources"]
+                    if ask_gathered:  # passages ranked within the gathered notes kept from this library
+                        run_filter["include_sources"] = [
+                            source for lib, source in kept_gathered_notes(_gathered) if lib == safe_lib
+                        ]
                     with search_progress_slot.container(), st.spinner("Searching…", show_time=True):
                         final_results, notice, nearest_distance = perform_search(
                             search_lib,
@@ -8265,12 +8353,16 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
 
         if final_results is not None:
             add_folder_paths(final_results, library_folder, corpus_root_path)
+            route = "literal" if filter_only_clicked or (search_clicked and exact_text_only) else "semantic"
+            if listing and final_results:
+                gather_results(safe_lib, final_results, route, library_counts, uploads_dirs)
             # Corpus prompts describe one library's author role, so skip them across libraries.
             search_corpus_prompt = "" if search_all_libraries else run_prompts["corpus"]
             tasks = run_prompts["tasks"]
             agents = [task for task in tasks if is_agent_prompt(task)]
             search_state = {
                 "filter_only": listing,
+                "route": route,
                 "library": state_library,
                 "results": final_results,
                 "question": "" if listing else prompt_text,
@@ -8360,17 +8452,22 @@ if last_search and last_search["library"] == safe_lib and last_search.get("dista
             )
         if abs(last_search.get("cutoff", distance_threshold) - distance_threshold) > 1e-6:
             st.caption("Cutoff changed — **Search** again to apply it.")
-if last_search and last_search["library"] in (safe_lib, ALL_LIBRARIES_KEY) and last_search.get("filter_only"):
-    with filter_results_slot:
-        render_filter_results(last_search, library_folder, safe_lib)
-elif last_search and last_search["library"] in (safe_lib, ALL_LIBRARIES_KEY):
-    render_search_results(
-        last_search,
-        library_folder,
-        safe_lib,
-        selected_ollama_model,
-        llm_max_tokens,
-        llm_temperature,
-        last_search.get("prompt_context", ""),
-        ollama_model_options,
-    )
+current_search = bool(last_search and last_search["library"] in (safe_lib, ALL_LIBRARIES_KEY))
+with filter_results_slot:
+    if current_search and last_search.get("filter_only") and not last_search["results"]:
+        st.warning(last_search["notice"] or "No notes match the filter.")
+    if gathered := gathered_notes(safe_lib):
+        render_gathered_notes(gathered, library_folder, safe_lib)
+if current_search and not last_search.get("filter_only"):
+    # The answer and its sources, in the colour of the route that found them.
+    with st.container(key=f"results_{last_search.get('route', 'semantic')}"):
+        render_search_results(
+            last_search,
+            library_folder,
+            safe_lib,
+            selected_ollama_model,
+            llm_max_tokens,
+            llm_temperature,
+            last_search.get("prompt_context", ""),
+            ollama_model_options,
+        )
