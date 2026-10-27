@@ -5080,13 +5080,13 @@ def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str, p
     by_route = {route: sum(1 for r in routes.values() if r == route) for route in ROUTE_TINTS}
     kept = kept_gathered_notes(gathered)
     st.markdown(
-        f"**{len(notes)} note(s) gathered** · {by_route['semantic']} by meaning (blue), "
+        f"**In scope · {len(notes)} note(s)** · {by_route['semantic']} by meaning (blue), "
         f"{by_route['literal']} by exact text (orange)"
     )
     st.caption(
-        "Find notes and Filter search only add to this list; a note found again takes the colour of the latest "
-        f"search. Tick **🚫** to exclude a note or click **🎯** to keep just the ones you pick: **Search** (or "
-        f"**Ask**) answers from the {len(kept)} you kept. **Clear results** starts over."
+        "Every search adds the notes it finds here; a note found again takes the colour of the latest search. "
+        "Tick **🚫** to exclude a note or click **🎯** to keep just the ones you pick, then **Ask about in-scope "
+        f"notes** answers from the {len(kept)} you kept. **Clear results** starts over."
     )
     listed = [
         (blocks[0].get("_safe_lib", safe_lib), file_source)
@@ -7732,6 +7732,27 @@ def gathered_full_notes(gathered: dict, keys: list[tuple[str, str]]) -> list[dic
     return blocks
 
 
+def share_context(gathered: dict, keys: list[tuple[str, str]], budget: int) -> tuple[list[dict], int]:
+    """The blocks of these in-scope notes, each note cut to an equal share of `budget` characters, so all of
+    them reach the LLM. Returns (blocks, how many notes were trimmed)."""
+    share = max(budget // max(len(keys), 1) - 120, 400)  # 120: each note's source line in the context
+    blocks, trimmed = [], 0
+    for key in keys:
+        used = 0
+        for block in gathered_full_notes(gathered, [key]):
+            text = str(block.get("text", ""))
+            if used >= share:
+                trimmed += 1
+                break
+            if used + len(text) > share:
+                blocks.append({**block, "text": text[:share - used].rstrip() + " […]"})
+                trimmed += 1
+                break
+            blocks.append(block)
+            used += len(text)
+    return blocks, trimmed
+
+
 def clear_gathered_notes() -> None:
     st.session_state.pop(GATHERED_KEY, None)
 
@@ -8523,7 +8544,7 @@ with ask_box_col:
     if pick_ref is not None:
         # Pick mode: no LLM; the Ask box shows the reference document being filled from the list.
         render_pick_panel(pick_ref)
-        prompt_text, search_clicked, use_llm_answer = "", False, False
+        prompt_text, search_clicked, use_llm_answer, scope_clicked = "", False, False, False
         selected_ollama_model = default_ollama
         llm_max_tokens = int(corpus_config["llm_max_tokens"])
         llm_temperature = float(corpus_config["llm_temperature"])
@@ -8634,14 +8655,22 @@ with ask_box_col:
                 use_container_width=True,
                 help="Uses the route chosen in the Filter box: "
                 + (
-                    "**Literal**: answers your question from the notes "
-                    + ("you gathered and kept" if gathered_notes(safe_lib) else "matching the filter terms")
-                    + ", sent in full."
+                    "**Literal**: answers your question from the notes matching the filter terms, sent in full."
                     if exact_text_only
-                    else "**Semantic**: passages ranked by meaning"
-                    + (" within the notes you gathered and kept." if gathered_notes(safe_lib) else ".")
+                    else "**Semantic**: passages ranked by meaning."
                 )
+                + " Its notes are added to **In scope** under the Filter box."
                 + f" Returns at most {result_limit} results (**Max results**, in the Filter box).",
+            )
+            _in_scope = gathered_notes(safe_lib)
+            _kept_in_scope = kept_gathered_notes(_in_scope) if _in_scope else []
+            scope_clicked = st.button(
+                f"🗂 Ask about in-scope notes ({len(_kept_in_scope)})",
+                use_container_width=True,
+                disabled=not _kept_in_scope,
+                help="Answers your question from every note in **In scope** (under the Filter box) that you haven't "
+                "excluded, e.g. *list the actions* across two companies' conversations. Each note gets an equal "
+                "share of the LLM's context.",
             )
             # Searching and answering show their progress here, right under the button that started them.
             # Between runs it shows the selected model's last speed.
@@ -8651,7 +8680,7 @@ with ask_box_col:
 
 run_prompts = resolve_run_prompts(prompt_library, corpus_config)
 
-new_search = search_clicked or filter_only_clicked or find_clicked
+new_search = search_clicked or filter_only_clicked or find_clicked or scope_clicked
 listing = filter_only_clicked or find_clicked  # notes listed to down-select, no LLM answer
 if new_search:
     # Also save on Search, in case the box was not left before clicking.
@@ -8659,20 +8688,20 @@ if new_search:
     remember_searched_dates()
 run_filter_only = filter_only_clicked or (search_clicked and exact_text_only)
 _gathered = gathered_notes(safe_lib)
-ask_gathered = bool(search_clicked and _gathered)  # Search / Ask answers from the gathered notes kept
-search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode() and not ask_gathered
+_in_scope_before = len(_gathered["notes"]) if _gathered else 0
+search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode()
 
 if new_search:
     # A new search replaces the previous results and discussion.
     st.session_state.pop(LAST_SEARCH_KEY, None)
 
-if new_search and run_filter_only and not ask_gathered and not has_positive_filter_terms(search_filter):
+if new_search and run_filter_only and not has_positive_filter_terms(search_filter):
     st.warning("Add at least one **Must include** or **Any of** term to filter notes.")
 elif find_clicked and not find_query.strip():
     st.warning("Type what the notes are about in **Find notes about** first.")
-elif ask_gathered and not kept_gathered_notes(_gathered):
-    st.warning("Every gathered note is excluded: keep at least one, or **Clear results** to search them all.")
-elif new_search and (prompt_text or run_filter_only or find_clicked):
+elif scope_clicked and not prompt_text.strip() and not run_prompts["tasks"]:
+    st.warning("Type a question (or choose a task) to ask about the in-scope notes.")
+elif new_search and (prompt_text or run_filter_only or find_clicked or scope_clicked):
     final_results = None
     notice = ""
     nearest_distance = None
@@ -8680,7 +8709,20 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
     uploads_dirs: tuple[Path, ...] = ()
     state_library = safe_lib
     try:
-        if search_all_libraries:
+        if scope_clicked:
+            # Every in-scope note kept, each with an equal share of the LLM's context.
+            kept = kept_gathered_notes(_gathered)
+            final_results, trimmed = share_context(_gathered, kept, LLM_CONTEXT_MAX_CHARS)
+            if trimmed:
+                notice = (f"{trimmed} of the {len(kept)} in-scope notes were trimmed so every one fits the LLM's "
+                          f"context ({LLM_CONTEXT_MAX_CHARS:,} characters of notes).")
+            try:
+                uploads_dirs = get_library_uploads_dirs(Library().load_library(safe_lib))
+            except Exception:
+                uploads_dirs = ()
+            if any(lib != safe_lib for lib, _source in kept):
+                state_library = ALL_LIBRARIES_KEY
+        elif search_all_libraries:
             state_library = ALL_LIBRARIES_KEY
             with search_progress_slot.container(), st.spinner("Searching all libraries for exact text…", show_time=True):
                 final_results, library_counts = exact_text_search_all_libraries(
@@ -8700,13 +8742,6 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
 
             if not search_lib:
                 st.error("Library not found. Use **Rescan** or **Re-index** in the left panel first.")
-            elif ask_gathered and exact_text_only:
-                # Literal Ask: the gathered notes kept, in full, most recent hits first.
-                uploads_dirs = get_library_uploads_dirs(search_lib)
-                kept = kept_gathered_notes(_gathered)[:result_limit]
-                final_results = gathered_full_notes(_gathered, kept)
-                if any(lib != safe_lib for lib, _source in kept):
-                    state_library = ALL_LIBRARIES_KEY
             elif run_filter_only:
                 uploads_dirs = get_library_uploads_dirs(search_lib)
                 with search_progress_slot.container(), st.spinner("Searching for exact text…", show_time=True):
@@ -8739,10 +8774,6 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
                         notice = notice or f"No notes found about *{find_query.strip()}*."
                 else:
                     run_filter = with_exclusions(search_filter, safe_lib)
-                    if ask_gathered:  # passages ranked within the gathered notes kept from this library
-                        run_filter["include_sources"] = [
-                            source for lib, source in kept_gathered_notes(_gathered) if lib == safe_lib
-                        ]
                     with search_progress_slot.container(), st.spinner("Searching…", show_time=True):
                         final_results, notice, nearest_distance = perform_search(
                             search_lib,
@@ -8755,8 +8786,10 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
 
         if final_results is not None:
             add_folder_paths(final_results, library_folder, corpus_root_path)
-            route = "literal" if filter_only_clicked or (search_clicked and exact_text_only) else "semantic"
-            if listing and final_results:
+            route = "scope" if scope_clicked else (
+                "literal" if filter_only_clicked or (search_clicked and exact_text_only) else "semantic"
+            )
+            if final_results and not scope_clicked:  # every search adds its notes to the in-scope list
                 gather_results(safe_lib, final_results, route, library_counts, uploads_dirs)
             # Corpus prompts describe one library's author role, so skip them across libraries.
             search_corpus_prompt = "" if search_all_libraries else run_prompts["corpus"]
@@ -8840,6 +8873,9 @@ elif new_search and (prompt_text or run_filter_only or find_clicked):
                 if selected_ollama_model != search_state["prompt_model"]:
                     tuning["ollama_model"] = selected_ollama_model
                 save_corpus_config(safe_lib, tuning)
+            # The Ask box was drawn before this search added notes: redraw so its in-scope button counts them.
+            if len((gathered_notes(safe_lib) or {}).get("notes", {})) != _in_scope_before:
+                st.rerun()
     except Exception as exc:
         st.error(f"Search failed: {exc}")
 
