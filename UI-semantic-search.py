@@ -901,20 +901,51 @@ LLM_TINT = "33, 195, 84"  # light green: the Ask box and the LLM's answer
 AGENT_TINT = "28, 131, 225"  # a harder blue for an Agent's workflow and actions
 
 
+# Coloured sections set --section to their colour ("r, g, b"); inputs and buttons inside take shades of it.
+SHADED_SECTIONS = (
+    ".st-key-filter_box", ".st-key-ask_box", '[class*="st-key-results_"]', ".st-key-agent_panel", ".st-key-agent_prompts",
+)
+
+
+def section_shading_css() -> str:
+    """Inputs in a coloured section get a light tint of its colour with a mid-tone border; buttons a deeper tint,
+    deeper again on hover. Text keeps the theme's colour, so it reads in light and dark mode. A section inside
+    another (an Agent box in the answer) uses its own colour, as --section is inherited from the nearest one."""
+    within = f":is({', '.join(SHADED_SECTIONS)})"
+    fields = (f'{within} :is([data-testid="stTextInputRootElement"], [data-testid="stTextAreaRootElement"], '
+              '[data-testid="stNumberInputContainer"], [data-testid="stSelectbox"] [role="group"], '
+              '[data-testid="stMultiSelect"] [role="group"], [data-testid="stDateInputField"])')
+    inner = f'{within} :is([data-testid="stTextInputRootElement"], [data-testid="stTextAreaRootElement"]) *'
+    buttons = (f'{within} :is(button[data-testid="stBaseButton-secondary"], button[data-testid="stBaseButton-primary"], '
+               'a[data-testid="stBaseLinkButton-secondary"])')
+    return (
+        f"{fields} {{ background-color: rgba(var(--section), 0.10) !important; "
+        "border-color: rgba(var(--section), 0.45) !important; }"
+        f"{inner} {{ background-color: transparent !important; }}"
+        f"{buttons} {{ background-color: rgba(var(--section), 0.24) !important; "
+        "border-color: rgba(var(--section), 0.55) !important; color: inherit !important; }"
+        f"{buttons}:hover {{ background-color: rgba(var(--section), 0.36) !important; "
+        "border-color: rgb(var(--section)) !important; }"
+    )
+
+
 def route_tint_style(route: str) -> str:
     rows = "".join(
         f'[class*="st-key-gathered_{name}_"] {{ background: rgba({rgb}, 0.10); border-radius: 0.5rem; }}'
         for name, rgb in ROUTE_TINTS.items()
     )
     # The LLM side in green (the Ask box and the answer), an Agent's workflow inside it in a harder blue.
-    llm = (f'.st-key-ask_box, [class*="st-key-results_"] {{ background: rgba({LLM_TINT}, 0.10) !important; }}'
+    llm = (f".st-key-filter_box {{ --section: {ROUTE_TINTS[route]}; }}"
+           f'.st-key-ask_box, [class*="st-key-results_"] {{ --section: {LLM_TINT}; }}'
+           f".st-key-agent_panel {{ --section: {AGENT_TINT}; }}"
+           f'.st-key-ask_box, [class*="st-key-results_"] {{ background: rgba({LLM_TINT}, 0.10) !important; }}'
            '[class*="st-key-results_"] { padding: 0.5rem 0.9rem; border-radius: 0.75rem; }'
            f".st-key-agent_panel {{ background: rgba({AGENT_TINT}, 0.16) !important; }}"
            f".st-key-agent_staging {{ background: rgba({AGENT_TINT}, 0.10) !important; }}")
     # The route switch: each option in its colour, lightly when not chosen and a few shades deeper when it is.
     switch = "".join(
         f'.st-key-route_switch button[role="radio"]:nth-of-type({n}) {{ background: rgba({rgb}, 0.10) !important; '
-        f"color: rgb({rgb}) !important; border-color: rgba({rgb}, 0.45) !important; }}"
+        f"color: inherit !important; border-color: rgba({rgb}, 0.6) !important; }}"  # theme text: readable (AA)
         f'.st-key-route_switch button[role="radio"]:nth-of-type({n})[aria-checked="true"] {{ '
         f"background: rgba({rgb}, 0.34) !important; color: inherit !important; "
         f"border-color: rgb({rgb}) !important; font-weight: 600; }}"
@@ -922,7 +953,7 @@ def route_tint_style(route: str) -> str:
         for n, rgb in enumerate(ROUTE_TINTS.values(), 1)  # same order as SEARCH_ROUTES: semantic, literal
     )
     return (f"<style>.st-key-filter_box {{ background: rgba({ROUTE_TINTS[route]}, 0.06) !important; }}"
-            f'[class*="st-key-gathered_"] {{ padding: 0.1rem 0.4rem; }}{rows}{llm}{switch}</style>')
+            f'[class*="st-key-gathered_"] {{ padding: 0.1rem 0.4rem; }}{rows}{llm}{section_shading_css()}{switch}</style>')
 
 
 # Filter fields as small rounded boxes, and their quick dates and quick terms as rounded chips.
@@ -2439,8 +2470,9 @@ def render_reference_documents_section(library: dict) -> None:
                                   placeholder="e.g. PoC types")
                     st.link_button("Choose notes", f"?pick={ref['id']}", icon=":material/open_in_new:",
                                    help="Opens the search page in a new tab to add or remove this document's notes.")
-                    st.link_button("Open", f"{REFERENCE_PAGE_URL}&ref={ref['id']}", icon=":material/visibility:",
-                                   disabled=not ref.get("notes"), help="Read its notes, as the LLM gets them.")
+                    if st.button("Open", key=f"reference_open_{ref['id']}", icon=":material/visibility:",
+                                 disabled=not ref.get("notes"), help="Read its notes, as the LLM gets them."):
+                        reference_popup(ref["id"])
                     st.button(":material/delete:", key=f"reference_delete_{ref['id']}", type="tertiary",
                               on_click=delete_reference_document, args=(ref["id"],),
                               help="Delete this reference document and detach it from prompts.")
@@ -2478,16 +2510,113 @@ def render_reference_page() -> None:
     if ref is None:
         st.warning("This reference document doesn't exist (any more).")
         return
-    text, missing = reference_document_text(ref)
+    render_reference_document_body(ref)
+
+
+DOC_PARAM = "doc"  # ?doc=<Apple Notes ID or path>: the note open in the pick mode popup (refresh reopens it)
+
+
+def open_document_popup(note: dict) -> None:
+    st.query_params[DOC_PARAM] = note.get("note_id") or note.get("path", "")
+
+
+def close_document_popup() -> None:
+    st.query_params.pop(DOC_PARAM, None)
+    for key in [k for k in st.session_state if str(k).startswith("doc_pending_")]:
+        del st.session_state[key]
+
+
+def note_for_doc_param(value: str) -> tuple[dict, Path] | None:
+    """The note a ?doc= value names: an Apple Notes ID, or the path of a note under the corpus root."""
+    if not value:
+        return None
+    path = reference_note_path({"note_id": value})
+    root = get_corpus_root_path()
+    if path is None and root:
+        candidate = Path(value)
+        if candidate.suffix == ".md" and candidate.is_file() and candidate.resolve().is_relative_to(Path(root).resolve()):
+            path = candidate
+    return (reference_note_for_path(path), path) if path else None
+
+
+def render_note_body(path: Path, note: dict, height: int = 440) -> None:
+    modified = datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%a %d %b %Y %H:%M")
+    st.caption(f"{reference_note_folder(path)} · modified {modified}"
+               + (f" · Apple Notes ID `{note['note_id']}`" if note.get("note_id") else ""))
+    with st.container(height=height, border=True):
+        st.markdown(path.read_text(errors="ignore"))
+
+
+@st.dialog("Note", width="large", on_dismiss=close_document_popup)
+def document_popup(ref_id: str, doc: str) -> None:
+    """Pick mode: a note in a popup, with Add to <document> → Apply and return / Remove from list."""
+    ref, found = find_reference_document(ref_id), note_for_doc_param(doc)
+    if ref is None or found is None:
+        st.warning("That note or reference document can't be found (any more).")
+        if st.button("Close"):
+            close_document_popup()
+            st.rerun()
+        return
+    note, path = found
+    label = reference_label(ref)
+    st.markdown(f"**{md_escape_text(path.stem)}**")
+    render_note_body(path, note)
+    key = reference_note_key(note)
+    pending_key = f"doc_pending_{key}"
+    in_list = any(reference_note_key(n) == key for n in ref.get("notes", []))
+    # Add and Remove change state in callbacks, so the popup redraws with the right buttons; Apply and return
+    # and Return rerun the page, which closes it.
+    with st.container(horizontal=True, vertical_alignment="center"):
+        if st.session_state.get(pending_key):  # added here, not saved until Apply and return
+            if st.button("Apply and return", key="doc_apply", type="primary", icon=":material/check:",
+                         on_click=apply_document_popup, args=(ref_id, note, pending_key)):
+                st.rerun()
+            st.button("Remove from list", key="doc_unadd", icon=":material/remove:",
+                      on_click=st.session_state.pop, args=(pending_key, None))
+        elif in_list:
+            st.caption(f"✓ In {label}")
+            st.button("Remove from list", key="doc_remove", icon=":material/remove:",
+                      on_click=toggle_reference_note, args=(ref_id, note))
+            if st.button("Return", key="doc_return", on_click=close_document_popup):
+                st.rerun()
+        else:
+            st.button(f"Add to {label}", key="doc_add", type="primary", icon=":material/add:",
+                      on_click=st.session_state.__setitem__, args=(pending_key, True))
+
+
+def apply_document_popup(ref_id: str, note: dict, pending_key: str) -> None:
+    """Apply and return: save the note into the reference document, then close the popup."""
+    ref = find_reference_document(ref_id)
+    if ref and not any(reference_note_key(n) == reference_note_key(note) for n in ref.get("notes", [])):
+        toggle_reference_note(ref_id, note)
+    close_document_popup()
+
+
+@st.dialog("Reference document", width="large")
+def reference_popup(ref_id: str) -> None:
+    """A reference document's notes in a popup (from the prompt library or the pick panel)."""
+    ref = find_reference_document(ref_id)
+    if ref is None:
+        st.warning("This reference document doesn't exist (any more).")
+        return
+    render_reference_document_body(ref, height=320)
+
+
+def render_reference_document_body(ref: dict, height: int | None = None) -> None:
+    """A reference document: its title, size as sent and each note in full."""
+    text, _missing = reference_document_text(ref)
     st.subheader(reference_label(ref))
     st.caption(f"{len(ref.get('notes', []))} note(s) · {len(text):,} characters sent to the LLM"
                + (f", trimmed to {REFERENCE_DOC_CHAR_LIMIT:,}" if text.endswith("[… trimmed]") else ""))
     for note in ref.get("notes", []):
         path = reference_note_path(note)
-        with st.container(border=True):
-            if path is None:
-                st.warning(f"Not found: *{md_escape_text(note.get('title', 'a note'))}* — deleted, or no longer exported?")
-                continue
+        if path is None:
+            st.warning(f"Not found: *{md_escape_text(note.get('title', 'a note'))}* — deleted, or no longer exported?")
+            continue
+        st.markdown(f"**{md_escape_text(path.stem)}**")
+        if height:
+            render_note_body(path, note, height)
+        else:
             modified = datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%a %d %b %Y %H:%M")
             st.caption(f"{reference_note_folder(path)} · modified {modified}"
                        + (f" · Apple Notes ID `{note['note_id']}`" if note.get("note_id") else ""))
@@ -2511,7 +2640,8 @@ def render_pick_panel(ref: dict) -> None:
                 st.button(":material/close:", key=f"pick_drop_{reference_note_key(note)}", type="tertiary",
                           on_click=remove_reference_note, args=(ref["id"], reference_note_key(note)))
         if ref.get("notes"):
-            st.link_button("Open", f"{REFERENCE_PAGE_URL}&ref={ref['id']}", icon=":material/visibility:")
+            if st.button("Open", key="pick_panel_open", icon=":material/visibility:"):
+                reference_popup(ref["id"])
         else:
             st.caption("No notes yet.")
 
@@ -3549,163 +3679,214 @@ def render_agent_workflow_editor(prompt: dict) -> None:
     )
 
 
+OPEN_PROMPTS_SETTING = "prompt_cards_open"  # ids of the prompt cards left open on the prompt library page
+
+
+def saved_open_prompts() -> set[str]:
+    return set(load_app_settings().get(OPEN_PROMPTS_SETTING) or [])
+
+
+def persist_open_prompt(prompt_id: str) -> None:
+    """Remember whether a prompt card is open (saved with the app's settings)."""
+    opened = saved_open_prompts()
+    (opened.add if st.session_state.get(f"prompt_open_{prompt_id}") else opened.discard)(prompt_id)
+    save_app_settings({OPEN_PROMPTS_SETTING: sorted(opened)})
+
+
+def set_prompts_open(prompt_ids: list[str], is_open: bool) -> None:
+    """Expand all / Collapse all for one section of the prompt library."""
+    for prompt_id in prompt_ids:
+        st.session_state[f"prompt_open_{prompt_id}"] = is_open
+    opened = saved_open_prompts()
+    opened = opened | set(prompt_ids) if is_open else opened - set(prompt_ids)
+    save_app_settings({OPEN_PROMPTS_SETTING: sorted(opened)})
+
+
+def prompt_card_label(prompt: dict) -> str:
+    """A collapsed card's header: the name as the Ask box shows it, plus Global and Starred markers."""
+    markers = (" · Global" if prompt.get("global") else "") + (" · ★" if prompt.get("starred") else "")
+    return agent_prompt_label(prompt) + markers
+
+
 def render_prompt_card(
     prompt: dict, model_options: list[str], links: list[dict] = (), references: list[dict] = ()
 ) -> None:
     prompt_id = prompt["id"]
     agent = is_agent_prompt(prompt)
     # The key gives the card a CSS class; Agent cards get a blue border (see render_prompt_library_page).
-    with st.container(border=True, key=f"{'agent' if agent else 'task'}_prompt_card_{prompt_id}"):
-        with st.container(horizontal=True, vertical_alignment="center"):
-            st.text_input(
-                "Name",
-                value=prompt["name"],
-                key=f"prompt_name_{prompt_id}",
-                on_change=save_prompt_field,
-                args=(prompt_id, "name"),
-                label_visibility="collapsed",
-            )
-            with st.popover(":material/delete:", type="tertiary", help="Delete this prompt"):
-                st.markdown(f"Delete **{prompt['name']}**? This can't be undone.")
-                st.button(
-                    "Delete",
-                    key=f"prompt_delete_{prompt_id}",
-                    type="primary",
-                    icon=":material/delete:",
-                    on_click=delete_prompt,
-                    args=(prompt_id,),
-                )
-        if agent:
-            st.caption("**Step 1 · Collection** — what to find in the notes, list and ask about.")
-        st.text_area(
-            "Prompt",
-            value=prompt["text"],
-            key=f"prompt_text_{prompt_id}",
-            on_change=save_prompt_field,
-            args=(prompt_id, "text"),
-            height=90,
-            label_visibility="collapsed",
-        )
-        render_saved_note(f"prompt_{prompt_id}")
-        with st.container(horizontal=True, vertical_alignment="center"):
-            st.checkbox(
-                "Global",
-                value=bool(prompt.get("global")),
-                key=f"prompt_global_{prompt_id}",
-                on_change=save_prompt_field,
-                args=(prompt_id, "global"),
-                disabled=agent,
-                help=(
-                    "Send this with **every** LLM request in **every** corpus, like About me — for standing "
-                    "instructions. It can still be left out of a single run in the Ask panel. "
-                    "Not available for Agent prompts."
-                ),
-            )
-            st.checkbox(
-                "Starred",
-                value=bool(prompt.get("starred")),
-                key=f"prompt_starred_{prompt_id}",
-                on_change=save_prompt_field,
-                args=(prompt_id, "starred"),
-                help="Starred prompts fill the Ask panel's Starred row.",
-            )
-            st.checkbox(
-                "Agent",
-                value=agent,
-                key=f"prompt_agent_{prompt_id}",
-                on_change=save_prompt_field,
-                args=(prompt_id, "agent"),
-                disabled=bool(prompt.get("global")),
-                help=(
-                    "Agent prompts are a workflow: step 1 collects and lists what's in the notes, optional steps "
-                    "refine it with you, and the **Action Command** stages a **Note**, **Tasks** or an **Email** "
-                    "for you to confirm and send to the outbox for another system (e.g. Salesforce). Only Agent "
-                    "prompts send to the outbox. Not available for Global prompts."
-                ),
-            )
-            if agent:
-                st.selectbox(
-                    "Output",
-                    options=DRAFT_OUTPUT_TYPES,
-                    index=DRAFT_OUTPUT_TYPES.index(get_prompt_output_type(prompt)),
-                    format_func=OUTPUT_TYPES.get,
-                    key=f"prompt_output_{prompt_id}",
+    # Collapsible: a header row (the name and its markers) opens the card; open cards are remembered.
+    open_key = f"prompt_open_{prompt_id}"
+    if open_key not in st.session_state:
+        st.session_state[open_key] = prompt_id in saved_open_prompts()
+    with st.container(key=f"{'agent' if agent else 'task'}_prompt_card_{prompt_id}"):
+        with st.expander(prompt_card_label(prompt), key=open_key, on_change=persist_open_prompt, args=(prompt_id,)):
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.text_input(
+                    "Name",
+                    value=prompt["name"],
+                    key=f"prompt_name_{prompt_id}",
                     on_change=save_prompt_field,
-                    args=(prompt_id, "output"),
-                    width=150,
+                    args=(prompt_id, "name"),
                     label_visibility="collapsed",
-                    help="What this Agent drafts for the outbox.",
                 )
-            options = model_options if prompt.get("model", "") in model_options else [*model_options, prompt["model"]]
-            st.selectbox(
-                "Model",
-                options=options,
-                index=options.index(prompt.get("model", "")),
-                format_func=format_prompt_model,
-                key=f"prompt_model_{prompt_id}",
+                with st.popover(":material/delete:", type="tertiary", help="Delete this prompt"):
+                    st.markdown(f"Delete **{prompt['name']}**? This can't be undone.")
+                    st.button(
+                        "Delete",
+                        key=f"prompt_delete_{prompt_id}",
+                        type="primary",
+                        icon=":material/delete:",
+                        on_click=delete_prompt,
+                        args=(prompt_id,),
+                    )
+            if agent:
+                st.caption("**Step 1 · Collection** — what to find in the notes, list and ask about.")
+            st.text_area(
+                "Prompt",
+                value=prompt["text"],
+                key=f"prompt_text_{prompt_id}",
                 on_change=save_prompt_field,
-                args=(prompt_id, "model"),
-                width=200,
-                label_visibility="collapsed",
-                help=(
-                    "Model to use when you pick this prompt, for the answer and the discussion. You can still "
-                    "change either model in the Ask panel. **Model: as selected** keeps whatever is selected."
-                ),
-            )
-            st.multiselect(
-                "Tags",
-                options=prompt.get("tags", []),
-                default=prompt.get("tags", []),
-                key=f"prompt_tags_{prompt_id}",
-                accept_new_options=True,
-                on_change=save_prompt_field,
-                args=(prompt_id, "tags"),
-                placeholder="Add a tag, press Enter",
+                args=(prompt_id, "text"),
+                height=90,
                 label_visibility="collapsed",
             )
-        if links:
-            titles = {
-                link["id"]: ("⚙️ " if link.get("role") == EXECUTOR_ROLE else "🔗 ") + (link["title"] or link["url"])
-                for link in links
-            }
-            st.multiselect(
-                "Links",
-                options=list(titles),
-                default=[link_id for link_id in prompt.get("links", []) if link_id in titles],
-                format_func=lambda link_id: titles.get(link_id, link_id),
-                key=f"prompt_links_{prompt_id}",
-                on_change=save_prompt_field,
-                args=(prompt_id, "links"),
-                placeholder="Links to show when this prompt is used",
-                label_visibility="collapsed",
-                help="Shown as links under the question in the Ask box while this prompt is injected. "
-                "Add links in **Common links** at the top of this page.",
-            )
-        if references:
-            ref_titles = {ref["id"]: "📄 " + reference_label(ref) for ref in references}
-            st.multiselect(
-                "Reference documents",
-                options=list(ref_titles),
-                default=[ref_id for ref_id in prompt.get("references", []) if ref_id in ref_titles],
-                format_func=lambda ref_id: ref_titles.get(ref_id, ref_id),
-                key=f"prompt_references_{prompt_id}",
-                on_change=save_prompt_field,
-                args=(prompt_id, "references"),
-                placeholder="Reference documents to send with this prompt",
-                label_visibility="collapsed",
-                help="Sent to the LLM as background whenever this prompt is used, Agent or not. "
-                "Make them in **Reference documents** at the top of this page.",
-            )
-        if agent:
-            render_agent_workflow_editor(prompt)
-        if prompt.get("last_used"):
-            st.caption(f"Last used {prompt['last_used'].replace('T', ' ')}")
+            render_saved_note(f"prompt_{prompt_id}")
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.checkbox(
+                    "Global",
+                    value=bool(prompt.get("global")),
+                    key=f"prompt_global_{prompt_id}",
+                    on_change=save_prompt_field,
+                    args=(prompt_id, "global"),
+                    disabled=agent,
+                    help=(
+                        "Send this with **every** LLM request in **every** corpus, like About me — for standing "
+                        "instructions. It can still be left out of a single run in the Ask panel. "
+                        "Not available for Agent prompts."
+                    ),
+                )
+                st.checkbox(
+                    "Starred",
+                    value=bool(prompt.get("starred")),
+                    key=f"prompt_starred_{prompt_id}",
+                    on_change=save_prompt_field,
+                    args=(prompt_id, "starred"),
+                    help="Starred prompts fill the Ask panel's Starred row.",
+                )
+                st.checkbox(
+                    "Agent",
+                    value=agent,
+                    key=f"prompt_agent_{prompt_id}",
+                    on_change=save_prompt_field,
+                    args=(prompt_id, "agent"),
+                    disabled=bool(prompt.get("global")),
+                    help=(
+                        "Agent prompts are a workflow: step 1 collects and lists what's in the notes, optional steps "
+                        "refine it with you, and the **Action Command** stages a **Note**, **Tasks** or an **Email** "
+                        "for you to confirm and send to the outbox for another system (e.g. Salesforce). Only Agent "
+                        "prompts send to the outbox. Not available for Global prompts."
+                    ),
+                )
+                if agent:
+                    st.selectbox(
+                        "Output",
+                        options=DRAFT_OUTPUT_TYPES,
+                        index=DRAFT_OUTPUT_TYPES.index(get_prompt_output_type(prompt)),
+                        format_func=OUTPUT_TYPES.get,
+                        key=f"prompt_output_{prompt_id}",
+                        on_change=save_prompt_field,
+                        args=(prompt_id, "output"),
+                        width=150,
+                        label_visibility="collapsed",
+                        help="What this Agent drafts for the outbox.",
+                    )
+                options = model_options if prompt.get("model", "") in model_options else [*model_options, prompt["model"]]
+                st.selectbox(
+                    "Model",
+                    options=options,
+                    index=options.index(prompt.get("model", "")),
+                    format_func=format_prompt_model,
+                    key=f"prompt_model_{prompt_id}",
+                    on_change=save_prompt_field,
+                    args=(prompt_id, "model"),
+                    width=200,
+                    label_visibility="collapsed",
+                    help=(
+                        "Model to use when you pick this prompt, for the answer and the discussion. You can still "
+                        "change either model in the Ask panel. **Model: as selected** keeps whatever is selected."
+                    ),
+                )
+                st.multiselect(
+                    "Tags",
+                    options=prompt.get("tags", []),
+                    default=prompt.get("tags", []),
+                    key=f"prompt_tags_{prompt_id}",
+                    accept_new_options=True,
+                    on_change=save_prompt_field,
+                    args=(prompt_id, "tags"),
+                    placeholder="Add a tag, press Enter",
+                    label_visibility="collapsed",
+                )
+            if links:
+                titles = {
+                    link["id"]: ("⚙️ " if link.get("role") == EXECUTOR_ROLE else "🔗 ") + (link["title"] or link["url"])
+                    for link in links
+                }
+                st.multiselect(
+                    "Links",
+                    options=list(titles),
+                    default=[link_id for link_id in prompt.get("links", []) if link_id in titles],
+                    format_func=lambda link_id: titles.get(link_id, link_id),
+                    key=f"prompt_links_{prompt_id}",
+                    on_change=save_prompt_field,
+                    args=(prompt_id, "links"),
+                    placeholder="Links to show when this prompt is used",
+                    label_visibility="collapsed",
+                    help="Shown as links under the question in the Ask box while this prompt is injected. "
+                    "Add links in **Common links** at the top of this page.",
+                )
+            if references:
+                ref_titles = {ref["id"]: "📄 " + reference_label(ref) for ref in references}
+                st.multiselect(
+                    "Reference documents",
+                    options=list(ref_titles),
+                    default=[ref_id for ref_id in prompt.get("references", []) if ref_id in ref_titles],
+                    format_func=lambda ref_id: ref_titles.get(ref_id, ref_id),
+                    key=f"prompt_references_{prompt_id}",
+                    on_change=save_prompt_field,
+                    args=(prompt_id, "references"),
+                    placeholder="Reference documents to send with this prompt",
+                    label_visibility="collapsed",
+                    help="Sent to the LLM as background whenever this prompt is used, Agent or not. "
+                    "Make them in **Reference documents** at the top of this page.",
+                )
+            if agent:
+                render_agent_workflow_editor(prompt)
+            if prompt.get("last_used"):
+                st.caption(f"Last used {prompt['last_used'].replace('T', ' ')}")
+
+
+def render_prompt_section_cards(
+    section: str, prompts: list[dict], library: dict, model_options: list[str], empty: str
+) -> None:
+    """One section's prompt cards (collapsed until opened), with Expand all / Collapse all."""
+    if not prompts:
+        st.caption(empty)
+        return
+    ids = [p["id"] for p in prompts]
+    with st.container(horizontal=True, gap="small"):
+        st.button("Expand all", key=f"prompts_expand_{section}", icon=":material/unfold_more:", type="tertiary",
+                  on_click=set_prompts_open, args=(ids, True))
+        st.button("Collapse all", key=f"prompts_collapse_{section}", icon=":material/unfold_less:", type="tertiary",
+                  on_click=set_prompts_open, args=(ids, False))
+    for prompt in prompts:
+        render_prompt_card(prompt, model_options, ordered_links(library), reference_documents(library))
 
 
 def render_prompt_library_page() -> None:
     """Prompt library page (opened in its own tab): About me, corpus prompt, task prompts."""
     library = load_prompt_library()
-    add_agent_border_style("[class*='st-key-agent_prompt_card_']")
+    add_agent_border_style("[class*='st-key-agent_prompt_card_'] [data-testid='stExpander'] details")
     render_outbox_status()
     render_page_title("Prompt library")
     st.caption(
@@ -3938,11 +4119,6 @@ def render_prompt_library_page() -> None:
                 disabled=not query,
                 key="prompt_page_clear_search",
             )
-            agents_only = st.toggle(
-                "Agents only",
-                key="prompt_page_agents_only",
-                help="Show only Agent prompts, the ones that send drafts to the outbox.",
-            )
         keywords = common_prompt_tags(library)
         if keywords:
             with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
@@ -3955,10 +4131,7 @@ def render_prompt_library_page() -> None:
                         on_click=set_prompt_page_query,
                         args=(keyword,),
                     )
-        shown = [
-            p for p in library["prompts"]
-            if prompt_matches_query(p, query) and (is_agent_prompt(p) or not agents_only)
-        ]
+        shown = [p for p in library["prompts"] if prompt_matches_query(p, query)]
         # "Edit prompt workflow" in the Discussion panel opens this page with ?prompt=<id>.
         focused = find_prompt(library, st.query_params.get("prompt"))
         if focused:
@@ -3966,13 +4139,25 @@ def render_prompt_library_page() -> None:
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.caption(f"Showing the workflow you opened: **{focused['name']}**.")
                 st.button("Show all prompts", key="prompt_page_show_all", on_click=show_all_prompts)
-        elif query.strip() or agents_only:
+            st.session_state[f"prompt_open_{focused['id']}"] = True
+        elif query.strip():
             st.caption(f"{len(shown)} of {len(library['prompts'])} prompts match.")
-        if not shown:
-            st.caption("No prompts match." if library["prompts"] else "No prompts yet — add one below.")
         model_options = prompt_model_options()
-        for prompt in shown:
-            render_prompt_card(prompt, model_options, ordered_links(library), reference_documents(library))
+        # The Agent tick decides the section: ticking or unticking it moves the prompt at once.
+        tasks = [p for p in shown if not is_agent_prompt(p)]
+        render_prompt_section_cards("task", tasks, library, model_options,
+                                    "No task prompts match." if library["prompts"] else "No prompts yet — add one below.")
+
+    st.html(f"<style>.st-key-agent_prompts {{ --section: {AGENT_TINT}; border: 1px solid rgb({AGENT_TINT}) !important; }}"
+            f".st-key-agent_prompts h3 {{ color: rgb({AGENT_TINT}); }}{section_shading_css()}</style>")
+    with st.container(border=True, key="agent_prompts"):
+        st.subheader("Agent prompts")
+        st.caption(
+            "Prompts with **Agent** ticked: workflows that end by sending a note, tasks, an email or a Next Step "
+            "to the outbox. Untick **Agent** to move one to Task prompts. The search above covers both sections."
+        )
+        agents = [p for p in shown if is_agent_prompt(p)]
+        render_prompt_section_cards("agent", agents, library, model_options, "No Agent prompts match.")
 
     with st.container(border=True):
         st.subheader("Add a prompt")
@@ -5161,14 +5346,18 @@ def render_filter_result_row(
             note = reference_note_for_path(found)
             ref = find_reference_document(pick["id"]) or pick
             added = any(reference_note_key(n) == reference_note_key(note) for n in ref.get("notes", []))
-            st.button(
-                f"✓ In {reference_label(ref)} — remove" if added else f"Add to {reference_label(ref)}",
-                key=f"pick_toggle_{note_lib}_{file_source}",
-                type="primary" if not added else "secondary",
-                icon=":material/remove:" if added else ":material/add:",
-                on_click=toggle_reference_note,
-                args=(ref["id"], note),
-            )
+            with st.container(horizontal=True, gap="small"):
+                st.button(
+                    f"✓ In {reference_label(ref)} — remove" if added else f"Add to {reference_label(ref)}",
+                    key=f"pick_toggle_{note_lib}_{file_source}",
+                    type="primary" if not added else "secondary",
+                    icon=":material/remove:" if added else ":material/add:",
+                    on_click=toggle_reference_note,
+                    args=(ref["id"], note),
+                )
+                st.button("Open", key=f"pick_open_{note_lib}_{file_source}", icon=":material/visibility:",
+                          on_click=open_document_popup, args=(note,),
+                          help="Read the note in a popup; the list and your filters stay as they are.")
     check_col, target_col, help_col, note_col = st.columns([1, 1, 0.6, 9.4])
     with check_col:
         checkbox_key = exclude_checkbox_key(note_lib, file_source)
@@ -8922,6 +9111,8 @@ if last_search and last_search["library"] == safe_lib and last_search.get("dista
             )
         if abs(last_search.get("cutoff", distance_threshold) - distance_threshold) > 1e-6:
             st.caption("Cutoff changed — **Search** again to apply it.")
+if pick_ref is not None and st.query_params.get(DOC_PARAM):
+    document_popup(pick_ref["id"], st.query_params[DOC_PARAM])
 current_search = bool(last_search and last_search["library"] in (safe_lib, ALL_LIBRARIES_KEY))
 answering = current_search and not last_search.get("filter_only")
 gathered = gathered_notes(safe_lib)
