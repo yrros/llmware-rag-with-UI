@@ -1532,6 +1532,7 @@ def new_prompt_record(
     output: str = "text",
     model: str = "",
     references=None,
+    salesforce: bool = False,
 ) -> dict:
     return {
         "id": uuid.uuid4().hex[:12],
@@ -1544,6 +1545,7 @@ def new_prompt_record(
         "command": DEFAULT_AGENT_COMMANDS.get(output, "") if agent else "",
         "model": model,  # empty: use whichever model is selected
         "references": list(references or []),  # reference documents sent whenever this prompt is used
+        "salesforce": bool(salesforce),  # send the Salesforce records the notes mention whenever it's used
         "tags": clean_filter_terms(tags or []),
         "starred": bool(starred),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1577,6 +1579,7 @@ def load_prompt_library() -> dict:
             prompt.setdefault("model", "")
             prompt.setdefault("links", [])
             prompt.setdefault("references", [])  # reference documents sent whenever this prompt is used
+            prompt.setdefault("salesforce", False)
         return library
     return save_prompt_library(
         {
@@ -2069,6 +2072,109 @@ def reference_prompt_text(records: list[dict], next_steps: bool = False) -> str:
     )
 
 
+SALESFORCE_CONTEXT_SETTING = "salesforce_context"  # the Ask box's Salesforce chip, kept between sessions
+SALESFORCE_PROMPT_HELP = (
+    "Whenever this prompt is used, send the Salesforce records for the opportunities the notes mention (stage, "
+    "close date, Next Step, ID and link) and your open tasks on them, from the connector's snapshot. Useful for "
+    "drafting updates that need the link or close date."
+)
+SALESFORCE_CONTEXT_LIMIT = 20  # opportunities sent as context, so a small local model isn't swamped
+
+
+def salesforce_context_records(results: list) -> list[dict]:
+    """The snapshot's opportunities that these notes mention, as sent with the Salesforce chip."""
+    return notes_reference_records(results)[:SALESFORCE_CONTEXT_LIMIT]
+
+
+def snapshot_taken(snapshot: dict | None) -> str:
+    """When the connector took the snapshot, e.g. "27 Oct 08:00", or ""."""
+    try:
+        return datetime.datetime.fromisoformat((snapshot or {}).get("generated_at", "")).strftime("%d %b %H:%M")
+    except ValueError:
+        return ""
+
+
+def salesforce_context_text(results: list) -> str:
+    """Salesforce facts for the opportunities the notes mention, plus my open tasks on them (empty if none).
+
+    Unlike the Agents' list, which only names records, this gives what a question might need: stage, close
+    date, Next Step, the record's ID and its link, so the model can quote them.
+    """
+    records = salesforce_context_records(results)
+    if not records:
+        return ""
+    lines = []
+    for r in records:
+        facts = [f"Account: {r['account']}" if r.get("account") else "",
+                 f"Stage: {r['stage']}" if r.get("stage") else "",
+                 f"Close date: {r['close_date']}" if r.get("close_date") else "",
+                 f"Next Step: “{r['next_step']}”" if r.get("next_step") else "Next Step: (empty)",
+                 f"Last activity: {r['last_activity']}" if r.get("last_activity") else "",
+                 f"Last updated: {r['last_updated']}" if r.get("last_updated") else "",
+                 f"Salesforce ID: {r['id']}" if r.get("id") else ""]
+        lines.append(f"- Opportunity: {r['name']}\n  " + "; ".join(f for f in facts if f)
+                     + (f"\n  Link: {r['url']}" if str(r.get("url") or "").startswith("https://") else ""))
+    names = {str(r.get(k) or "").strip().lower() for r in records for k in ("name", "account")} - {""}
+    tasks = [t for t in reference_open_tasks() if str(t.get("related") or "").strip().lower() in names]
+    for t in tasks[:OPEN_TASKS_PROMPT_LIMIT]:
+        facts = [f"due {t['due_date']}" if t.get("due_date") else "no due date", t.get("status") or "",
+                 f"on {t['related']}" if t.get("related") else ""]
+        lines.append(f"- My open task: {t['subject']} (" + ", ".join(f for f in facts if f) + ")"
+                     + (f"\n  Link: {t['url']}" if str(t.get("url") or "").startswith("https://") else ""))
+    taken = snapshot_taken(load_reference_snapshot())
+    return (
+        f"Salesforce records for the opportunities these notes mention (a read-only snapshot"
+        f"{' taken ' + taken if taken else ''}; the notes may be newer). Use them for facts such as stage, "
+        "close date, Next Step and links. When you give a link, copy it exactly from this list and put it on its "
+        "own line; never make a link up.\n" + "\n".join(lines)
+    )
+
+
+def with_salesforce_context(search_state: dict, corpus_prompt: str, results: list) -> str:
+    """The preamble plus Salesforce records when the search has the Salesforce chip on."""
+    if not search_state.get("salesforce_context"):
+        return corpus_prompt
+    return "\n\n".join(part for part in (corpus_prompt, salesforce_context_text(results)) if part.strip())
+
+
+def toggle_ask_salesforce_context() -> None:
+    save_app_settings({SALESFORCE_CONTEXT_SETTING: not load_app_settings().get(SALESFORCE_CONTEXT_SETTING, False)})
+
+
+def toggle_follow_up_salesforce_context(search_state: dict) -> None:
+    search_state["salesforce_context"] = not search_state.get("salesforce_context")
+
+
+def render_follow_up_context(search_state: dict, key_prefix: str) -> None:
+    """Discussion: extra context for the next follow-ups — the Salesforce records the notes in use mention."""
+    snapshot = load_reference_snapshot()
+    records = salesforce_context_records(discussion_results(search_state)) if snapshot else []
+    on = bool(search_state.get("salesforce_context"))
+    taken = snapshot_taken(snapshot)
+    count = f"{len(records)} opportunit{'y' if len(records) == 1 else 'ies'}"
+    if not snapshot:
+        note = "No Salesforce snapshot yet: the connector writes one when it refreshes."
+    elif not records:
+        note = "The notes in use mention no opportunities in the snapshot."
+    elif on:
+        note = f"Sending {count} and your open tasks on them · snapshot {taken}"
+    else:
+        note = f"{count} in the notes in use · snapshot {taken}"
+    with st.container(horizontal=True, vertical_alignment="center", gap="xsmall", key=f"{key_prefix}_add_context"):
+        st.caption("📎 Add context:", width="content")
+        st.button(
+            "☁️ Salesforce",
+            key=f"{key_prefix}_salesforce_context",
+            type="primary" if on else "secondary",
+            disabled=not snapshot or (not records and not on),
+            on_click=toggle_follow_up_salesforce_context,
+            args=(search_state,),
+            help="Send the opportunities the notes in use mention (stage, close date, Next Step, ID and link) and "
+            "your open tasks on them with the next follow-ups. Click again to stop sending them.",
+        )
+        st.caption(note)
+
+
 def agent_action(prompt: dict) -> str:
     return f"\"{agent_command(prompt)}\" ({OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()})"
 
@@ -2403,12 +2509,27 @@ def render_ask_reference_row(library: dict, tasks: list[dict]) -> None:
     """Ask box: reference documents for this question — recent ones as chips, a finder for the rest, and what
     will be sent (with those the injected prompts bring)."""
     refs = reference_documents(library)
-    if not refs:
+    snapshot = load_reference_snapshot()
+    if not refs and not snapshot:
         return
     active = list(st.session_state.get(ACTIVE_REFERENCES_KEY, []))
     from_prompts = {i: task["name"] for task in tasks for i in task.get("references", [])}
+    salesforce_on = bool(load_app_settings().get(SALESFORCE_CONTEXT_SETTING))
+    salesforce_prompts = [task["name"] for task in tasks if task.get("salesforce")]
     with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
         st.caption("Reference:")
+        if snapshot:
+            st.button(
+                "☁️ Salesforce",
+                key="use_salesforce_context",
+                type="primary" if salesforce_on or salesforce_prompts else "secondary",
+                on_click=toggle_ask_salesforce_context,
+                disabled=bool(salesforce_prompts) and not salesforce_on,
+                help=(f"Sent with {', '.join(salesforce_prompts)}." if salesforce_prompts and not salesforce_on else
+                      "Send the Salesforce records for the opportunities the found notes mention (stage, close "
+                      "date, Next Step, ID and link) and your open tasks on them, from the connector's snapshot "
+                      f"taken {snapshot_taken(snapshot) or 'earlier'}. Stays on until you click it again."),
+            )
         for ref in recent_reference_documents(library):
             st.button(
                 reference_label(ref),
@@ -2421,16 +2542,17 @@ def render_ask_reference_row(library: dict, tasks: list[dict]) -> None:
                 else "Send this reference document with your question.",
             )
         labels = {ref["id"]: reference_label(ref) for ref in refs}
-        st.selectbox(
-            "Find a reference document",
-            options=list(labels),
-            index=None,
-            format_func=labels.get,
-            key="reference_finder",
-            on_change=pick_reference_from_finder,
-            placeholder="Find a reference document…",
-            label_visibility="collapsed",
-        )
+        if refs:
+            st.selectbox(
+                "Find a reference document",
+                options=list(labels),
+                index=None,
+                format_func=labels.get,
+                key="reference_finder",
+                on_change=pick_reference_from_finder,
+                placeholder="Find a reference document…",
+                label_visibility="collapsed",
+            )
     sending = run_reference_documents(tasks, library)
     if sending:
         st.markdown(
@@ -3524,7 +3646,7 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
     value = st.session_state.get(f"prompt_{field}_{prompt_id}")
     if field == "tags":
         value = clean_filter_terms(value)
-    elif field in ("global", "starred", "agent"):
+    elif field in ("global", "starred", "agent", "salesforce"):
         value = bool(value)
     elif field == "output":
         value = value if value in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
@@ -3606,6 +3728,7 @@ def add_prompt_from_form() -> None:
             model=st.session_state.get("new_prompt_model") or "",
             references=[ref_id for ref_id in st.session_state.get("new_prompt_references", [])
                         if find_reference_document(ref_id, library)],
+            salesforce=bool(st.session_state.get("new_prompt_salesforce", False)),
         )
     )
     save_prompt_library(library)
@@ -3887,6 +4010,14 @@ def render_prompt_card(
                     help="Sent to the LLM as background whenever this prompt is used, Agent or not. "
                     "Make them in **Reference documents** at the top of this page.",
                 )
+            st.checkbox(
+                "☁️ Send Salesforce records",
+                value=bool(prompt.get("salesforce")),
+                key=f"prompt_salesforce_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "salesforce"),
+                help=SALESFORCE_PROMPT_HELP,
+            )
             if agent:
                 render_agent_workflow_editor(prompt)
             if prompt.get("last_used"):
@@ -4532,6 +4663,7 @@ def render_prompt_library_page() -> None:
             else:
                 st.caption("No reference documents yet: make them in **Reference documents** above, then attach "
                            "them here or on the prompt's card.")
+            st.checkbox("☁️ Send Salesforce records", key="new_prompt_salesforce", help=SALESFORCE_PROMPT_HELP)
             st.form_submit_button("Add prompt", type="primary", icon=":material/add:", on_click=add_prompt_from_form)
         if error := st.session_state.pop("add_prompt_error", None):
             st.warning(error)
@@ -5153,7 +5285,7 @@ def build_discussion_messages(search_state: dict, max_tokens: int, temperature: 
             discussion_results(search_state),
             max_tokens,
             temperature,
-            corpus_prompt,
+            with_salesforce_context(search_state, corpus_prompt, discussion_results(search_state)),
             search_state.get("task_prompt", ""),
         ),
     }]
@@ -5267,7 +5399,8 @@ def render_big_screen_reply(search_state: dict, index: int, turn: dict) -> None:
         with st.expander("Question asked"):
             st.markdown(asked)
     st.markdown(link_opportunity_names(turn["content"]))
-    render_copy_buttons([("Copy reply", turn["content"]), ("Copy all output", full_llm_output(search_state))])
+    render_copy_buttons([("Copy reply", link_opportunity_names(turn["content"])),
+                         ("Copy all output", full_llm_output(search_state))])
     st.button(
         "↩ Back to the answer",
         key="big_screen_back",
@@ -5287,14 +5420,15 @@ def full_llm_output(search_state: dict) -> str:
     parts = []
     if search_state.get("question"):
         parts.append("## Question\n\n" + search_state["question"].strip())
-    parts.append("## Answer\n\n" + (search_state.get("answer") or "").strip())
+    # Copied text carries the opportunity links the app adds on screen.
+    parts.append("## Answer\n\n" + link_opportunity_names((search_state.get("answer") or "").strip()))
     turns = []
     for turn in search_state.get("discussion") or []:
         if turn["role"] == "user":
             turns.append("**You:** " + turn["content"].strip())
         else:
             model = f" (`{turn['model']}`)" if turn.get("model") else ""
-            turns.append(f"**LLM**{model}:\n\n" + turn["content"].strip())
+            turns.append(f"**LLM**{model}:\n\n" + link_opportunity_names(turn["content"].strip()))
     if turns:
         parts.append("## Discussion\n\n" + "\n\n".join(turns))
     return "\n\n".join(parts)
@@ -5657,7 +5791,8 @@ def render_discussion_body(
                     st.caption(f"`{turn['model']}`")
                 # Every turn can be copied. When the model was sent more than is shown (a step's prompt, or
                 # Needs work with the rejected list), that full prompt can be copied too, to reuse in flows.
-                buttons = [("Copy", turn["content"])]
+                buttons = [("Copy", link_opportunity_names(turn["content"]) if turn["role"] == "assistant"
+                             else turn["content"])]
                 if turn.get("prompt") and turn["prompt"] != turn["content"]:
                     buttons.append(("Copy prompt sent", turn["prompt"]))
                 # Copy and Big screen share one line.
@@ -5682,6 +5817,7 @@ def render_discussion_body(
                                 help="Show this reply in the main output area.",
                             )
 
+    render_follow_up_context(search_state, key_prefix)
     with st.container(border=True):
         # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
         with st.container(horizontal=True, vertical_alignment="center"):
@@ -6386,7 +6522,7 @@ def render_search_results(
             if search_state["answer"]:
                 with st.expander("Answer"):
                     st.markdown(link_opportunity_names(search_state["answer"]))
-                    render_copy_buttons([("Copy answer", search_state["answer"])])
+                    render_copy_buttons([("Copy answer", link_opportunity_names(search_state["answer"]))])
         elif search_state["answer"]:
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.subheader("Answer", width="content")
@@ -6394,7 +6530,7 @@ def render_search_results(
             st.markdown(link_opportunity_names(search_state["answer"]))
             render_copy_buttons([
                 ("Copy all output", full_llm_output(search_state)),
-                ("Copy answer", search_state["answer"]),
+                ("Copy answer", link_opportunity_names(search_state["answer"])),
                 ("Copy question", search_state.get("question", "")),
                 ("Copy task prompt", search_state.get("task_prompt", "")),
             ])
@@ -9559,6 +9695,10 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
             tasks = run_prompts["tasks"]
             agents = [task for task in tasks if is_agent_prompt(task)]
             run_references = run_reference_documents(tasks, prompt_library) if use_llm_answer else []
+            # The Ask box's Salesforce chip, or a prompt that asks for Salesforce records.
+            salesforce_prompts = [task["name"] for task in tasks if task.get("salesforce")]
+            run_salesforce = use_llm_answer and bool(load_reference_snapshot()) and (
+                bool(load_app_settings().get(SALESFORCE_CONTEXT_SETTING)) or bool(salesforce_prompts))
             search_state = {
                 "filter_only": listing,
                 "route": route,
@@ -9591,7 +9731,9 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                     else tasks[0]["text"] if tasks else ""
                 ),
                 "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt)
-                + [f"Reference: {reference_label(ref)}" for ref in run_references],
+                + [f"Reference: {reference_label(ref)}" for ref in run_references]
+                + (["Salesforce records"] if run_salesforce else []),
+                "salesforce_context": run_salesforce,
                 "library_display": selected_lib if state_library == safe_lib else "All libraries",
                 "id": uuid.uuid4().hex[:8],  # keys this search's per-note widgets
                 "left_out_notes": [],
@@ -9615,7 +9757,8 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                             model_name=selected_ollama_model,
                             max_tokens=llm_max_tokens,
                             temperature=llm_temperature,
-                            corpus_prompt=search_state["prompt_context"],
+                            corpus_prompt=with_salesforce_context(
+                                search_state, search_state["prompt_context"], final_results),
                             task_prompt=search_state["task_prompt"],
                             on_progress=report,
                         )
