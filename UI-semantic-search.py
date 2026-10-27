@@ -3930,8 +3930,238 @@ def render_prompt_section_cards(
         render_prompt_card(prompt, model_options, ordered_links(library), reference_documents(library))
 
 
+# --- Export and import of all settings (no note content) --------------------------------------------------
+# One JSON file with the notes app's settings and prompts, the Salesforce connector's config.toml and the Notes
+# exporter's config.json, so that after the notes are put back and indexed everything is as it was. Nothing
+# from the notes themselves: no text, no indexes, no references to particular notes.
+
+SETTINGS_FORMAT = "rag-workspace-settings/v1"
+NOTE_DERIVED_SETTINGS = {"excluded_notes", "last_question", "search_filter", "llm_speed"}  # about notes, not settings
+OTHER_CONFIG_DEFAULTS = {
+    "connector": PROJECT_DIR.parent / "rag-action-interface" / "config.toml",  # the Salesforce connector
+    "exporter": Path("~/.config/notes-export/config.json").expanduser(),  # the Notes exporter
+}
+OTHER_CONFIG_LABELS = {"connector": "Salesforce connector", "exporter": "Notes exporter"}
+SETTINGS_BACKUP_DIR = APP_DATA_DIR / "backups"
+
+
+def other_config_path(kind: str) -> Path:
+    """Where the connector's or exporter's settings file is (set on the Configure page, else its default)."""
+    raw = str(load_app_settings().get(f"{kind}_config_path") or "").strip()
+    return Path(raw).expanduser() if raw else OTHER_CONFIG_DEFAULTS[kind]
+
+
+def persist_other_config_path(kind: str) -> None:
+    save_app_settings({f"{kind}_config_path": str(st.session_state.get(f"{kind}_config_path_input", "")).strip()})
+
+
+def read_json_file(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def build_settings_bundle(parts: set[str], full: bool = False) -> dict:
+    """The settings file. `full` (local backups only) keeps what an export leaves out about notes."""
+    bundle = {"format": SETTINGS_FORMAT, "exported_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+              "notes_app": None, "connector": None, "exporter": None}
+    if "notes_app" in parts:
+        app = read_json_file(APP_SETTINGS_PATH)
+        library = json.loads(json.dumps(load_prompt_library()))
+        if not full:
+            app = {key: value for key, value in app.items() if key not in NOTE_DERIVED_SETTINGS}
+            library.pop("references", None)  # reference documents point at notes
+            for prompt in library["prompts"]:
+                prompt["references"] = []
+        bundle["notes_app"] = {"app_settings": app, "prompt_library": library,
+                               "corpus_settings": read_json_file(CORPUS_SETTINGS_PATH)}
+    connector = other_config_path("connector")
+    if "connector" in parts and connector.is_file():
+        bundle["connector"] = {"path": str(connector), "config_toml": connector.read_text()}
+    exporter = other_config_path("exporter")
+    if "exporter" in parts and exporter.is_file():
+        config = read_json_file(exporter)
+        if not full:
+            for key in ("include_notes", "exclude_notes"):  # single notes, named by title or Apple Notes ID
+                (config.get("filter") or {}).pop(key, None)
+        bundle["exporter"] = {"path": str(exporter), "config": config}
+    return bundle
+
+
+def parse_settings_bundle(raw: bytes) -> tuple[dict | None, str]:
+    """A settings file read and checked, or (None, why not)."""
+    import tomllib
+
+    try:
+        bundle = json.loads(raw)
+    except ValueError:
+        return None, "That isn't a settings file (not valid JSON)."
+    if not isinstance(bundle, dict) or bundle.get("format") != SETTINGS_FORMAT:
+        return None, f"That isn't a settings file from this app (format {bundle.get('format') if isinstance(bundle, dict) else '?'!r})."
+    notes = bundle.get("notes_app")
+    if notes is not None and not (isinstance(notes, dict) and isinstance(notes.get("prompt_library"), dict)
+                                  and isinstance(notes.get("app_settings"), dict)):
+        return None, "The notes app part of the file is damaged."
+    if bundle.get("connector"):
+        try:
+            tomllib.loads(bundle["connector"].get("config_toml", ""))
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return None, "The Salesforce connector part of the file is damaged."
+    if bundle.get("exporter") and not isinstance(bundle["exporter"].get("config"), dict):
+        return None, "The Notes exporter part of the file is damaged."
+    return bundle, ""
+
+
+def write_settings_backup() -> Path:
+    """Everything as it is now (including what exports leave out), before an import replaces it."""
+    SETTINGS_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    path = SETTINGS_BACKUP_DIR / f"settings-before-import-{datetime.datetime.now():%Y%m%d-%H%M%S}.json"
+    path.write_text(json.dumps(build_settings_bundle({"notes_app", "connector", "exporter"}, full=True), indent=2))
+    return path
+
+
+def write_text_atomically(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(text)
+    temp.replace(path)
+
+
+def apply_settings_bundle(bundle: dict, parts: set[str]) -> tuple[list[str], Path]:
+    """Restore the chosen parts, to the paths in the file. Returns (what was restored, the backup made first)."""
+    backup = write_settings_backup()
+    restored = []
+    notes = bundle.get("notes_app")
+    if "notes_app" in parts and notes:
+        app = {**read_json_file(APP_SETTINGS_PATH), **notes["app_settings"]}
+        write_text_atomically(APP_SETTINGS_PATH, json.dumps(app, indent=2))
+        library = dict(notes["prompt_library"])
+        library["references"] = load_prompt_library().get("references", [])  # this machine's own, if any
+        save_prompt_library(library)
+        corpora = {**read_json_file(CORPUS_SETTINGS_PATH), **(notes.get("corpus_settings") or {})}
+        write_text_atomically(CORPUS_SETTINGS_PATH, json.dumps(corpora, indent=2))
+        restored.append(f"the notes app ({len(library.get('prompts', []))} prompts, {len(corpora)} corpora)")
+    for kind in ("connector", "exporter"):
+        part = bundle.get(kind)
+        if kind not in parts or not part:
+            continue
+        path = Path(part["path"]).expanduser()
+        text = part["config_toml"] if kind == "connector" else json.dumps(part["config"], indent=2)
+        write_text_atomically(path, text)
+        save_app_settings({f"{kind}_config_path": str(path)})
+        restored.append(f"the {OTHER_CONFIG_LABELS[kind]} (`{path}`)")
+    return restored, backup
+
+
+def describe_settings_bundle(bundle: dict) -> dict[str, str]:
+    """{part: one line on what it holds} for the import's checkboxes."""
+    lines = {}
+    if notes := bundle.get("notes_app"):
+        prompts = notes["prompt_library"].get("prompts", [])
+        agents = sum(1 for prompt in prompts if prompt.get("agent") and not prompt.get("global"))
+        lines["notes_app"] = (
+            f"Notes app: {len(prompts)} prompts ({agents} Agents), {len(notes['prompt_library'].get('links', []))} "
+            f"links, settings for {len(notes.get('corpus_settings') or {})} corpora; notes folder "
+            f"`{notes['app_settings'].get('corpus_root_path', '?')}`"
+        )
+    if connector := bundle.get("connector"):
+        import tomllib
+
+        org = tomllib.loads(connector["config_toml"]).get("org", "?")
+        lines["connector"] = f"Salesforce connector: org `{org}`, to `{connector['path']}`"
+    if exporter := bundle.get("exporter"):
+        lines["exporter"] = (f"Notes exporter: export folder `{exporter['config'].get('output', '?')}`, to "
+                             f"`{exporter['path']}`")
+    return lines
+
+
+def index_all_corpora_here() -> None:
+    """After an import: index every visible corpus, each with its restored embedding model (Rescan all corpora)."""
+    corpus_root = get_corpus_root_path()
+    if corpus_root is None or not corpus_root.exists():
+        st.error("The notes folder from the settings isn't there yet: put the notes back, then index.")
+        return
+    if is_single_corpus_mode():
+        st.info("Single-corpus mode: open the RAG workspace and click **⚡ Rescan (incremental)** in the left panel.")
+        return
+    set_embedding_acceleration(get_use_gpu_for_embeddings())
+    summary = run_multi_corpus_rescan(filter_libraries_for_display(get_libraries()), corpus_root, st.container())
+    st.session_state["multi_rebuild_summary"] = summary
+    st.success("Indexing finished. Reload the RAG workspace tab to search.")
+
+
+def render_settings_transfer_section() -> None:
+    """Configure page: export all settings to a file, or import them from one."""
+    with st.expander("Export and import settings", expanded=True, key="configure_transfer_open",
+                     icon=":material/import_export:"):
+        st.caption(
+            "Settings only, for moving to another Mac or starting again: prompts (with About me and Agents), "
+            "links, quick search terms, the title marker, each corpus's settings and corpus prompt, the app's "
+            "settings, and the Salesforce connector's and Notes exporter's settings. **Nothing from your notes:** "
+            "no text, no indexes, no reference documents, no excluded notes, filter terms or last question, and "
+            "none of the exporter's single-note exceptions. To restore: put the notes back where they were "
+            "(e.g. export them again), import this file, then index."
+        )
+        st.markdown("**Export**")
+        found = {}
+        for kind, label in OTHER_CONFIG_LABELS.items():
+            path = other_config_path(kind)
+            found[kind] = path.is_file()
+            st.text_input(f"{label} settings file", value=str(path), key=f"{kind}_config_path_input",
+                          on_change=persist_other_config_path, args=(kind,),
+                          help="✓ found" if found[kind] else "Not found here: it won't be in the export.")
+        with st.container(horizontal=True, vertical_alignment="center"):
+            parts = {"notes_app"}
+            for kind, label in OTHER_CONFIG_LABELS.items():
+                if st.checkbox(label, value=found[kind], disabled=not found[kind], key=f"export_{kind}"):
+                    parts.add(kind)
+        st.download_button(
+            "Download settings",
+            data=json.dumps(build_settings_bundle(parts), indent=2),
+            file_name=f"rag-workspace-settings-{datetime.date.today():%Y-%m-%d}.json",
+            mime="application/json",
+            icon=":material/download:",
+            key="settings_download",
+        )
+
+        st.markdown("**Import**")
+        if done := st.session_state.get("settings_imported"):
+            st.success("Restored " + ", ".join(done["restored"]) + f". Your previous settings are in `{done['backup']}`.")
+            st.caption(
+                "Next: make sure the notes are back in their folder, then index them. Reload the RAG workspace tab "
+                "so it picks the settings up. If you use the connector's or exporter's schedule, turn it on again "
+                "in that app (the import doesn't install schedules)."
+            )
+            with st.container(horizontal=True):
+                if st.button("Index all corpora now", type="primary", icon=":material/bolt:", key="settings_index_now"):
+                    index_all_corpora_here()
+                st.button("Later", key="settings_index_later", on_click=st.session_state.pop,
+                          args=("settings_imported", None),
+                          help="Index later with **⚡ Rescan all corpora** in the RAG workspace's left panel.")
+            return
+        upload = st.file_uploader("Settings file", type=["json"], key="settings_import_file",
+                                  help="A file from **Download settings**.")
+        if upload is None:
+            return
+        bundle, problem = parse_settings_bundle(upload.getvalue())
+        if bundle is None:
+            st.error(problem)
+            return
+        st.caption(f"Exported {bundle.get('exported_at', '?')}. Restore:")
+        chosen = {kind for kind, line in describe_settings_bundle(bundle).items()
+                  if st.checkbox(line, value=True, key=f"import_{kind}")}
+        st.caption("Each part replaces what's there now, at the path in the file; everything is backed up first.")
+        if st.button("Import settings", type="primary", icon=":material/upload:", disabled=not chosen,
+                     key="settings_import_apply"):
+            restored, backup = apply_settings_bundle(bundle, chosen)
+            st.session_state["settings_imported"] = {"restored": restored, "backup": str(backup)}
+            st.rerun()
+
+
 def render_configure_page() -> None:
-    """Configure page (?page=configure): the task executor and other links, the outbox and the title marker."""
+    """Configure page (?page=configure): links, the outbox, the title marker, and export / import of settings."""
     library = load_prompt_library()
     render_outbox_status()
     render_page_title("Configure")
@@ -4048,6 +4278,8 @@ def render_configure_page() -> None:
             )
         if marker["text"]:
             st.caption(f"Example: **{marked_title('Follow up with Acme on the pilot', marker)}**")
+
+    render_settings_transfer_section()
 
 
 def render_prompt_library_page() -> None:

@@ -354,6 +354,17 @@ Open it with the **Configure** button under **Prompt library** in the left panel
 | **Outbox** | The folder that sent drafts are written to, and how many packages are waiting, processed and failed. See [Agents and the outbox](#agents-and-the-outbox). |
 | **Task title marker** | Text added **before** or **after** the title of everything an Agent stages (task subjects, note titles, email subjects), e.g. `RAG_TEST:` or `[AI]`, so those records are easy to find later. Applied when the Agent stages, so you see it before **That's right**; titles that already contain it are left alone. Empty means off. |
 
+#### Export and import settings
+
+The last section of **Configure**. **Download settings** saves one JSON file (`rag-workspace-settings-<date>.json`) with:
+
+- the notes app: About me, every prompt (with Agent steps and Action Commands), task executor settings and other links, quick search terms, the title marker, each corpus's settings (embedding model, cutoff, LLM model and tuning, corpus prompt) and the app's settings (notes folder, corpus mode, outbox folder, auto-rescan, GPU, hidden corpora, Max results, search route);
+- the Salesforce connector's `config.toml` and the Notes exporter's `config.json` (their paths are shown and can be changed; untick either to leave it out).
+
+**Nothing from your notes:** no note text, indexes or outbox content, no reference documents (prompts lose their links to them), no excluded notes, filter terms, last question or speed stats, and none of the exporter's single-note include/exclude rules (they name notes).
+
+To restore, e.g. on a new Mac: put the notes back where they were (export them again with the Notes exporter), choose the file under **Import**, tick the parts to restore and click **Import settings**. Each part goes back to the path in the file, replacing what's there; everything is first backed up to `llmware_data/backups/`. Then **Index all corpora now** indexes every visible corpus with its restored embedding model (or do it later with **⚡ Rescan all corpora**), reload the RAG workspace tab, and turn the connector's and exporter's schedules on again in those apps (an import doesn't install schedules).
+
 ### Agents and the outbox
 
 Choose an Agent as the task and **Search**. Its collection prompt (step 1) writes the first answer: a numbered list of what it found, and questions. Then, in the **Discussion** panel:
