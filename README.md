@@ -289,7 +289,7 @@ Results appear under **Sources** as one dropdown per document (documents with se
 
 ### Answer with LLM
 
-The Ask box reads top to bottom: your question → the injected prompt's **links** (if it has any) → **Answer with LLM** → **Prompt library** → **Ollama model details** → **Search** → progress. Search settings are in the Filter box: **Max results** under **Exclude (NOT)**, then the route's own settings at the bottom (**Distance cutoff** on the Semantic route; **Search all libraries**, **Filter search only** and **Rescan → Filter search** on the Literal route).
+The Ask box reads top to bottom: a title line with **Ask**, **Answer with LLM** and the injected prompt's **links** (if it has any, e.g. Salesforce tasks) → your question → **Prompt library** → **Ollama model details** → **Search** → progress. Search settings are in the Filter box: **Max results** under **Exclude (NOT)**, then the route's own settings at the bottom (**Distance cutoff** on the Semantic route; **Search all libraries**, **Filter search only** and **Rescan → Filter search** on the Literal route).
 
 - **Answer with LLM** is enabled by default.
 - **Prompt library** — see [Prompt library](#prompt-library) below.

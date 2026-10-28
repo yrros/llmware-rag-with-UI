@@ -2320,14 +2320,14 @@ def link_markdown(link: dict, guess: str = "") -> str:
     return f"{link_status_dot(link['url'])}[{title}]({url.replace(' ', '%20').replace(')', '%29')})"
 
 
-def render_prompt_links(prompts: list[dict], library: dict, guess: str) -> None:
+def render_prompt_links(prompts: list[dict], library: dict, guess: str, width="stretch") -> None:
     """The injected prompts' links, inline (task executor first), each opening in a new tab."""
     chosen = {link_id for prompt in prompts for link_id in prompt.get("links", [])}
     if not chosen:
         return
     parts = [link_markdown(link, guess) for link in ordered_links(library) if link["id"] in chosen and link.get("url")]
     if parts:
-        st.markdown(" · ".join(parts))
+        st.markdown(" · ".join(parts), width=width)
 
 
 # --- Reference documents: notes sent to the LLM as background, attached to prompts or added for one question --
@@ -9747,9 +9747,30 @@ with ask_box_col:
         search_progress_slot = st.empty()
     else:
         with st.container(border=True, key="ask_box"):  # green, like the answer (route_tint_style)
-            st.markdown("**Ask**")
             if "question_text" not in st.session_state:
                 st.session_state["question_text"] = str(load_app_settings().get("last_question", ""))
+            # One line: the title, Answer with LLM, then the injected prompt's links (e.g. Salesforce, the
+            # connector app). The links' best guess uses the question as typed so far.
+            with st.container(horizontal=True, vertical_alignment="center", gap="medium", key="ask_header"):
+                st.markdown("**Ask**", width="content")
+                use_llm_answer = st.checkbox(
+                    "Answer with LLM",
+                    value=True,
+                    key="use_llm_answer",
+                    width="content",
+                    help=(
+                        "**Semantic search** finds relevant note chunks using embedding vectors. "
+                        "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
+                        "Search still runs first; the LLM does not replace retrieval."
+                    ),
+                )
+                last_search_state = st.session_state.get(LAST_SEARCH_KEY)
+                render_prompt_links(
+                    resolve_run_prompts(prompt_library, corpus_config)["tasks"],
+                    prompt_library,
+                    best_guess(str(st.session_state.get("question_text", "")), search_filter,
+                               last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
+                )
             install_select_question_on_focus()
             prompt_text = st.text_area(
                 QUESTION_LABEL,
@@ -9758,25 +9779,8 @@ with ask_box_col:
                 on_change=persist_question,
                 help="Saved locally and restored when the page is reloaded.",
             )
-            # The injected prompt's links (e.g. Salesforce, the connector app), between the question and its token.
-            last_search_state = st.session_state.get(LAST_SEARCH_KEY)
-            render_prompt_links(
-                resolve_run_prompts(prompt_library, corpus_config)["tasks"],
-                prompt_library,
-                best_guess(prompt_text, search_filter, last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
-            )
             render_injected_prompt_token(prompt_library)
-            # Top to bottom: question → Answer with LLM → prompt library → model details → cutoff → Search → progress.
-            use_llm_answer = st.checkbox(
-                "Answer with LLM",
-                value=True,
-                key="use_llm_answer",
-                help=(
-                    "**Semantic search** finds relevant note chunks using embedding vectors. "
-                    "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
-                    "Search still runs first; the LLM does not replace retrieval."
-                ),
-            )
+            # Top to bottom: title, Answer with LLM and links → question → prompt library → model details → Search.
 
             if use_llm_answer:
                 render_ask_prompt_panel(prompt_library, corpus_config)
