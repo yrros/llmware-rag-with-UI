@@ -967,6 +967,13 @@ FILTER_FIELD_STYLE = """<style>
 [class*="st-key-quick_date_"] button:hover, [class*="st-key-quick_term_"] button:hover {
   border-color: currentColor !important;
 }
+/* Max results, the filter in words, exclusions and Clear exclusions stay on one line; the filter text takes
+   what's left and wraps within it. */
+.st-key-max_results_row { flex-wrap: nowrap; }
+.st-key-max_results_row > div { min-width: 0; }
+.st-key-max_results_row > div:has([data-testid="stCaptionContainer"]) { flex-shrink: 1; }
+/* The folded OR and NOT fields: a tighter fold, like the Must include box. */
+[class*="st-key-filter_fold_"] summary { padding-top: 0.35rem !important; padding-bottom: 0.35rem !important; }
 </style>"""
 
 
@@ -991,11 +998,14 @@ def apply_quick_term(term: str, field: str) -> None:
     persist_search_filter()
 
 
-def render_filter_heading(field: str, label: str, field_help: str) -> None:
-    """A filter field's heading with its quick date buttons on the same line, and quick search terms below."""
+def render_filter_heading(field: str, label: str, field_help: str, show_label: bool = True) -> None:
+    """A filter field's heading with its quick date buttons on the same line, and quick search terms below.
+
+    In a fold the fold's title names the field, so `show_label=False` leaves just the help icon.
+    """
     today = datetime.date.today()
     with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
-        st.markdown(label, width="content", help=field_help)
+        st.markdown(label if show_label else "", width="content", help=field_help)
         for kind, button_label in QUICK_DATE_LABELS.items():
             terms = quick_date_terms(kind, today, field)
             shown = " and ".join(f"`{t}`" for t in terms) if len(terms) <= 2 else f"`{terms[0]}` … `{terms[-1]}`"
@@ -9544,7 +9554,14 @@ with filter_box_col:
                     # Dates restored from the last session count as left over from an earlier search.
                     st.session_state[f"searched_dates_{field}"] = date_terms(st.session_state[_key])
                 # Each field is one small box: heading and quick dates, quick terms, then the terms themselves.
-                with st.container(border=True, gap="xsmall", key=f"filter_field_{field}"):
+                # Any of (OR) and Exclude (NOT) are folded, with their terms in the title, to keep the box short.
+                folded = field != "all"
+                field_terms = st.session_state[_key]
+                field_box = st.expander(
+                    label + (f" · {len(field_terms)}: {truncate_text(', '.join(field_terms), 40)}" if field_terms else ""),
+                    key=f"filter_fold_{field}",
+                ) if folded else st.container(border=True, gap="xsmall", key=f"filter_field_{field}")
+                with field_box:
                     render_filter_heading(field, label, (
                         f"{field_help}\n\n"
                         "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
@@ -9554,7 +9571,7 @@ with filter_box_col:
                             if exact_text_only
                             else "On the **Semantic** route, passages are ranked **only within** the matching notes."
                         )
-                    ))
+                    ), show_label=not folded)
                     st.multiselect(
                         label,
                         options=st.session_state[_key],
@@ -9574,29 +9591,32 @@ with filter_box_col:
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
         if "max_results" not in st.session_state:  # saved between searches and sessions
             st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
-        install_filter_commit_on_blur()
-        install_tooltip_hide_on_click()
-        install_save_flash()
         search_filter = get_search_filter_from_widgets()
-        # One line: Max results, then what the filter and exclusions leave out, with Clear exclusions rightmost.
-        st.html("<style>.st-key-max_results_row{flex-wrap:nowrap}"
-                ".st-key-max_results_row>div{min-width:0}</style>")
-        with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key="max_results_row"):
+        # One line: Max results (its title beside the box), then what the filter and exclusions leave out, with
+        # Clear exclusions rightmost.
+        with st.container(horizontal=True, vertical_alignment="center", gap="small", key="max_results_row"):
+            st.markdown("Max results", width="content",
+                        help="The most passages (Semantic route) or notes (Literal route) a search returns. "
+                        "Saved for next time.")
             result_limit = st.number_input(
                 "Max results",
                 min_value=1,
                 max_value=50,
                 key="max_results",
                 on_change=persist_max_results,
-                width=110,
-                help="The most passages (Semantic route) or notes (Literal route) a search returns. Saved for next time.",
+                width=80,
+                label_visibility="collapsed",
             )
             # The filter takes the free space and wraps within it, so the rest stays on this line.
             st.caption(f"Filter: {describe_search_filter(search_filter)}" if is_filter_active(search_filter) else "")
             if count_excluded_notes():
-                st.caption(f"🚫 {count_excluded_notes()} excluded", width="content",
-                           help=f"{count_excluded_notes()} note(s) excluded from **Search**.")
-                st.button("Clear exclusions", type="tertiary", on_click=clear_excluded_notes)
+                st.caption(f"🚫 {count_excluded_notes()} excluded", width="content")
+                st.button("Clear", key="clear_exclusions", type="tertiary", on_click=clear_excluded_notes,
+                          help=f"Clear exclusions: search the {count_excluded_notes()} excluded note(s) again.")
+        # Scripts with no visible part: after the row, so their empty slots don't open a gap above it.
+        install_filter_commit_on_blur()
+        install_tooltip_hide_on_click()
+        install_save_flash()
 
         with st.container(border=True):
             st.markdown(
