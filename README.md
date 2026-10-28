@@ -289,7 +289,7 @@ Results appear under **Sources** as one dropdown per document (documents with se
 
 ### Answer with LLM
 
-The Ask box reads top to bottom: a title line with **Ask**, **Answer with LLM** and the injected prompt's **links** (if it has any, e.g. Salesforce tasks) → your question → **Prompt library** → **Ollama model details** → **Search** → progress. Search settings are in the Filter box: **Max results** under **Exclude (NOT)**, then the route's own settings at the bottom (**Distance cutoff** on the Semantic route; **Search all libraries**, **Filter search only** and **Rescan → Filter search** on the Literal route).
+The Ask box reads top to bottom: a title line with **Ask**, **Answer with LLM** and the injected prompt's **links** (if it has any, e.g. Salesforce tasks) → your question (one line high; **Bigger**, on the line above it, makes it taller) → **Prompt library** → **Ollama model details** → **Search** → progress. Search settings are in the Filter box: **Max results** under **Exclude (NOT)**, then the route's own settings at the bottom (**Distance cutoff** on the Semantic route; **Search all libraries**, **Filter search only** and **Rescan → Filter search** on the Literal route).
 
 - **Answer with LLM** is enabled by default.
 - **Prompt library** — see [Prompt library](#prompt-library) below.
@@ -304,7 +304,7 @@ The Ask box reads top to bottom: a title line with **Ask**, **Answer with LLM** 
 
 ### Prompt library
 
-Open it with the **Prompt library** button in the left panel (hover it for a summary of what is switched on), or **Manage** in the Ask panel's Prompt library box. It opens in a new tab (`?page=prompts`) and saves to `llmware_data/prompt_library.json` (the corpus prompt stays in `corpus_settings.json`). Top to bottom: About me, corpus prompt, quick search filters, reference documents, task prompts and Agent prompts. Links, the outbox and the title marker are on the [Configure](#configure) page.
+Open it with the **Prompt library** button in the left panel (hover it for a summary of what is switched on), or the **↗** beside the title of the Ask panel's Prompt library box. It opens in a new tab (`?page=prompts`) and saves to `llmware_data/prompt_library.json` (the corpus prompt stays in `corpus_settings.json`). Top to bottom: About me, corpus prompt, quick search filters, reference documents, task prompts and Agent prompts. Links, the outbox and the title marker are on the [Configure](#configure) page.
 
 | Section | What it does |
 |---------|--------------|
@@ -333,9 +333,10 @@ Four example task prompts are added the first time; edit or delete them freely.
 
 **In the Ask panel** (shown when **Answer with LLM** is on), the compact **Prompt library** box sits above the model settings and has:
 
-- **Always** — About me, the corpus prompt and each global prompt, ticked. Untick one to leave it out of this run.
+- **About me** and **Corpus prompt** — toggles on the box's title line. About me is on for each new session; switch it off to leave it out of this run. Corpus prompt is this corpus's **Apply corpus prompt** setting (saved, the same as on the Prompt library page), greyed out until the corpus has a corpus prompt written; hover it to read the prompt.
+- **Always** — each global prompt, ticked. Untick one to leave it out of this run.
 - **Task** — click a prompt to attach it (click it again, or **✕**, to remove it). Agents add up: click **Agent:SF_Next_Step** and **Agent:SF_Tasks** to do both in one action (see [Several Agents at once](#several-agents-at-once)); a plain prompt replaces whatever was attached, and an Agent replaces a plain prompt; your question still decides which notes are found, and the task tells the LLM what to write from them. The task also applies to follow-up questions. On the **Literal** search route, a task can produce an answer even without a question.
-- **Recent** — titles of the five task prompts most recently used for an answer, newest first. **Starred** — up to five starred prompts not already in Recent, most recently used first, so favourites fill the gap. Hover a title to see the full prompt.
+- **Recent** — titles of the five task prompts most recently used for an answer, newest first. **Starred** — up to five starred prompts not already in Recent, most recently used first, so favourites fill the gap. Each row shows only the titles that fit on one line after its label (a title that would overflow is left out; find it with **Find a prompt**). Hover a title to see the full prompt.
 - **Find a prompt** — search every task prompt by name or tag.
 - **Agent prompts** read *Agent:Name* (e.g. *Agent:SF_Tasks*) and have a blue border: on the Recent and Starred buttons, on the chosen **Task**, and on the prompt token under the question box. **Find a prompt** shows the same *Agent:* names.
 

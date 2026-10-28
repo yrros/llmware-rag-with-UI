@@ -5069,7 +5069,27 @@ PROMPT_CHIP_STYLE = """<style>
 </style>"""
 
 
-def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
+PROMPT_ROW_CHARS = 52  # about what fits on the Recent or Starred row after its label; chips that don't are left out
+
+
+def fit_prompt_chips(prompts: list[dict]) -> list[tuple[dict, str]]:
+    """(prompt, chip label) for as many prompts as fit on one line, in order, skipping any that would overflow."""
+    shown, width = [], 0
+    for prompt in prompts:
+        label = truncate_text(agent_prompt_label(prompt), 34 if is_agent_prompt(prompt) else 28)
+        cost = len(label) + 4  # a chip's padding and the gap
+        if width + cost <= PROMPT_ROW_CHARS:
+            shown.append((prompt, label))
+            width += cost
+    return shown
+
+
+def set_corpus_prompt_enabled(safe_lib: str) -> None:
+    """The Ask box's Corpus prompt toggle: the same per-corpus setting as Apply corpus prompt."""
+    save_corpus_config(safe_lib, {"corpus_prompt_enabled": bool(st.session_state.get(f"ask_corpus_prompt_{safe_lib}"))})
+
+
+def render_ask_prompt_panel(library: dict, corpus_config: dict, safe_lib: str = "") -> None:
     """Compact 'Prompt library' box in the Ask panel: always-included prompts, task, recent and starred."""
     profile = library["profile"]
     profile_text = str(profile.get("text", "")).strip() if profile.get("enabled") else ""
@@ -5083,23 +5103,35 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
     st.html(PROMPT_CHIP_STYLE)
 
     with st.container(border=True, gap="xsmall"):
-        with st.container(horizontal=True, vertical_alignment="center"):
-            st.markdown("**Prompt library**")
+        with st.container(horizontal=True, vertical_alignment="center", gap="xsmall", key="prompt_panel_title"):
+            st.markdown("**Prompt library**", width="content")
+            # Icon only, so About me and Corpus prompt fit on this line.
             st.link_button(
-                "Manage",
+                ":material/open_in_new:",
                 PROMPT_LIBRARY_PAGE_URL,
-                icon=":material/open_in_new:",
                 type="tertiary",
-                help="Opens the prompt library in a new tab.",
+                help="Manage: opens the prompt library in a new tab.",
+            )
+            if profile_text:
+                st.toggle("About me", value=True, key="run_include_profile", help=profile_text)
+            # Kept in step with the saved setting, which the Prompt library page can change too.
+            corpus_text = str(corpus_config.get("corpus_prompt", "")).strip()
+            corpus_key = f"ask_corpus_prompt_{safe_lib}"
+            st.session_state[corpus_key] = bool(corpus_config.get("corpus_prompt_enabled")) and bool(corpus_text)
+            st.toggle(
+                "Corpus prompt",
+                key=corpus_key,
+                on_change=set_corpus_prompt_enabled,
+                args=(safe_lib,),
+                disabled=not corpus_text,
+                help=(corpus_text + "\n\nSent ahead of the notes for every answer and follow-up in this corpus. "
+                      "Saved per corpus." if corpus_text
+                      else "This corpus has no corpus prompt yet: write one on the Prompt library page (the ↗ beside **Prompt library**)."),
             )
 
-        if profile_text or corpus_prompt or global_prompts:
+        if global_prompts:
             with st.container(horizontal=True, vertical_alignment="center", gap="small"):
                 st.caption("Always:")
-                if profile_text:
-                    st.checkbox("About me", value=True, key="run_include_profile", help=profile_text)
-                if corpus_prompt:
-                    st.checkbox("Corpus prompt", value=True, key="run_include_corpus", help=corpus_prompt)
                 for prompt in global_prompts:
                     st.checkbox(
                         prompt["name"], value=True, key=f"run_include_global_{prompt['id']}", help=prompt["text"]
@@ -5110,12 +5142,13 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
             if not prompts:
                 continue
             with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
-                st.caption(f"{title}:")
-                for prompt in prompts:
+                st.caption(f"{title}:", width="content")
+                # Only what fits on this line; the rest are in Find a prompt.
+                for prompt, label in fit_prompt_chips(prompts):
                     is_active = prompt["id"] in active_ids
                     agent = is_agent_prompt(prompt)
                     st.button(
-                        truncate_text(agent_prompt_label(prompt), 34 if agent else 28),
+                        label,
                         # Agent keys pick up the blue border style above.
                         key=f"use_{'agent_' if agent else ''}prompt_{title}_{prompt['id']}",
                         help=(f"**Agent** — ends by sending {OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()} "
@@ -5956,6 +5989,12 @@ if (page.__tooltipTidyVersion !== 3) {
 
 
 QUESTION_LABEL = "What would you like to ask?"
+QUESTION_BIG_HEIGHT = 220
+# The question box at one line's height (a text area keeps Enter for new lines and stays selectable on focus).
+QUESTION_ONE_LINE_STYLE = """<style>
+.st-key-question_text [data-testid="stTextAreaRootElement"] { height: auto !important; min-height: 0 !important; }
+.st-key-question_text textarea { height: 2.4rem !important; min-height: 2.4rem !important; resize: none; }
+</style>"""
 
 
 def install_select_question_on_focus() -> None:
@@ -9751,39 +9790,47 @@ with ask_box_col:
                 st.session_state["question_text"] = str(load_app_settings().get("last_question", ""))
             # One line: the title, Answer with LLM, then the injected prompt's links (e.g. Salesforce, the
             # connector app). The links' best guess uses the question as typed so far.
-            with st.container(horizontal=True, vertical_alignment="center", gap="medium", key="ask_header"):
-                st.markdown("**Ask**", width="content")
-                use_llm_answer = st.checkbox(
-                    "Answer with LLM",
-                    value=True,
-                    key="use_llm_answer",
-                    width="content",
-                    help=(
-                        "**Semantic search** finds relevant note chunks using embedding vectors. "
-                        "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
-                        "Search still runs first; the LLM does not replace retrieval."
-                    ),
+            with st.container(gap="xsmall", key="ask_top"):
+                with st.container(horizontal=True, vertical_alignment="center", gap="medium", key="ask_header"):
+                    st.markdown("**Ask**", width="content")
+                    use_llm_answer = st.checkbox(
+                        "Answer with LLM",
+                        value=True,
+                        key="use_llm_answer",
+                        width="content",
+                        help=(
+                            "**Semantic search** finds relevant note chunks using embedding vectors. "
+                            "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
+                            "Search still runs first; the LLM does not replace retrieval."
+                        ),
+                    )
+                    last_search_state = st.session_state.get(LAST_SEARCH_KEY)
+                    render_prompt_links(
+                        resolve_run_prompts(prompt_library, corpus_config)["tasks"],
+                        prompt_library,
+                        best_guess(str(st.session_state.get("question_text", "")), search_filter,
+                                   last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
+                    )
+                # The question: one line unless Bigger is on, its title and the toggle on the line above.
+                with st.container(horizontal=True, vertical_alignment="center", key="question_heading"):
+                    st.markdown(QUESTION_LABEL, width="stretch",
+                                help="Saved locally and restored when the page is reloaded.")
+                    big_question = st.toggle("Bigger", key="question_bigger", help="A taller box for long questions.")
+                if not big_question:
+                    st.html(QUESTION_ONE_LINE_STYLE)
+                prompt_text = st.text_area(
+                    QUESTION_LABEL,
+                    height=QUESTION_BIG_HEIGHT if big_question else "content",
+                    key="question_text",
+                    on_change=persist_question,
+                    label_visibility="collapsed",
                 )
-                last_search_state = st.session_state.get(LAST_SEARCH_KEY)
-                render_prompt_links(
-                    resolve_run_prompts(prompt_library, corpus_config)["tasks"],
-                    prompt_library,
-                    best_guess(str(st.session_state.get("question_text", "")), search_filter,
-                               last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
-                )
-            install_select_question_on_focus()
-            prompt_text = st.text_area(
-                QUESTION_LABEL,
-                height=100,
-                key="question_text",
-                on_change=persist_question,
-                help="Saved locally and restored when the page is reloaded.",
-            )
+            install_select_question_on_focus()  # no visible part: after the box, so it adds no gap above it
             render_injected_prompt_token(prompt_library)
             # Top to bottom: title, Answer with LLM and links → question → prompt library → model details → Search.
 
             if use_llm_answer:
-                render_ask_prompt_panel(prompt_library, corpus_config)
+                render_ask_prompt_panel(prompt_library, corpus_config, safe_lib)
                 # A task prompt with its own model preselects it. The box has no key, so its default changes with
                 # the prompt; picking another model here overrides it for this run.
                 prompt_model = first_prompt_model(resolve_run_prompts(prompt_library, corpus_config)["tasks"])
