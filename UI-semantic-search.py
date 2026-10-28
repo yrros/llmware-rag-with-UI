@@ -9613,16 +9613,9 @@ with filter_box_col:
                 st.caption(f"🚫 {count_excluded_notes()} excluded", width="content")
                 st.button("Clear", key="clear_exclusions", type="tertiary", on_click=clear_excluded_notes,
                           help=f"Clear exclusions: search the {count_excluded_notes()} excluded note(s) again.")
-        # Scripts with no visible part: after the row, so their empty slots don't open a gap above it.
-        install_filter_commit_on_blur()
-        install_tooltip_hide_on_click()
-        install_save_flash()
 
-        with st.container(border=True):
-            st.markdown(
-                "**Advanced search settings** · "
-                + ("literal: whole notes that match the filter" if exact_text_only else "semantic: passages ranked by meaning")
-            )
+        # The route's search settings, at the bottom of the Filter box.
+        with st.container():
             if exact_text_only:
                 all_libs_col, filter_btn_col = st.columns([1, 1.2], vertical_alignment="center")
                 with all_libs_col:
@@ -9650,7 +9643,7 @@ with filter_box_col:
 
                 rescan_all = search_all_libraries and not is_single_corpus_mode()
                 rescan_libraries = scan_libraries if rescan_all else [selected_lib]
-                rescan_note_col, rescan_btn_col = st.columns([2, 1.2], vertical_alignment="center")
+                rescan_note_col, rescan_btn_col = st.columns([1.5, 1.3], vertical_alignment="center")
                 rescan_note_slot = rescan_note_col.empty()
                 if rescan_btn_col.button(
                     "🔄 Rescan → Filter search",
@@ -9705,6 +9698,10 @@ with filter_box_col:
                 )
                 distance_threshold = float(st.session_state[_cutoff_key])
                 distance_map_slot = st.container()
+        # Scripts with no visible part: last in the Filter box, so their empty slots don't open gaps between rows.
+        install_filter_commit_on_blur()
+        install_tooltip_hide_on_click()
+        install_save_flash()
 
     # Filter-only results are listed here, under the Filter box.
     filter_results_slot = st.container()
