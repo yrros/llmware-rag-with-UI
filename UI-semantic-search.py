@@ -3738,6 +3738,22 @@ def item_salesforce_links(item: dict) -> str:
     return " · ".join(links)
 
 
+def plural(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def describe_check_scope(entries: dict[str, list[dict]]) -> str:
+    """'7 items in 3 packages (6 tasks, 1 Next Step)': what the check covers, counted the way the tabs are."""
+    items = [i for i in outbox_items(entries) if i["state"] in DUPLICATE_CHECK_STATES]
+    packages = sum(len(entries[state]) for state in DUPLICATE_CHECK_STATES)
+    kinds: dict[str, int] = {}
+    for i in items:
+        name = ITEM_KIND_NAMES.get(i["item"].get("type"), "Item")
+        kinds[name] = kinds.get(name, 0) + 1
+    breakdown = ", ".join(plural(n, name if name == "Next Step" else name.lower()) for name, n in kinds.items())
+    return f"{plural(len(items), 'item')} in {plural(packages, 'package')}" + (f" ({breakdown})" if breakdown else "")
+
+
 def duplicate_check_model_options() -> tuple[bool, list[str]]:
     ok, installed = discover_ollama_models()
     return ok, list(installed if ok and installed else SUGGESTED_OLLAMA_MODELS)
@@ -3780,25 +3796,28 @@ def render_duplicate_check_panel(entries: dict[str, list[dict]]) -> None:
             st.caption("Ollama isn't running, so the check can't run.")
         if clicked:
             bar = st.progress(0.0, text="Checking…")
-            st.session_state[DUPLICATE_CHECK_KEY] = run_duplicate_check(
-                entries, model, on_step=lambda n, total: bar.progress(n / total, text=f"Checking item {n} of {total}…"))
+            st.session_state[DUPLICATE_CHECK_KEY] = {
+                **run_duplicate_check(entries, model,
+                                      on_step=lambda n, total: bar.progress(n / total, text=f"Checking item {n} of {total}…")),
+                "scope": describe_check_scope(entries),
+            }
             bar.empty()
         check = st.session_state.get(DUPLICATE_CHECK_KEY)
         if check:
             flagged = sum(1 for i in outbox_items(entries) if i["state"] in DUPLICATE_CHECK_STATES
                           and any(m["text"] == i["text"] for m in check["matches"].get(i["key"], [])))
             st.caption(
-                f"Checked {check['checked']} Waiting and Withdrawn item{'s' if check['checked'] != 1 else ''} at "
+                f"Checked {check['scope']} on the Waiting and Withdrawn tabs at "
                 f"{check['when']:%H:%M} with `{check['model']}`: {check['comparisons']} comparisons, against the "
                 f"outbox and your {check['open_tasks']} open Salesforce tasks. "
-                + (f"**⚠ {flagged} look{'s' if flagged == 1 else ''} like duplicates** (marked below)."
+                + (f"**⚠ {plural(flagged, 'item')} look{'s' if flagged == 1 else ''} like duplicates** (marked below)."
                    if flagged else "No likely duplicates.")
                 + (f" **{len(check['errors'])} couldn't be checked:**" if check["errors"] else "")
             )
             for error in check["errors"]:
                 st.caption(f"Couldn't check {error}")
         else:
-            st.caption(f"{to_check} Waiting and Withdrawn item{'s' if to_check != 1 else ''} to check. "
+            st.caption(f"To check: {describe_check_scope(entries)} on the Waiting and Withdrawn tabs. "
                        "Each item also links to its record in Salesforce.")
 
 
@@ -3851,8 +3870,12 @@ def render_actions_page() -> None:
     flagged = {state: sum(1 for i in outbox_items({state: entries[state]})
                           if any(m["text"] == i["text"] for m in check.get("matches", {}).get(i["key"], [])))
                for state in DUPLICATE_CHECK_STATES}
-    tabs = st.tabs([f"{OUTBOX_STATES[state][0]} ({len(entries[state])})"
-                    + (f" · ⚠ {flagged[state]}" if flagged.get(state) else "") for state in OUTBOX_STATES])
+    # Tabs count packages and the items in them, as the duplicate check counts items.
+    item_counts = {state: len(outbox_items({state: entries[state]})) for state in OUTBOX_STATES}
+    tabs = st.tabs([
+        f"{OUTBOX_STATES[state][0]} ({plural(len(entries[state]), 'package')}"
+        + (f" · {plural(item_counts[state], 'item')}" if entries[state] else "") + ")"
+        + (f" · ⚠ {flagged[state]}" if flagged.get(state) else "") for state in OUTBOX_STATES])
     for tab, state in zip(tabs, OUTBOX_STATES):
         with tab:
             shown = [entry for entry in entries[state] if outbox_entry_matches(entry, query)]
