@@ -3257,10 +3257,13 @@ def render_outbox_entry(entry: dict, state: str) -> None:
     status = state if state in ("waiting", "withdrawn") else receipt.get("status", "")
     icon, status_text = PACKAGE_STATUS.get(status, PACKAGE_STATUS[""])
     kind = {"note": "note", "task": "task", "email": "email", "update": "update"}.get(package.get("item_type"), "item")
+    flagged = sum(1 for index, item in enumerate(items) if item_duplicate_matches(entry, index, item)) \
+        if state in DUPLICATE_CHECK_STATES else 0
     label = (
         f"{icon} {format_when(entry['when'])} · {len(items)} {kind}{'' if len(items) == 1 else 's'}"
         + (f" · Agent:{prompt_name}" if prompt_name else "")
         + f" · {status_text}"
+        + (f" · ⚠ {flagged} possible duplicate{'s' if flagged != 1 else ''}" if flagged else "")
     )
     with st.expander(label, expanded=state == "failed"):
         details = [f"File `{entry['path'].name}`"]
@@ -3306,6 +3309,11 @@ def render_outbox_entry(entry: dict, state: str) -> None:
                 line = f"**{staged_item_title(item)}**"
             icon = RECEIPT_ITEM_ICONS.get(result.get("status"), "⏳" if state == "waiting" else "")
             st.markdown(f"{icon} {link_opportunity_names(line)}")
+            if state in DUPLICATE_CHECK_STATES:
+                if links := item_salesforce_links(item):
+                    st.caption("Check in Salesforce: " + links)
+                for match in item_duplicate_matches(entry, index, item):
+                    st.markdown(describe_duplicate_match(match))
             notes_line = []
             if result.get("record_id"):
                 notes_line.append(f"{result.get('object', 'Record')} `{result['record_id']}`")
@@ -3544,6 +3552,246 @@ def save_package_edits(path_text: str, entry_key: str, indexes: list[int]) -> No
     st.session_state["actions_notice"] = f"Saved changes to `{path.name}`."
 
 
+# --- Duplicate check on the Actions page ----------------------------------------
+DUPLICATE_CHECK_KEY = "outbox_duplicate_check"  # the last check's results, for this session
+DUPLICATE_CHECK_STATES = ("waiting", "withdrawn")  # the items checked; any state can be what they repeat
+DUPLICATE_CHECK_MAX_TOKENS = 2048  # room for a reasoning model (e.g. Qwen3) to think before it answers
+DUPLICATE_CANDIDATE_LIMIT = 12  # existing items shown to the model per checked item, same record first
+# A verdict on every candidate, not just a list of matches: small models then flag far fewer false duplicates.
+DUPLICATE_CHECK_SCHEMA = {
+    "type": "object",
+    "properties": {"verdicts": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"number": {"type": "integer"}, "same": {"type": "boolean"}, "reason": {"type": "string"}},
+        "required": ["number", "same", "reason"],
+    }}},
+    "required": ["verdicts"],
+}
+ITEM_KIND_NAMES = {"task": "Task", "note": "Note", "email": "Email", "update": "Next Step"}
+
+
+def outbox_item_key(entry: dict, index: int) -> str:
+    return f"{entry['path'].name}#{index}"
+
+
+def outbox_item_text(item: dict) -> str:
+    """What an item says, for the model: its kind, title and the start of its body."""
+    body = item.get("description") or item.get("body") or ""
+    text = f"{ITEM_KIND_NAMES.get(item.get('type'), 'Item')}: {staged_item_title(item)}"
+    return text + (f" — {truncate_text(body, 300)}" if body else "")
+
+
+def item_title_words(item: dict) -> set[str]:
+    """Key words of an item's title (a Next Step's value), as task subjects are compared."""
+    return task_subject_words(item.get("value", "") if item.get("type") == "update" else staged_item_title(item))
+
+
+def item_record_name(item: dict) -> str:
+    return str((item.get("related_to") or {}).get("name") or "").strip().lower()
+
+
+def outbox_items(entries: dict[str, list[dict]]) -> list[dict]:
+    """Every readable item in the outbox, in every state, with where it is."""
+    found = []
+    for state, group in entries.items():
+        for entry in group:
+            package = entry["package"] if isinstance(entry["package"], dict) else {}
+            for index, item in enumerate(package.get("items", [])):
+                if isinstance(item, dict) and item.get("type"):
+                    found.append({"key": outbox_item_key(entry, index), "state": state, "item": item,
+                                  "when": entry["when"], "text": outbox_item_text(item)})
+    return found
+
+
+def duplicate_candidates(checked: dict, others: list[dict], open_tasks: list[dict]) -> list[dict]:
+    """What a checked item might repeat: items of the same kind on the same record, or, when either has no
+    record, sharing a key word; tasks also against my open tasks in Salesforce. Same record first, newest first."""
+    item, record = checked["item"], item_record_name(checked["item"])
+    words = item_title_words(item)
+
+    def related(other_record: str, other_words: set[str]) -> int:
+        if record and other_record:
+            return 2 if record == other_record else 0
+        return 1 if words & other_words else 0
+
+    found = []
+    for other in others:
+        if other["key"] == checked["key"] or other["item"].get("type") != item.get("type"):
+            continue
+        if score := related(item_record_name(other["item"]), item_title_words(other["item"])):
+            found.append({"kind": "outbox", "score": score, "when": other["when"], "key": other["key"],
+                          "state": other["state"], "text": other["text"]})
+    if item.get("type") == "task":
+        for task in open_tasks:
+            if score := related(str(task.get("related") or "").strip().lower(), task_subject_words(task["subject"])):
+                found.append({"kind": "salesforce", "score": score, "when": None, "task": task,
+                              "text": f"Task: {task['subject']}"})
+    found.sort(key=lambda c: (-c["score"], -(c["when"].timestamp() if c["when"] else 0)))
+    return found[:DUPLICATE_CANDIDATE_LIMIT]
+
+
+def duplicate_check_messages(checked: dict, candidates: list[dict]) -> list[dict]:
+    record = (checked["item"].get("related_to") or {}).get("name") or "no record"
+    lines = "\n".join(f"{n}. {c['text']}" + (" (already in Salesforce)" if c["kind"] == "salesforce" else "")
+                      for n, c in enumerate(candidates, 1))
+    return [{"role": "user", "content": (
+        "You check a CRM outbox for duplicates. Below is a NEW item and a numbered list of EXISTING items.\n"
+        "An existing item is a duplicate only when it is the same action or says the same thing as the new item, "
+        "even in different words (e.g. 'Send revised pricing' and 'Email Jo the updated price list'). Different "
+        "actions on the same deal are NOT duplicates (e.g. 'Book kickoff workshop' and 'Send revised pricing'), nor "
+        "is a follow-up to an earlier action unless it repeats it.\n"
+        "For every existing item, say whether it is the same action (same: true or false) with a short reason.\n\n"
+        f"NEW item (on {record}):\n{checked['text']}\n\nEXISTING items:\n{lines}"
+    )}]
+
+
+def run_duplicate_check(entries: dict[str, list[dict]], model_name: str, chat=None, on_step=None) -> dict:
+    """Ask the model, for each Waiting and Withdrawn item, which of its shortlisted items it repeats.
+
+    A pair is asked about once. Results map each item key to its matches, both ways round, so the other
+    item shows the match too when it's on screen.
+    """
+    chat = chat or chat_with_ollama
+    items = outbox_items(entries)
+    open_tasks = reference_open_tasks()
+    checked_items = [i for i in items if i["state"] in DUPLICATE_CHECK_STATES]
+    by_key = {i["key"]: i for i in items}
+    matches: dict[str, list[dict]] = {}
+    asked: set[frozenset] = set()
+    errors, comparisons = [], 0
+    for number, checked in enumerate(checked_items, 1):
+        if on_step:
+            on_step(number, len(checked_items))
+        candidates = [c for c in duplicate_candidates(checked, items, open_tasks)
+                      if c["kind"] == "salesforce" or frozenset((checked["key"], c["key"])) not in asked]
+        if not candidates:
+            continue
+        asked.update(frozenset((checked["key"], c["key"])) for c in candidates if c["kind"] == "outbox")
+        comparisons += len(candidates)
+        try:
+            # Thinking off: a reasoning model judges these as well without it, and many times faster.
+            reply, _usage = chat(duplicate_check_messages(checked, candidates), model_name,
+                                 max_tokens=DUPLICATE_CHECK_MAX_TOKENS, temperature=0.0,
+                                 response_format=DUPLICATE_CHECK_SCHEMA, think=False)
+            found = [v for v in json.loads(reply).get("verdicts", []) if isinstance(v, dict) and v.get("same") is True]
+        except Exception as exc:  # one bad reply shouldn't stop the rest
+            errors.append(f"{checked['text'][:60]}: {exc}")
+            continue
+        for match in found:
+            try:
+                candidate = candidates[int(match["number"]) - 1]
+            except (KeyError, ValueError, TypeError, IndexError):
+                continue
+            reason = str(match.get("reason") or "").strip()
+            if candidate["kind"] == "salesforce":
+                matches.setdefault(checked["key"], []).append(
+                    {"kind": "salesforce", "task": candidate["task"], "reason": reason, "text": checked["text"]})
+                continue
+            other = by_key[candidate["key"]]
+            matches.setdefault(checked["key"], []).append(
+                {"kind": "outbox", "key": other["key"], "state": other["state"], "when": other["when"],
+                 "text": checked["text"], "other_text": other["text"], "reason": reason})
+            matches.setdefault(other["key"], []).append(
+                {"kind": "outbox", "key": checked["key"], "state": checked["state"], "when": checked["when"],
+                 "text": other["text"], "other_text": checked["text"], "reason": reason})
+    return {"when": datetime.datetime.now(), "model": model_name, "checked": len(checked_items),
+            "comparisons": comparisons, "open_tasks": len(open_tasks), "matches": matches, "errors": errors}
+
+
+def item_duplicate_matches(entry: dict, index: int, item: dict) -> list[dict]:
+    """The last check's matches for this item, unless it has been edited since."""
+    check = st.session_state.get(DUPLICATE_CHECK_KEY) or {}
+    text = outbox_item_text(item)
+    return [m for m in check.get("matches", {}).get(outbox_item_key(entry, index), []) if m["text"] == text]
+
+
+def describe_duplicate_match(match: dict) -> str:
+    if match["kind"] == "salesforce":
+        return f"⚠ **Looks like your open Salesforce task** {describe_open_task(match['task'])} — {match['reason']}"
+    where = f"{OUTBOX_STATES.get(match['state'], ('',))[0]} · {format_when(match['when'])}"
+    return f"⚠ **Looks like** “{truncate_text(match['other_text'], 120)}” ({where}) — {match['reason']}"
+
+
+def item_salesforce_links(item: dict) -> str:
+    """Links to check an item in Salesforce: the record it's on, and my open tasks on that record."""
+    name = (item.get("related_to") or {}).get("name") or ""
+    record = find_reference_record(name) if name else None
+    links = []
+    if record and str(record.get("url") or "").startswith("https://"):
+        links.append(f"[Open {record['name']} ↗]({record['url']})")
+    on = name.strip().lower()
+    tasks = [t for t in reference_open_tasks() if on and str(t.get("related") or "").strip().lower() == on]
+    if tasks:
+        shown = [f"[{truncate_text(t['subject'], 40)} ↗]({t['url']})" if str(t.get("url") or "").startswith("https://")
+                 else f"“{truncate_text(t['subject'], 40)}”" for t in tasks[:5]]
+        links.append(f"your open tasks on it: {', '.join(shown)}" + (f" and {len(tasks) - 5} more" if len(tasks) > 5 else ""))
+    return " · ".join(links)
+
+
+def duplicate_check_model_options() -> tuple[bool, list[str]]:
+    ok, installed = discover_ollama_models()
+    return ok, list(installed if ok and installed else SUGGESTED_OLLAMA_MODELS)
+
+
+def model_size(name: str) -> float:
+    """Billions of parameters from a model tag such as `qwen3:30b` or `llama3.2:3b` (0 if it doesn't say)."""
+    match = re.search(r"(\d+(?:\.\d+)?)b\b", name.lower())
+    return float(match.group(1)) if match else 0.0
+
+
+def persist_duplicate_check_model() -> None:
+    save_app_settings({"duplicate_check_model": st.session_state.get("duplicate_check_model")})
+
+
+def render_duplicate_check_panel(entries: dict[str, list[dict]]) -> None:
+    """Actions page: a button to check Waiting and Withdrawn items for duplicates, and the last check's summary."""
+    to_check = sum(1 for i in outbox_items(entries) if i["state"] in DUPLICATE_CHECK_STATES)
+    ok, models = duplicate_check_model_options()
+    if st.session_state.get("duplicate_check_model") not in models:
+        # Until one is chosen, the largest installed model: small ones judge duplicates poorly.
+        saved = load_app_settings().get("duplicate_check_model")
+        st.session_state["duplicate_check_model"] = saved if saved in models else max(models, key=model_size)
+    with st.container(border=True):
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            model = st.selectbox("Model", models, key="duplicate_check_model", on_change=persist_duplicate_check_model,
+                                 width=220, help="The local Ollama model that judges whether two items are the same. A larger model "
+                                 "(e.g. `qwen3:30b`) judges much better; a small one like `llama3.2:3b` misses "
+                                 "rewordings and flags different actions.")
+            clicked = st.button(
+                "🔍 Check for duplicates",
+                key="duplicate_check_run",
+                disabled=not ok or not to_check,
+                help="Compares each Waiting and Withdrawn item with the other items in the outbox (any tab) and, for "
+                "tasks, your open tasks in Salesforce. Items on the same record, or sharing a word when one has no "
+                "record, are shortlisted; the model then judges which say the same thing, even in other words. "
+                "Nothing is changed: likely duplicates are marked ⚠ for you to withdraw or keep.",
+            )
+        if not ok:
+            st.caption("Ollama isn't running, so the check can't run.")
+        if clicked:
+            bar = st.progress(0.0, text="Checking…")
+            st.session_state[DUPLICATE_CHECK_KEY] = run_duplicate_check(
+                entries, model, on_step=lambda n, total: bar.progress(n / total, text=f"Checking item {n} of {total}…"))
+            bar.empty()
+        check = st.session_state.get(DUPLICATE_CHECK_KEY)
+        if check:
+            flagged = sum(1 for i in outbox_items(entries) if i["state"] in DUPLICATE_CHECK_STATES
+                          and any(m["text"] == i["text"] for m in check["matches"].get(i["key"], [])))
+            st.caption(
+                f"Checked {check['checked']} Waiting and Withdrawn item{'s' if check['checked'] != 1 else ''} at "
+                f"{check['when']:%H:%M} with `{check['model']}`: {check['comparisons']} comparisons, against the "
+                f"outbox and your {check['open_tasks']} open Salesforce tasks. "
+                + (f"**⚠ {flagged} look{'s' if flagged == 1 else ''} like duplicates** (marked below)."
+                   if flagged else "No likely duplicates.")
+                + (f" **{len(check['errors'])} couldn't be checked:**" if check["errors"] else "")
+            )
+            for error in check["errors"]:
+                st.caption(f"Couldn't check {error}")
+        else:
+            st.caption(f"{to_check} Waiting and Withdrawn item{'s' if to_check != 1 else ''} to check. "
+                       "Each item also links to its record in Salesforce.")
+
+
 def render_actions_page() -> None:
     """Actions page (?page=actions): everything Agents sent to the outbox and what the connector did with it."""
     render_outbox_status(link=False)
@@ -3588,7 +3836,13 @@ def render_actions_page() -> None:
                 help="Clear the filter",
             )
         st.button("Refresh", icon=":material/refresh:", key="actions_refresh")
-    tabs = st.tabs([f"{OUTBOX_STATES[state][0]} ({len(entries[state])})" for state in OUTBOX_STATES])
+    render_duplicate_check_panel(entries)
+    check = st.session_state.get(DUPLICATE_CHECK_KEY) or {}
+    flagged = {state: sum(1 for i in outbox_items({state: entries[state]})
+                          if any(m["text"] == i["text"] for m in check.get("matches", {}).get(i["key"], [])))
+               for state in DUPLICATE_CHECK_STATES}
+    tabs = st.tabs([f"{OUTBOX_STATES[state][0]} ({len(entries[state])})"
+                    + (f" · ⚠ {flagged[state]}" if flagged.get(state) else "") for state in OUTBOX_STATES])
     for tab, state in zip(tabs, OUTBOX_STATES):
         with tab:
             shown = [entry for entry in entries[state] if outbox_entry_matches(entry, query)]
@@ -7967,10 +8221,12 @@ def chat_with_ollama(
     num_ctx: int | None = None,
     response_format: dict | None = None,
     on_progress=None,
+    think: bool | None = None,
 ) -> tuple[str, dict]:
     """Send a chat conversation to a local Ollama model and return (reply, usage).
 
     `response_format` is a JSON schema; Ollama then constrains the reply to match it.
+    `think=False` asks a reasoning model (e.g. Qwen3) to answer without thinking first; other models ignore it.
     The reply is streamed, so long answers have no overall time limit; `on_progress(tokens, seconds)`
     is called every LLM_PROGRESS_SECONDS with the tokens generated so far and the seconds since the
     first one (None while the model is still reading the prompt).
@@ -7992,6 +8248,8 @@ def chat_with_ollama(
     }
     if response_format:
         payload["format"] = response_format
+    if think is not None:
+        payload["think"] = think
 
     try:
         # (connect, longest wait between streamed pieces): a big prompt can take minutes before the first token.

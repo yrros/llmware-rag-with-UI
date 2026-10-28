@@ -433,6 +433,15 @@ The app never contacts another system. A separate connector (for example [rag-ac
 
 When a record needs choosing (an ambiguous or missing name), either choose it in the connector, which retries the package by itself, or correct **Related to** with **Edit** and press **Retry**. A package you withdraw also shows as withdrawn in the Agent box of the discussion that sent it.
 
+**Checking for duplicates.** Each item on the **Waiting** and **Withdrawn** tabs has a **Check in Salesforce** line: a link to the record it's on, and links to your open tasks on that record (from the connector's snapshot), so you can see what's already there. **🔍 Check for duplicates**, above the tabs, has your local model compare each Waiting and Withdrawn item with:
+
+- the other items in the outbox, in any tab (so the same task sent twice, or one already processed, shows up);
+- for tasks, your open tasks in Salesforce.
+
+Only likely pairs go to the model: items of the same kind on the same record, or sharing a key word when one has no record (up to 12 per item, same record first). The model gives a same/different verdict on each, judging by meaning, so *Send revised pricing* and *Email the updated price list* match but *Book kickoff workshop* doesn't. Likely duplicates are marked **⚠ Looks like …** under the item with what they match, where it is (or an **Open Task ↗** link) and the model's reason. The tab and the package heading show a ⚠ count too. Nothing is changed: withdraw or keep each one yourself. The results last for the session and disappear from an item once you edit it.
+
+Pick the **Model** beside the button. It starts on the largest model you have installed, because small ones judge poorly: in testing, `llama3.2:3b` missed rewordings and flagged different actions, while `qwen3:30b` got them right. Reasoning models are asked to answer without thinking, which is as accurate here and far faster (about 20 seconds for a handful of items with `qwen3:30b`).
+
 **Default location:** `outbox/` in the project folder, i.e. the folder you run Streamlit from, which is the project folder when you start with `start_app.sh` or the Desktop launcher. Change it under **Outbox** on the Prompt library page (saved as `outbox_path` in `app_settings.json`); the connector must read the same folder. The outbox is gitignored because sent drafts contain your notes, and `reset_rag.sh` leaves it alone.
 
 Each file is named `YYYYMMDD-HHMMSS-<note|task|email>-<first 8 characters of the package id>.json` and written atomically (a hidden `.<name>.tmp` file is renamed into place).
