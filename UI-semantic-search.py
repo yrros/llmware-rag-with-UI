@@ -835,6 +835,30 @@ def persist_search_filter() -> None:
     save_app_settings({"search_filter": current})
 
 
+def search_inputs() -> tuple[str, str]:
+    """What's typed to search with: the question and Find notes about."""
+    return st.session_state.get("question_text", ""), st.session_state.get("find_notes_query", "")
+
+
+def remember_search_inputs() -> None:
+    """Note what's typed, once the question box is drawn, so a rerun with the same text isn't a new search."""
+    st.session_state["filter_revealed_for"] = search_inputs()
+
+
+def reveal_filter_for_new_search(terms_by_field: dict[str, list[str]]) -> None:
+    """Open Narrow by terms, and the folded fields holding terms, when a new search starts with a filter set.
+
+    A new search is a changed question or Find notes about text, or a Search or Find notes click (read from
+    their keys, as the buttons come after the filter). In between, the boxes stay as you left them.
+    """
+    clicked = st.session_state.get("search_button") or st.session_state.get("find_notes_button")
+    if any(terms_by_field.values()) and (clicked or search_inputs() != st.session_state.get("filter_revealed_for")):
+        st.session_state["narrow_by_terms"] = True
+        for field, terms in terms_by_field.items():
+            if field != "all" and terms:
+                st.session_state[f"filter_fold_{field}"] = True
+
+
 # Quick date buttons under Must include. Notes carry their date as 2026-10-25, and weekly notes are headed
 # "Week#43"; ISO weeks (Monday to Sunday) and ISO week-years, so 29 Dec 2025 is in 2026 Week#1.
 QUICK_DATE_LABELS = {
@@ -9599,14 +9623,17 @@ with filter_box_col:
         }
         st.html(FILTER_FIELD_STYLE)
         # On the Semantic route the terms only narrow which notes are searched, so they're folded away.
-        set_terms = [
-            t for field in SEARCH_FILTER_FIELDS
-            for t in st.session_state.get(f"filter_{field}", _saved_filter.get(field, []))
-        ]
+        terms_by_field = {
+            field: st.session_state.get(f"filter_{field}", _saved_filter.get(field, [])) for field in SEARCH_FILTER_FIELDS
+        }
+        set_terms = [t for terms in terms_by_field.values() for t in terms]
+        if not exact_text_only:  # a filter set when you start a new search is shown, not folded away
+            reveal_filter_for_new_search(terms_by_field)
         terms_area = st.container() if exact_text_only else st.expander(
             "Narrow by terms" + (f" · {len(set_terms)} set ({truncate_text(', '.join(set_terms), 40)})" if set_terms else ""),
             key="narrow_by_terms",
             icon=":material/filter_alt:",
+            on_change="rerun",
         )
         with terms_area:
             for field, (label, field_help) in FILTER_WIDGETS.items():
@@ -9622,6 +9649,7 @@ with filter_box_col:
                 field_box = st.expander(
                     label + (f" · {len(field_terms)}: {truncate_text(', '.join(field_terms), 40)}" if field_terms else ""),
                     key=f"filter_fold_{field}",
+                    on_change="rerun",
                 ) if folded else st.container(border=True, gap="xsmall", key=f"filter_field_{field}")
                 with field_box:
                     render_filter_heading(field, label, (
@@ -9825,6 +9853,7 @@ with ask_box_col:
                     on_change=persist_question,
                     label_visibility="collapsed",
                 )
+                remember_search_inputs()
             install_select_question_on_focus()  # no visible part: after the box, so it adds no gap above it
             render_injected_prompt_token(prompt_library)
             # Top to bottom: title, Answer with LLM and links → question → prompt library → model details → Search.
@@ -9908,6 +9937,7 @@ with ask_box_col:
             search_clicked = st.button(
                 f"🔍 Ask (filtered only){literal_count}" if exact_text_only else "🔍 Search",
                 type="primary",
+                key="search_button",
                 use_container_width=True,
                 help="Uses the route chosen in the Filter box: "
                 + (

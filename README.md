@@ -263,7 +263,7 @@ The search area is split into a **Filter** box (left) and an **Ask** box (right)
 
 | Route | What **Search** does | Settings shown |
 |-------|----------------------|----------------|
-| **Semantic (meaning)** | Ranks passages by meaning using the embeddings. Filter terms narrow which notes it looks in. | **Find notes about** (below), the filter folded into **Narrow by terms** (its title says how many terms are set), **Distance cutoff** (how close a match must be) and, after a search, the match bar. |
+| **Semantic (meaning)** | Ranks passages by meaning using the embeddings. Filter terms narrow which notes it looks in. | **Find notes about** (below), the filter folded into **Narrow by terms** (its title says how many terms are set; when terms are set it opens, with any **Any of** and **Exclude** fields holding terms, as you start a new search: a new question or **Find notes about** text, or a **Search** or **Find notes** click, and stays as you left it in between), **Distance cutoff** (how close a match must be) and, after a search, the match bar. |
 | **Literal (exact text)** — button reads **Ask (filtered only)** | Returns the notes that match the filter terms, in full. Much faster; the question is only used for the LLM answer. | **Search all libraries**, **🔎 Filter search only**, **🔄 Rescan → Filter search**. |
 
 **In scope: gather across searches, then ask.** Each route has its colour: **Semantic** blue, **Literal** orange. The route switch shows both (the chosen one a few shades deeper) and the Filter box takes the chosen route's tint.
