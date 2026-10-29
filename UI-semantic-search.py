@@ -982,6 +982,10 @@ def route_tint_style(route: str) -> str:
 
 # Filter fields as small rounded boxes, and their quick dates and quick terms as rounded chips.
 FILTER_FIELD_STYLE = """<style>
+.st-key-filter_box .st-key-clear_all button[data-testid] { border: 1px solid #e5484d !important; color: #e5484d !important; }
+.st-key-filter_box .st-key-clear_all button[data-testid]:hover {
+  border-color: #e5484d !important; background: color-mix(in srgb, #e5484d 14%, transparent) !important;
+}
 [class*="st-key-filter_field_"] { padding: 0.45rem 0.7rem 0.6rem !important; border-radius: 0.75rem !important; }
 [class*="st-key-quick_date_"] button, [class*="st-key-quick_term_"] button {
   border: 1px solid color-mix(in srgb, currentColor 28%, transparent) !important;
@@ -8999,6 +9003,22 @@ def clear_search_results() -> None:
     st.session_state.pop(LAST_SEARCH_KEY, None)
 
 
+def clear_all_search_page() -> None:
+    """Clear all button: filter, exclusions, results and discussion, the question, Find notes about and the
+    injected task prompts. Settings (route, Max results, model, toggles) stay."""
+    clear_search_filter()
+    clear_search_results()
+    for field in SEARCH_FILTER_FIELDS:
+        st.session_state[f"searched_dates_{field}"] = []
+    st.session_state["question_text"] = ""
+    persist_question()
+    st.session_state["find_notes_query"] = ""
+    st.session_state[ACTIVE_TASK_PROMPTS_KEY] = []
+    st.session_state.pop("question_task_token", None)
+    for key in [key for key in st.session_state if str(key).endswith("_follow_up_text")]:
+        del st.session_state[key]
+
+
 def perform_search(
     search_lib: Library,
     prompt_text: str,
@@ -9552,7 +9572,9 @@ filter_box_col, ask_box_col = (st.container(), st.container()) if pick_ref is no
 
 with filter_box_col:
     with st.container(border=True, key="filter_box"):
-        title_col, clear_filter_col, clear_results_col = st.columns([2.4, 1.2, 1.2], vertical_alignment="center")
+        title_col, clear_filter_col, clear_results_col, clear_all_col = st.columns(
+            [1.6, 1.2, 1.2, 1], vertical_alignment="center"
+        )
         title_col.markdown("**Filter**")
         clear_filter_col.button(
             "Clear Filter",
@@ -9567,6 +9589,15 @@ with filter_box_col:
             disabled=not (gathered_notes(safe_lib) or st.session_state.get(LAST_SEARCH_KEY)),
             help="Clear the gathered notes and the last results, so **Search** looks through the whole library "
             "again. Filter terms and exclusions stay.",
+        )
+        clear_all_col.button(
+            "Clear all",
+            key="clear_all",
+            on_click=clear_all_search_page,
+            use_container_width=True,
+            help="Start the page afresh: clears the filter, exclusions, results and discussion, your question, "
+            "**Find notes about** and any injected task prompt. Settings such as the route, **Max results** and "
+            "the model stay.",
         )
         # Two routes into the notes: semantic (vector) search or literal text matching. The controls below
         # follow the route; the Ask box's Search button uses it too.
