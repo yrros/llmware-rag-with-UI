@@ -9702,13 +9702,6 @@ with filter_box_col:
                         placeholder="Type a term, press Enter",
                         label_visibility="collapsed",
                     )
-        if not exact_text_only:  # under the terms, so you can narrow first
-            find_clicked = st.button(
-                "🔎 Find notes",
-                key="find_notes_button",
-                use_container_width=True,
-                help="Lists the notes about what's in **Find notes about**, within **Narrow by terms** if set.",
-            )
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
         if "max_results" not in st.session_state:  # saved between searches and sessions
             st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
@@ -9819,6 +9812,13 @@ with filter_box_col:
                 )
                 distance_threshold = float(st.session_state[_cutoff_key])
                 distance_map_slot = st.container()
+                # Last in the box, under every setting it uses.
+                find_clicked = st.button(
+                    "🔎 Find notes",
+                    key="find_notes_button",
+                    use_container_width=True,
+                    help="Lists the notes about what's in **Find notes about**, within **Narrow by terms** if set.",
+                )
         # Scripts with no visible part: last in the Filter box, so their empty slots don't open gaps between rows.
         install_filter_commit_on_blur()
         install_tooltip_hide_on_click()
