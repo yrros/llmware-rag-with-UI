@@ -300,7 +300,7 @@ The Ask box reads top to bottom: a title line with **Ask**, **Answer with LLM** 
 - **Progress** shows right under **Search**: a spinner with the elapsed time while searching and answering, and beside it the generation speed (tokens per second and tokens so far), refreshed every 3 seconds. Answers stream from Ollama, so there's no overall time limit. The answer caption ends with the final tokens per second.
 - **Speed score.** After each answer the model's speed is saved (`llm_speed` in `app_settings.json`, per model) and shown under **Search** between runs, e.g. *Last run with `qwen3:30b` (25 Oct 10:42): 12.4 tokens/s · 10,000 tokens ≈ 13 min 26 s*, for whichever model is selected.
 - Search runs first; Ollama summarises the retrieved chunks—it does not replace retrieval.
-- While the LLM is working (an answer, a Discussion follow-up or an Agent step), a **Cancel** button floats at the bottom of the window wherever you've scrolled. It stops the request within about half a second, even while the model is still reading the notes, and Ollama stops generating. Change the task, prompts or filter and run it again.
+- While the LLM is working (an answer, a Discussion follow-up or an Agent step), an orange **Cancel Query** button floats at the bottom of the window wherever you've scrolled. It stops the request within about half a second, even while the model is still reading the notes, and Ollama stops generating. Change the task, prompts or filter and run it again.
 - **Folder paths.** Each result gets its note's folder path from where the file sits under the notes folder, e.g. *Clients > Prospects > Acme*. It's shown on the note in **Sources** and given to the LLM with every passage (`[Source 2: Kickoff-2026-10-20.md, in Clients > Prospects > Acme]`), so the model knows what each note is about even for passages that don't include its title. No rebuild is needed. When two notes in a library share a file name, the path is left out rather than guessed. Local Apple Notes Export can also put the path in each note's title line (its *Folder path in titles* option), which puts it in the indexed text for search, after a rescan and re-embed.
 
 ### Prompt library
@@ -327,6 +327,9 @@ Open it with the **Prompt library** button in the left panel (hover it for a sum
 | **Steps 2, 3, …** | Optional. Each has a short name and a prompt, e.g. *Select tasks* ("List the tasks again and ask which to send") or *Set due dates*. They become one-click buttons in the Discussion panel. **Add step**, reorder with the arrows, remove with ✕. |
 | **Output** | What the Agent sends: **Note**, **Tasks** or **Email** (the box next to **Agent**). |
 | **Action Command** | The last step, e.g. *Send to tasks in Salesforce*. It's the instruction used to stage the result. |
+| **Actioned mark** | Tracks which notes this Agent has actioned (see [Actions log](#actions-log)). Type it into a note in Apple Notes to log something done by hand. Empty means `[<Agent name>]`, e.g. `[SF_Tasks]`. |
+
+**Agent Semantic Fixes** (below the Agent prompts, blue outline) are facts that repair what Agents send, e.g. *Joseph Oliver is known as J-O*. Each is a large text box, saved as you type, with the date it was added (and last edited); ✕ removes one. They're used only by **Re-assess** on the Actions page (see [Fixing an item with context](#fixing-an-item-with-context)), not when Agents stage records. They're kept in `prompt_library.json`, so they're included in a settings export.
 
 A prompt can be Global or Agent, not both. Prompt libraries saved before Agent workflows existed are upgraded on load: prompts already set to draft a note, tasks or an email become Agents with no middle steps and a default Action Command (*Create these as tasks*, *Save this as a note* or *Draft this as an email*).
 
@@ -421,7 +424,20 @@ The app never contacts another system. A separate connector (for example [rag-ac
 
 **Outbox status line.** The top of every page shows, e.g., *Outbox: 2 waiting (7 items) · 1 needs attention · Last processed 25 Oct 10:42 · Last error 24 Oct 18:03 · Open Actions*. "Waiting" counts packages not yet picked up and the records in them; "needs attention" counts packages in `failed/`, including items held for you to choose a record; the dates come from the connector's receipts.
 
-**Actions page.** **Open Actions** at the end of the status line opens `?page=actions` in a new tab: everything in the outbox, newest first, in four tabs — **Needs attention** (packages in `failed/`, opened up), **Waiting**, **Processed** and **Withdrawn**. Each package shows the Agent that sent it, its library, question, model and source notes, the connector's overall result, and every record with its outcome: the record ID it created, or why it didn't (with possible matches when a name was ambiguous). Filter by any text, e.g. a subject, owner or client name; **Refresh** re-reads the folder. Under the title, **Task executor** links to the service that processes the outbox (set in **Task executor settings** on the **Configure** page), with 🟢 running / 🔴 not running.
+**Actions page.** **Open Actions** at the end of the status line opens `?page=actions` in a new tab: everything in the outbox, newest first, in four tabs — **Needs attention** (packages in `failed/`, opened up), **Waiting**, **Processed** and **Withdrawn** — plus the [Actions log](#actions-log). Each package shows the Agent that sent it, its library, question, model and source notes, the connector's overall result, and every record with its outcome: the record ID it created, or why it didn't (with possible matches when a name was ambiguous). Filter by any text, e.g. a subject, owner or client name; **Refresh** re-reads the folder. Under the title, **Task executor** links to the service that processes the outbox (set in **Task executor settings** on the **Configure** page), with 🟢 running / 🔴 not running.
+
+#### Actions log
+
+The **Actions log** tab on the Actions page tracks which notes each Agent has actioned, so you can tell what's already in Salesforce:
+
+- **Sent (⏳).** **That's right** logs every note in use against each Agent that staged items from it.
+- **Done (✓).** Once the connector's receipt says at least one of that Agent's items was created, updated or already existed, the entry is done, with a link to the record.
+- **Failed (⚠) or withdrawn (↩).** The package failed, or was withdrawn or deleted on the Actions page. A retried package that then goes through becomes done.
+- **Done by hand (✓, mark).** Type an Agent's **Actioned mark** (set on its card in the Prompt library, `[SF_Tasks]` by default) anywhere in a note in Apple Notes. Once the exporter has exported the note and a rescan (auto or manual) has indexed it, the note is logged as done by that Agent. Marks escaped by a Markdown export, such as `\[SF\_Tasks\]`, count too. The entry stays if you later remove the mark.
+
+Nothing is written back to Apple Notes or the exported files. In search results and the in-scope list, each note's title shows its Agents (` · ✓ SF_Tasks`), and opening it shows how and when, with a link to the record. The **Actioned** control under **Max results** in the Filter box shows **All notes**, **Not yet actioned** or **Only actioned**, by any Agent or one. It applies to every search route, and the filter line shows it. Sent and done count as actioned; failed and withdrawn don't.
+
+On the tab, filter by Agent, status or note name, select rows to delete them (a note still holding its mark is logged again on the next scan), or **Scan notes for marks now** to look without waiting for a rescan. Marks are looked for in every visible corpus (hidden ones are skipped) when a corpus has been rescanned since its last scan or when a mark changes. The log is kept in `llmware_data/actions_log.json`. Back it up and restore it under **Advanced — Actions log** in the sidebar.
 
 **Getting back.** On every screen other than the main one (the Prompt library, the Actions page and the Salesforce Connector app) the 🧠 before the title takes you back to the main screen in the same tab.
 
@@ -432,6 +448,17 @@ The app never contacts another system. A separate connector (for example [rag-ac
 | **Restore** | Withdrawn | Moves the package back to the outbox for a connector to process. |
 | **Delete** | Withdrawn | Deletes the package and its receipt for good, after you confirm. **Delete all** at the top of the tab does the same for every withdrawn package listed (only those matching the filter, when there is one). Only files in `outbox/withdrawn/` can be deleted. |
 | **Edit** | Waiting, Needs attention, Withdrawn | Opens the package's items for editing: subject or title, description or body, due date, priority, owner, recipients and **Related to**. **Save changes** checks the package against the schema and rewrites the file atomically, keeping its id (so nothing is ever created twice). Use it to add a marker such as `[TEST]` to find records easily, or to fix a name the connector couldn't match, then **Retry**. On a partly done package, records already created aren't shown, since editing them wouldn't change the other system. If a connector picks the package up while you edit, nothing is saved. |
+
+#### Fixing an item with context
+
+Every item that can still be edited (on **Needs attention**, **Waiting** and **Withdrawn**, and not already created) has a **Fix with context** switch. It opens an inline panel:
+
+1. **Extra context.** Type what the model needs to know, e.g. *Joseph Oliver is known as J-O*.
+2. **Re-assess** is a dry run. The model gets the item, the connector's message about it, your context, every Agent Semantic Fix and the package's source notes, re-read from disk (up to 8,000 characters shared between them). It returns the item corrected, changing only what that information shows is wrong, with a one-line reason. The panel lists each change as old → new. Nothing is saved yet. It uses the **Model** picked for the duplicate check at the top of the page.
+3. **Apply and retry** saves the changes in the package (checked against the schema, same package id) and sends it back to the outbox for the connector's next run. A withdrawn package goes back too, and records already created aren't created twice. **Discard** drops the proposal.
+4. If you typed context, a pop-up then offers to add it to **Agent Semantic Fixes**, editable first, so the next Re-assess knows it without retyping.
+
+In testing, `llama3.2:3b` and `qwen3:30b` both turned an owner of *J-O* into *Joseph Oliver* from a saved fix and changed nothing else.
 
 When a record needs choosing (an ambiguous or missing name), either choose it in the connector, which retries the package by itself, or correct **Related to** with **Edit** and press **Retry**. A package you withdraw also shows as withdrawn in the Agent box of the discussion that sent it.
 
@@ -458,6 +485,7 @@ Each file is named `YYYYMMDD-HHMMSS-<note|task|email>-<first 8 characters of the
 | Manage corpus visibility | Global | Hides corpora from the library list **and** from every all-corpora scan and rebuild, including auto-rescan. A hidden corpus keeps its index as it was; select it to rescan it on its own. Only applies while **Enable corpus hiding** is ticked. |
 | Embedding engine | Per corpus | Changing model requires **Re-index** after acknowledging the warning. |
 | Relevance cutoff (distance) | Per corpus | Lower = stricter matches. Saved per corpus; no re-embed needed. |
+| Back up / restore actions log | Global | Under **Advanced — Actions log**. **Back up actions log** downloads the log as JSON (`llm-notes-actions-log/v1`). **Restore** reads a backup: **Merge** adds entries you don't have, **Replace** swaps the log for it. Either way the log as it was is saved to `llmware_data/backups/` first, and marks are scanned again. The log isn't in the Configure page's settings export, because it names notes. |
 | Debug details | Per session | Paths, file counts, index health |
 
 ### Rescan vs Re-index
@@ -492,6 +520,7 @@ llmware_data/
 ├── job_status.json       # Last scan summary per corpus
 ├── app_settings.json     # Global settings (GPU toggle, auto-rescan, corpus root…)
 ├── text_rescan_status.json  # When each corpus's text index was last rescanned
+├── actions_log.json      # Which notes each Agent has actioned (Actions log)
 └── prompt_library.json   # About me, task and global prompts
 ```
 
@@ -523,6 +552,7 @@ On first run, the app may copy data from the legacy location `~/llmware_data/` i
 - `auto_rescan_all_corpora` — default `false`; auto-rescan every visible corpus instead of just the selected one
 - `hide_corpora_enabled` — default `false`; hide corpora marked `hidden` in `corpus_settings.json` from the library list and all-corpora scans
 - `outbox_path` — folder that sent drafts are written to; empty means `outbox/` in the project folder
+- `actioned_filter` — the Filter box's **Actioned** control: `mode` (`all`, `hide` or `only`) and `agent` (a prompt id, or empty for any Agent)
 - `llm_speed` — per Ollama model, the tokens per second of its last answer (with when, and how many tokens), shown under **Search** as the time for 10,000 tokens
 
 ### In-app constants (`UI-semantic-search.py`)
