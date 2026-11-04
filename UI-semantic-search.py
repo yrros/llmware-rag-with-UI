@@ -10,6 +10,10 @@ import threading
 import datetime
 import difflib
 import html
+import http.client
+import itertools
+import queue
+import socket
 import uuid
 from contextlib import contextmanager
 from functools import lru_cache
@@ -114,6 +118,10 @@ FOLLOW_UP_NUM_CTX = 8192
 # the model isn't reloaded for every small change; bigger windows use more memory.
 OLLAMA_CONTEXT_SIZES = (8192, 16384, 32768, 65536)
 LLM_PROGRESS_SECONDS = 3  # how often the tokens-per-second count refreshes while an answer streams
+# How often the page is touched while waiting on Ollama: Streamlit only acts on a click (Cancel) when the
+# running script updates the page.
+LLM_TICK_SECONDS = 0.5
+LLM_CANCELLED_KEY = "llm_cancelled"
 # Max tokens: up to roughly a short novel. English runs at about 0.75 words per token.
 WORDS_PER_TOKEN = 0.75
 LLM_MAX_TOKENS_LIMIT = 50000
@@ -1661,17 +1669,20 @@ def mark_prompt_used(prompt_id: str) -> None:
 
 
 def select_prompt_stacks(library: dict) -> tuple[list[dict], list[dict]]:
-    """Five most recently used task prompts, then the most recently used starred ones not already listed."""
+    """Five most recently used task prompts, and every starred one, most recently used first.
+
+    The Ask panel leaves out of its starred rows only the prompts its Recent row actually shows, so a
+    starred prompt never vanishes because Recent ran out of room.
+    """
     task_prompts = [p for p in library["prompts"] if not p.get("global")]
     recent = sorted(
         (p for p in task_prompts if p.get("last_used")), key=lambda p: p["last_used"], reverse=True
     )[:PROMPT_STACK_SIZE]
-    recent_ids = {p["id"] for p in recent}
     starred = sorted(
-        (p for p in task_prompts if p.get("starred") and p["id"] not in recent_ids),
+        (p for p in task_prompts if p.get("starred")),
         key=lambda p: (p.get("last_used") or "", p.get("created") or ""),
         reverse=True,
-    )[:PROMPT_STACK_SIZE]
+    )
     return recent, starred
 
 
@@ -4240,7 +4251,7 @@ def render_prompt_card(
                     key=f"prompt_starred_{prompt_id}",
                     on_change=save_prompt_field,
                     args=(prompt_id, "starred"),
-                    help="Starred prompts fill the Ask panel's Starred row.",
+                    help="Starred prompts fill the Ask panel's Starred row (Agents: its Agent Starred row).",
                 )
                 st.checkbox(
                     "Agent",
@@ -4934,7 +4945,7 @@ def render_prompt_library_page() -> None:
             )
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.checkbox("Global", key="new_prompt_global", help="Send with every LLM request in every corpus.")
-                st.checkbox("Starred", key="new_prompt_starred", help="Show it in the Ask panel's Starred row.")
+                st.checkbox("Starred", key="new_prompt_starred", help="Show it in the Ask panel's Starred row (Agents: its Agent Starred row).")
                 st.checkbox(
                     "Agent",
                     key="new_prompt_agent",
@@ -5100,13 +5111,13 @@ PROMPT_CHIP_STYLE = """<style>
 PROMPT_ROW_CHARS = 52  # about what fits on the Recent or Starred row after its label; chips that don't are left out
 
 
-def fit_prompt_chips(prompts: list[dict]) -> list[tuple[dict, str]]:
+def fit_prompt_chips(prompts: list[dict], row_chars: int = PROMPT_ROW_CHARS) -> list[tuple[dict, str]]:
     """(prompt, chip label) for as many prompts as fit on one line, in order, skipping any that would overflow."""
     shown, width = [], 0
     for prompt in prompts:
         label = truncate_text(agent_prompt_label(prompt), 34 if is_agent_prompt(prompt) else 28)
         cost = len(label) + 4  # a chip's padding and the gap
-        if width + cost <= PROMPT_ROW_CHARS:
+        if width + cost <= row_chars:
             shown.append((prompt, label))
             width += cost
     return shown
@@ -5166,19 +5177,29 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict, safe_lib: str = 
                     )
 
         recent, starred = select_prompt_stacks(library)
-        for title, prompts in (("Recent", recent), ("Starred", starred)):
-            if not prompts:
+        recent_chips = fit_prompt_chips(recent)
+        in_recent = {prompt["id"] for prompt, _label in recent_chips}
+        starred = [prompt for prompt in starred if prompt["id"] not in in_recent]
+        # The longer "Agent Starred:" label leaves less room for chips.
+        agent_row_chars = PROMPT_ROW_CHARS - (len("Agent Starred") - len("Starred"))
+        rows = (
+            ("Recent", recent_chips),
+            ("Starred", fit_prompt_chips([p for p in starred if not is_agent_prompt(p)])),
+            ("Agent Starred", fit_prompt_chips([p for p in starred if is_agent_prompt(p)], agent_row_chars)),
+        )
+        for title, chips in rows:
+            if not chips:
                 continue
             with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
                 st.caption(f"{title}:", width="content")
                 # Only what fits on this line; the rest are in Find a prompt.
-                for prompt, label in fit_prompt_chips(prompts):
+                for prompt, label in chips:
                     is_active = prompt["id"] in active_ids
                     agent = is_agent_prompt(prompt)
                     st.button(
                         label,
                         # Agent keys pick up the blue border style above.
-                        key=f"use_{'agent_' if agent else ''}prompt_{title}_{prompt['id']}",
+                        key=f"use_{'agent_' if agent else ''}prompt_{title.replace(' ', '')}_{prompt['id']}",
                         help=(f"**Agent** — ends by sending {OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()} "
                               f"to the outbox: *{agent_command(prompt)}*\n\n" if agent else "") + prompt["text"],
                         type="primary" if is_active else "secondary",
@@ -6131,6 +6152,23 @@ def render_follow_up_discussion(
     return model_name
 
 
+def sticky_follow_up_style(box_key: str) -> str:
+    """CSS that keeps the follow-up box in view while a long answer beside it is scrolled.
+
+    A sticky element only travels within its parent, so the Discussion column is stretched to the full
+    height of the answer column first. The box gets the page background so text scrolling under it is hidden.
+    """
+    background = "#0e1117" if st.context.theme.type == "dark" else "#ffffff"
+    # A column holds one .stVerticalBlock; the keyed box (or the wrapper carrying its key) sits directly in it.
+    column = f'[data-testid="stColumn"]:has(> .stVerticalBlock > .st-key-{box_key})'
+    return f"""<style>
+[data-testid="stHorizontalBlock"]:has({column}) {{ align-items: stretch; }}
+{column} {{ align-self: stretch; }}
+{column} > .stVerticalBlock {{ height: 100%; }}
+.st-key-{box_key} {{ position: sticky; top: 4.25rem; z-index: 5; background: {background}; }}
+</style>"""
+
+
 def render_discussion_body(
     search_state: dict,
     model_name: str,
@@ -6181,7 +6219,9 @@ def render_discussion_body(
                             )
 
     render_follow_up_context(search_state, key_prefix)
-    with st.container(border=True):
+    if not in_dialog:
+        st.html(sticky_follow_up_style(f"{key_prefix}_follow_up_box"))
+    with st.container(border=True, key=f"{key_prefix}_follow_up_box"):
         # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
         with st.container(horizontal=True, vertical_alignment="center"):
             st.markdown("Ask a follow-up", width="stretch")
@@ -6235,8 +6275,11 @@ def show_discussion_dialog(
     )
 
 
-def render_library_counts(search_state: dict) -> None:
-    """Per-library match counts for all-library searches, with buttons to switch library."""
+def render_library_counts(search_state: dict, key_prefix: str = "results") -> None:
+    """Per-library match counts for all-library searches, with buttons to switch library.
+
+    `key_prefix` keeps button keys unique when the gathered notes and an answer both show counts.
+    """
     library_counts = search_state.get("library_counts") or []
     results = search_state["results"]
     if library_counts:
@@ -6253,7 +6296,7 @@ def render_library_counts(search_state: dict) -> None:
                 name_col.markdown(f"**{library}** — {count} note(s)")
                 button_col.button(
                     "Use library",
-                    key=f"use_library_{library}",
+                    key=f"use_library_{key_prefix}_{library}",
                     on_click=switch_to_library,
                     args=(library,),
                     disabled=library == st.session_state.get("selected_library"),
@@ -6270,7 +6313,7 @@ def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str, p
     keys = list(reversed(gathered["notes"]))
     results = [block for key in keys for block in gathered["notes"][key]["blocks"]]
     routes = {key: gathered["notes"][key]["route"] for key in keys}
-    render_library_counts({"library_counts": gathered["library_counts"], "results": results})
+    render_library_counts({"library_counts": gathered["library_counts"], "results": results}, key_prefix="gathered")
 
     notes: dict[tuple[str, str], list[dict]] = {}
     for result in results:
@@ -6721,24 +6764,28 @@ def render_agent_panel(
                             temperature, corpus_prompt, sent_text=step["text"],
                         ):
                             st.rerun()
-        st.caption(
-            "Reply in the discussion to pick items (e.g. *Yes:1,2,3 ignore 4,5,6*), set dates and answer questions. "
-            f"When it's right, stage the {item_kind}. Untick notes under Sources to narrow what the LLM uses."
-        )
-        snapshot = load_reference_snapshot()
-        if snapshot:
-            refreshed = datetime.datetime.fromisoformat(snapshot["generated_at"]).strftime("%d %b %H:%M")
+        # Guidance, folded so the step buttons and Execute stay close together.
+        with st.expander("How it works", expanded=False):
             st.caption(
-                f"Reference: {len(reference_records())} {snapshot.get('scope', 'records')} from "
-                f"{snapshot.get('source', 'the connector')} ({snapshot.get('target', '?')}), refreshed {refreshed}. "
-                "The Agent uses their exact names; refresh it from the task executor."
+                "Reply in the discussion to pick items (e.g. *Yes:1,2,3 ignore 4,5,6*), set dates and answer "
+                f"questions. When it's right, stage the {item_kind}. Untick notes under Sources to narrow what "
+                "the LLM uses."
             )
-        else:
-            st.caption("No reference snapshot yet: the task executor can refresh one so the Agent uses real record names.")
+            snapshot = load_reference_snapshot()
+            if snapshot:
+                refreshed = datetime.datetime.fromisoformat(snapshot["generated_at"]).strftime("%d %b %H:%M")
+                st.caption(
+                    f"Reference: {len(reference_records())} {snapshot.get('scope', 'records')} from "
+                    f"{snapshot.get('source', 'the connector')} ({snapshot.get('target', '?')}), refreshed "
+                    f"{refreshed}. The Agent uses their exact names; refresh it from the task executor."
+                )
+            else:
+                st.caption(
+                    "No reference snapshot yet: the task executor can refresh one so the Agent uses real record names."
+                )
         if st.button(
-            label,
+            f"Execute :material/smart_toy: {label} with context",
             key="agent_run",
-            icon=":material/smart_toy:",
             use_container_width=True,
             help=(
                 "**Action Command" + ("s" if several else "") + ":** "
@@ -8311,6 +8358,77 @@ def answer_with_ollama(
     )
 
 
+# Cancel floats at the bottom centre of the window, wherever the page is scrolled to.
+LLM_CANCEL_STYLE = """<style>
+[class*="st-key-llm_cancel_"] {
+  position: fixed !important; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+  width: auto !important; z-index: 1000;
+}
+[class*="st-key-llm_cancel_"] button { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); }
+</style>"""
+_LLM_CANCEL_KEYS = itertools.count()  # one Cancel per LLM call; restarts each script run
+
+
+def cancel_llm() -> None:
+    st.session_state[LLM_CANCELLED_KEY] = True
+
+
+def show_llm_cancel_button():
+    """A floating Cancel for the LLM call about to run; returns its slot, to clear when the call ends.
+
+    Clicking it reruns the script, which stops the call at its next page update (see LLM_TICK_SECONDS).
+    """
+    slot = st.empty()
+    with slot.container(key=f"llm_cancel_{next(_LLM_CANCEL_KEYS)}"):
+        st.html(LLM_CANCEL_STYLE)
+        st.button(
+            "Cancel",
+            icon=":material/stop_circle:",
+            type="primary",
+            on_click=cancel_llm,
+            help="Stop the LLM now, e.g. to change the task or prompts and run it again.",
+        )
+    return slot
+
+
+class OllamaChatStream:
+    """POST /api/chat on a worker thread, putting each streamed line on `lines`.
+
+    The script thread stays free to update the page (so Streamlit can act on Cancel), and `close` can cut
+    the connection at any point, even while Ollama is still reading the prompt; Ollama stops generating
+    when its client goes away.
+    """
+
+    def __init__(self, host: str, port: int, payload: dict):
+        self.conn = http.client.HTTPConnection(host, port, timeout=10)
+        self.conn.connect()  # here, so close() always has a socket to cut
+        self.conn.sock.settimeout(900)  # longest wait between streamed pieces: a big prompt can take minutes
+        self.lines: queue.Queue = queue.Queue()
+        threading.Thread(target=self._run, args=(payload,), daemon=True).start()
+
+    def _run(self, payload: dict) -> None:
+        try:
+            self.conn.request(
+                "POST", "/api/chat", body=json.dumps(payload), headers={"Content-Type": "application/json"}
+            )
+            response = self.conn.getresponse()
+            if response.status != 200:
+                self.lines.put(("http_error", (response.status, response.read(500).decode(errors="replace"))))
+                return
+            for line in response:
+                self.lines.put(("line", line))
+            self.lines.put(("end", None))
+        except Exception as exc:
+            self.lines.put(("error", exc))
+
+    def close(self) -> None:
+        try:
+            self.conn.sock and self.conn.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.conn.close()
+
+
 def chat_with_ollama(
     messages: list[dict],
     model_name: str,
@@ -8330,16 +8448,14 @@ def chat_with_ollama(
     The reply is streamed, so long answers have no overall time limit; `on_progress(tokens, seconds)`
     is called every LLM_PROGRESS_SECONDS with the tokens generated so far and the seconds since the
     first one (None while the model is still reading the prompt).
+    A floating Cancel shows while the call runs; clicking it stops the call and closes the connection.
     """
-    import requests
-
     options = {
         "temperature": temperature,
         "num_predict": max_tokens,
         "num_ctx": context_window_for(messages, max_tokens, num_ctx),
     }
 
-    url = f"http://{host}:{port}/api/chat"
     payload = {
         "model": model_name,
         "messages": messages,
@@ -8352,47 +8468,57 @@ def chat_with_ollama(
         payload["think"] = think
 
     try:
-        # (connect, longest wait between streamed pieces): a big prompt can take minutes before the first token.
-        response = requests.post(url, json=payload, stream=True, timeout=(10, 900))
-    except requests.RequestException as exc:
+        stream = OllamaChatStream(host, port, payload)
+    except OSError as exc:
         raise RuntimeError(
             f"Could not reach Ollama at `{host}:{port}`. "
             f"Start Ollama or run `./start_app.sh`. Details: {exc}"
         ) from exc
 
-    if not response.ok:
-        raise RuntimeError(
-            f"Ollama returned HTTP {response.status_code} for model `{model_name}`: "
-            f"{response.text[:500]}"
-        )
-
+    cancel_slot = show_llm_cancel_button()
+    tick = st.empty()
     content, thinking, data = [], [], {}
     generated, first_token_at = 0, None
     last_report = time.monotonic()
     try:
-        for line in response.iter_lines():
-            if not line:
-                continue
+        while True:
             try:
-                chunk = json.loads(line)
-            except ValueError as exc:
-                raise RuntimeError(f"Ollama returned invalid JSON: {line[:500]!r}") from exc
-            if chunk.get("error"):
-                raise RuntimeError(f"Ollama error for model `{model_name}`: {chunk['error']}")
-            piece = chunk.get("message") or {}
-            if piece.get("content") or piece.get("thinking"):
-                content.append(piece.get("content") or "")
-                thinking.append(piece.get("thinking") or "")
-                generated += 1  # Ollama streams about one token per piece
-                first_token_at = first_token_at or time.monotonic()
-            if chunk.get("done"):
-                data = chunk
+                kind, value = stream.lines.get(timeout=LLM_TICK_SECONDS)
+            except queue.Empty:
+                kind, value = "wait", None
+                tick.empty()  # a page update, so a Cancel click takes effect here
+            if kind == "http_error":
+                status, body = value
+                raise RuntimeError(f"Ollama returned HTTP {status} for model `{model_name}`: {body}")
+            if kind == "error":
+                raise RuntimeError(
+                    f"Lost the connection to Ollama while `{model_name}` was answering: {value}"
+                ) from value
+            if kind == "end":
                 break
+            if kind == "line" and value.strip():
+                try:
+                    chunk = json.loads(value)
+                except ValueError as exc:
+                    raise RuntimeError(f"Ollama returned invalid JSON: {value[:500]!r}") from exc
+                if chunk.get("error"):
+                    raise RuntimeError(f"Ollama error for model `{model_name}`: {chunk['error']}")
+                piece = chunk.get("message") or {}
+                if piece.get("content") or piece.get("thinking"):
+                    content.append(piece.get("content") or "")
+                    thinking.append(piece.get("thinking") or "")
+                    generated += 1  # Ollama streams about one token per piece
+                    first_token_at = first_token_at or time.monotonic()
+                if chunk.get("done"):
+                    data = chunk
+                    break
             if on_progress and time.monotonic() - last_report >= LLM_PROGRESS_SECONDS:
                 last_report = time.monotonic()
                 on_progress(generated, last_report - first_token_at if first_token_at else None)
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Lost the connection to Ollama while `{model_name}` was answering: {exc}") from exc
+    finally:
+        # Also runs when Cancel stops the script: dropping the connection stops Ollama generating.
+        stream.close()
+        cancel_slot.empty()
 
     message = {"content": "".join(content), "thinking": "".join(thinking)}
     # Reasoning models (e.g. Qwen3) may inline their thinking; keep only the answer.
@@ -8936,6 +9062,20 @@ def gather_results(
     st.session_state[GATHERED_KEY] = gathered
 
 
+def restrict_gathered_to_library(safe_lib: str) -> None:
+    """Drop gathered notes from other libraries and their per-library counts.
+
+    For a literal search with Search all libraries unticked: its output is this library only, even when
+    an earlier all-library search gathered notes elsewhere.
+    """
+    gathered = st.session_state.get(GATHERED_KEY)
+    if not gathered or gathered["library"] != safe_lib:
+        return
+    gathered["notes"] = {key: entry for key, entry in gathered["notes"].items() if key[0] == safe_lib}
+    gathered["library_counts"] = []
+    st.session_state[GATHERED_KEY] = gathered
+
+
 def kept_gathered_notes(gathered: dict) -> list[tuple[str, str]]:
     """Gathered notes not excluded with 🚫, most recent hit first."""
     return [key for key in reversed(gathered["notes"]) if key[1] not in get_excluded_notes(key[0])]
@@ -9104,6 +9244,8 @@ st.set_page_config(page_title=PAGE_TITLES.get(st.query_params.get("page"), "RAG 
                    layout="wide")
 # Starts the background auto-rescan thread once per server process.
 get_text_rescan_scheduler()
+if st.session_state.pop(LLM_CANCELLED_KEY, False):
+    st.toast("Stopped the LLM. Change what you need and run it again.", icon=":material/stop_circle:")
 if st.query_params.get("page") == "prompts":
     render_prompt_library_page()
     st.stop()
@@ -10107,6 +10249,8 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
             route = "scope" if scope_clicked else (
                 "literal" if filter_only_clicked or (search_clicked and exact_text_only) else "semantic"
             )
+            if route == "literal" and not search_all_libraries:
+                restrict_gathered_to_library(safe_lib)
             if final_results and not scope_clicked:  # every search adds its notes to the in-scope list
                 gather_results(safe_lib, final_results, route, library_counts, uploads_dirs)
             # Corpus prompts describe one library's author role, so skip them across libraries.
