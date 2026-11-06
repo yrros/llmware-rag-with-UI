@@ -2,6 +2,7 @@ import math
 import re
 import json
 import gc
+import hashlib
 import shutil
 import sqlite3
 import sys
@@ -736,8 +737,17 @@ def saved_search_route() -> str:
     return "literal" if load_app_settings().get("exact_text_only", False) else "semantic"
 
 
-def persist_max_results() -> None:
-    save_app_settings({"max_results": int(st.session_state.get("max_results", 15))})
+MAX_RESULTS_LIMITS = {"semantic": 50, "literal": 1000}  # passages (Semantic) or notes listed (Literal)
+ASK_NOTES_LIMIT = 50  # notes Ask (filtered only) answers from, whatever Max results says: the LLM reads few anyway
+
+
+def max_results_key(literal: bool) -> str:
+    """Each route keeps its own Max results, so a big literal listing doesn't carry over to Semantic."""
+    return "max_results_literal" if literal else "max_results"
+
+
+def persist_max_results(key: str = "max_results") -> None:
+    save_app_settings({key: int(st.session_state.get(key, 15))})
 
 
 def persist_search_route() -> None:
@@ -2956,12 +2966,13 @@ def stage_agent_batch(
     max_tokens: int,
     temperature: float,
     corpus_prompt: str,
+    last_note: str = "",
 ) -> dict:
     """Stage every injected Agent's records into one batch (one package). Each Agent is asked separately."""
     parts = len(prompts)
     batches = [
         stage_agent_items(search_state, prompt, model_name, max_tokens, temperature, corpus_prompt,
-                          part=(number, parts) if parts > 1 else None)
+                          part=(number, parts) if parts > 1 else None, last_note=last_note)
         for number, prompt in enumerate(prompts, 1)
     ]
     if parts == 1:
@@ -2985,10 +2996,12 @@ def stage_agent_items(
     temperature: float,
     corpus_prompt: str,
     part: tuple[int, int] | None = None,
+    last_note: str = "",
 ) -> dict:
     """Turn the discussion so far into exact records for the Agent's Action Command. Nothing is sent.
 
     `part` is (number, of) when several Agents were injected: only this Agent's part is staged here.
+    `last_note` is the One last note typed above Execute, e.g. "exclude points 2-5": it overrides the discussion.
     """
     item_type = get_prompt_output_type(prompt)
     messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
@@ -3004,7 +3017,10 @@ def stage_agent_items(
         "content": (
             f"{agent_command(prompt)}\n\n{only_part}Turn what we have agreed in this conversation into records now. "
             "Include only the items I selected or agreed, with the details we agreed, and leave out anything "
-            f"I said to ignore. {STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
+            "I said to ignore. "
+            + (f"One last note, which overrides anything above where they differ: {last_note.strip()} "
+               if last_note.strip() else "")
+            + f"{STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
             + (f"\n\n{reference}" if reference else "")
             + (f"\n\n{open_tasks}" if open_tasks else "")
         ),
@@ -3723,8 +3739,9 @@ def reassess_schema(item: dict) -> dict:
     return {"type": "object", "properties": properties, "required": [*fields, "reason"]}
 
 
-def reassess_messages(package: dict, index: int, receipt: dict | None, context: str, fixes: list[dict]) -> list[dict]:
-    item = package["items"][index]
+def reassess_messages(package: dict, index: int, receipt: dict | None, context: str, fixes: list[dict],
+                      item: dict | None = None) -> list[dict]:
+    item = item or package["items"][index]
     fields = REASSESS_FIELDS.get(item.get("type"), ())
     result = next((r for r in (receipt or {}).get("items", []) if isinstance(r, dict) and r.get("index") == index), {})
     problem = " ".join(p for p in (str(result.get("message") or ""), ", ".join(
@@ -3742,20 +3759,71 @@ def reassess_messages(package: dict, index: int, receipt: dict | None, context: 
         parts.append(f"The notes it came from:\n{notes}")
     parts.append(f"The {kind} as JSON:\n" + json.dumps({f: item.get(f) for f in fields}, ensure_ascii=False))
     parts.append(
-        "Return it with the same fields. Change only what the facts, the context or the notes show is wrong or "
-        "needed to fix the problem, e.g. replace a nickname with the person's full name, and keep every other "
-        "field exactly as it is. Set `reason` to one short sentence on what you changed and why, or why nothing "
-        "needed changing."
+        "Return it with the same fields. Salesforce only recognises people by their full name, so wherever a "
+        "person's field (owner, recipients, related to) holds a nickname, short name or alias that the facts or "
+        "the context give a full name for, replace it with that full name, even if the notes use the nickname. "
+        "Otherwise change only what the facts, the context or the notes show is wrong or needed to fix the "
+        "problem, and keep every other field exactly as it is. Set `reason` to one short sentence on what you "
+        "changed and why, or why nothing needed changing."
     )
     return [{"role": "user", "content": "\n\n".join(parts)}]
 
 
+ALIAS_SCHEMA = {"type": "object", "required": ["aliases"], "properties": {"aliases": {"type": "array", "items": {
+    "type": "object", "required": ["alias", "full_name"],
+    "properties": {"alias": {"type": "string"}, "full_name": {"type": "string"}}}}}}
+PERSON_FIELDS = ("owner", "to")  # fields holding people, where a known nickname is replaced by the full name
+
+
+def extract_aliases(texts: list[str], model_name: str, chat) -> dict[str, str]:
+    """{nickname, lower case: full name} stated in the fixes and context. The model only reads them out; the
+    app makes the swap, so it doesn't depend on the model judging the item (cached for the session)."""
+    facts = "\n".join(f"- {t.strip()}" for t in texts if t.strip())
+    if not facts:
+        return {}
+    cache = st.session_state.setdefault("reassess_alias_cache", {})
+    key = json.dumps([facts, model_name])
+    if key not in cache:
+        reply, _usage = chat(
+            [{"role": "user", "content": (
+                "List every person these facts give a nickname, short name or alias for, with their full name. "
+                "Only pairs the facts state; an empty list if there are none.\n\n" + facts)}],
+            model_name, max_tokens=512, temperature=0.0, response_format=ALIAS_SCHEMA, think=False,
+        )
+        try:
+            pairs = json.loads(reply).get("aliases", [])
+        except (ValueError, AttributeError):
+            pairs = []
+        cache[key] = {
+            str(p.get("alias", "")).strip().lower(): str(p.get("full_name", "")).strip()
+            for p in pairs if isinstance(p, dict) and str(p.get("alias", "")).strip() and str(p.get("full_name", "")).strip()
+            and str(p.get("alias", "")).strip().lower() != str(p.get("full_name", "")).strip().lower()
+        }
+    return cache[key]
+
+
+def apply_aliases(item: dict, aliases: dict[str, str]) -> dict:
+    """The item with each person field that is exactly a known nickname replaced by the full name."""
+    resolved = dict(item)
+    if isinstance(resolved.get("owner"), str):
+        resolved["owner"] = aliases.get(resolved["owner"].strip().lower(), resolved["owner"])
+    if isinstance(resolved.get("to"), list):
+        resolved["to"] = [aliases.get(str(r).strip().lower(), r) for r in resolved["to"]]
+    return resolved
+
+
 def reassess_item(entry: dict, index: int, context: str, model_name: str, chat=None) -> dict:
-    """Dry run: the model's corrected item and what changed. Nothing is written."""
+    """Dry run: the corrected item and what changed (each marked as a name fix or the model's). Nothing is written.
+
+    Known nicknames in person fields are swapped for full names first (see extract_aliases); the model then
+    re-assesses the item with those swaps in place, and can't undo them."""
     chat = chat or chat_with_ollama
     package = entry["package"]
     item = package["items"][index]
-    reply, _usage = chat(reassess_messages(package, index, entry["receipt"], context, semantic_fixes()), model_name,
+    fixes = semantic_fixes()
+    aliases = extract_aliases([f["text"] for f in fixes] + [context], model_name, chat)
+    resolved = apply_aliases(item, aliases)
+    reply, _usage = chat(reassess_messages(package, index, entry["receipt"], context, fixes, resolved), model_name,
                          max_tokens=1024, temperature=0.1, num_ctx=FOLLOW_UP_NUM_CTX,
                          response_format=reassess_schema(item), think=False)
     try:
@@ -3763,11 +3831,14 @@ def reassess_item(entry: dict, index: int, context: str, model_name: str, chat=N
     except ValueError as exc:
         raise RuntimeError(f"`{model_name}` didn't return complete JSON; try again or pick a larger model.") from exc
     fields = REASSESS_FIELDS.get(item.get("type"), ())
-    cleaned = normalise_draft_item(item["type"], {**item, **{f: data[f] for f in fields if f in data}})
+    cleaned = normalise_draft_item(item["type"], {**resolved, **{f: data[f] for f in fields if f in data}})
     proposal = {**item, **{f: cleaned[f] for f in fields if f in cleaned}}  # keep any other keys as they were
+    named = [f for f in PERSON_FIELDS if f in item and resolved.get(f) != item.get(f)]
+    for field in named:
+        proposal[field] = resolved[field]
     changes = [(f, item.get(f), proposal.get(f)) for f in fields if proposal.get(f) != item.get(f)]
-    return {"proposal": proposal, "changes": changes, "reason": str(data.get("reason", "")).strip(),
-            "context": context, "model": model_name}
+    return {"original": item, "proposal": proposal, "changes": changes, "named": named,
+            "reason": str(data.get("reason", "")).strip(), "context": context, "model": model_name}
 
 
 def describe_reassess_value(field: str, value) -> str:
@@ -3794,7 +3865,11 @@ def apply_reassessment(path_text: str, index: int, entry_key: str) -> None:
     outcome = st.session_state.get(REASSESS_KEY, {}).pop(f"{entry_key}_{index}", None)
     if not outcome or "proposal" not in outcome:
         return
-    proposal = outcome["proposal"]
+    picked = [f for f, _old, _new in outcome["changes"] if st.session_state.get(f"reassess_pick_{entry_key}_{index}_{f}", True)]
+    if not picked:
+        st.session_state["actions_notice"] = "Nothing applied: no change was ticked."
+        return
+    proposal = {**outcome["original"], **{f: outcome["proposal"][f] for f in picked}}
 
     def change(item: dict) -> None:
         item.clear()
@@ -3840,13 +3915,16 @@ def render_reassess_panel(entry: dict, index: int, entry_key: str) -> None:
         if not outcome["changes"]:
             st.info("No change proposed. Add more context and re-assess, or edit the item yourself.")
             return
+        st.caption("Untick any change you don't want; only ticked ones are applied.")
         for field, old, new in outcome["changes"]:
             name = REASSESS_FIELD_NAMES.get(field, field.replace("_", " ").capitalize())
-            st.markdown(f"**{name}:** ~~{describe_reassess_value(field, old)}~~ → {describe_reassess_value(field, new)}")
+            source = " · full name from the fixes" if field in outcome.get("named", []) else ""
+            st.checkbox(f"**{name}:** ~~{describe_reassess_value(field, old)}~~ → "
+                        f"{describe_reassess_value(field, new)}{source}", value=True, key=f"reassess_pick_{slot}_{field}")
         with st.container(horizontal=True):
             st.button("Apply and retry", type="primary", icon=":material/check:", key=f"reassess_apply_{slot}",
                       on_click=apply_reassessment, args=(str(entry["path"]), index, entry_key),
-                      help="Save these changes in the package and send it back to the outbox for the connector's "
+                      help="Save the ticked changes in the package and send it back to the outbox for the connector's "
                       "next run (a withdrawn package goes back too). Anything already created isn't created twice.")
             st.button("Discard", key=f"reassess_discard_{slot}", on_click=discard_reassessment, args=(entry_key, index))
 
@@ -5461,6 +5539,11 @@ def render_prompt_library_page() -> None:
     """Prompt library page (opened in its own tab): About me, corpus prompt, task prompts."""
     library = load_prompt_library()
     add_agent_border_style("[class*='st-key-agent_prompt_card_'] [data-testid='stExpander'] details")
+    # Agent cards also get a blue hue, folded or open, so they read as agentic at a glance.
+    st.html(f"<style>[class*='st-key-agent_prompt_card_'] [data-testid='stExpander'] details "
+            f"{{ background-color: rgba({AGENT_TINT}, 0.08) !important; }}"
+            f"[class*='st-key-agent_prompt_card_'] [data-testid='stExpander'] details > summary:hover "
+            f"{{ background-color: rgba({AGENT_TINT}, 0.14) !important; }}</style>")
     render_outbox_status()
     render_page_title("Prompt library")
     st.caption(
@@ -5834,6 +5917,13 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict, safe_lib: str = 
     active = resolve_run_prompts(library, corpus_config)["tasks"]
     active_ids = {task["id"] for task in active}
     add_agent_border_style("[class*='st-key-use_agent_prompt_'] button", "[class*='st-key-active_agent_task']")
+    # Agent chips (Recent, Starred, Agent Starred) are shaded blue, deeper when chosen, whatever section they're in.
+    chip = "[class*='st-key-use_agent_prompt_'][class*='st-key-use_agent_prompt_'] button"
+    st.html(f"<style>[class*='st-key-use_agent_prompt_'] {{ --section: {AGENT_TINT}; }}"
+            f"{chip} {{ background-color: rgba({AGENT_TINT}, 0.22) !important; color: inherit !important; }}"
+            f"{chip}:hover {{ background-color: rgba({AGENT_TINT}, 0.36) !important; }}"
+            f"{chip}[data-testid='stBaseButton-primary'] {{ background-color: rgba({AGENT_TINT}, 0.55) !important; "
+            "font-weight: 600 !important; }</style>")
     st.html("<style>[class*='st-key-active_agent_task'] { padding: 0.1rem 0.25rem 0.1rem 0.75rem !important; }</style>")
     st.html(PROMPT_CHIP_STYLE)
 
@@ -6780,8 +6870,9 @@ def render_follow_up_discussion(
     corpus_prompt: str = "",
     model_options: list[str] | None = None,
     safe_lib: str = "",
-) -> str:
-    """Chat panel for follow-up questions about the notes from the last search; returns the follow-up model."""
+) -> tuple:
+    """Chat panel for follow-up questions about the notes from the last search; returns the follow-up model and
+    the dock holding the follow-up box (see render_discussion_body)."""
     st.subheader("Discussion")
 
     # Follow-ups can use a different (e.g. larger) model than the main answer.
@@ -6797,17 +6888,8 @@ def render_follow_up_discussion(
     model_key = f"follow_up_model_{safe_lib}"
     if st.session_state.get(model_key) not in options:
         st.session_state[model_key] = saved_model  # set here, not via index, so a prompt's model can replace it
-    model_name = st.selectbox(
-        "Follow-up model",
-        options=options,
-        key=model_key,
-        on_change=persist_follow_up_model,
-        args=(safe_lib,),
-        help=(
-            "Ollama model used for follow-up questions. It can differ from the main answer model, "
-            "e.g. a larger model for deeper discussion. Saved per corpus."
-        ),
-    )
+    # The picker is drawn in the Ask a follow-up box below; its value is already known from its key.
+    model_name = st.session_state[model_key]
     in_use = len({discussion_note_key(r) for r in discussion_results(search_state)})
     total = len({discussion_note_key(r) for r in search_state["results"]})
     notes = "the notes in this search" if in_use == total else f"{in_use} of {total} notes from this search"
@@ -6835,7 +6917,7 @@ def render_follow_up_discussion(
             help="Show the latest reply in the main output area; it keeps following new replies.",
         )
 
-    render_discussion_body(
+    dock = render_discussion_body(
         search_state,
         model_name,
         max_tokens,
@@ -6844,15 +6926,18 @@ def render_follow_up_discussion(
         key_prefix="panel",
         # A content-sized panel can be shorter than the default box, so expanding uses a fixed taller height.
         height=DISCUSSION_EXPANDED_HEIGHT if expanded else DISCUSSION_HEIGHT,
+        model_select=(model_key, options, safe_lib),
     )
-    return model_name
+    return model_name, dock
 
 
 def sticky_follow_up_style(box_key: str) -> str:
-    """CSS that keeps the follow-up box in view while a long answer beside it is scrolled.
+    """CSS that keeps the follow-up box and the Agent box (the dock holding both) in view while a long answer
+    beside them is scrolled, so you can answer its questions without scrolling back.
 
     A sticky element only travels within its parent, so the Discussion column is stretched to the full
-    height of the answer column first. The box gets the page background so text scrolling under it is hidden.
+    height of the answer column first. The dock gets the page background so text scrolling under it is hidden,
+    and scrolls within itself when it's taller than the window.
     """
     background = "#0e1117" if st.context.theme.type == "dark" else "#ffffff"
     # A column holds one .stVerticalBlock; the keyed box (or the wrapper carrying its key) sits directly in it.
@@ -6861,7 +6946,8 @@ def sticky_follow_up_style(box_key: str) -> str:
 [data-testid="stHorizontalBlock"]:has({column}) {{ align-items: stretch; }}
 {column} {{ align-self: stretch; }}
 {column} > .stVerticalBlock {{ height: 100%; }}
-.st-key-{box_key} {{ position: sticky; top: 4.25rem; z-index: 5; background: {background}; }}
+.st-key-{box_key} {{ position: sticky; top: 4.25rem; z-index: 5; background: {background};
+  max-height: calc(100vh - 5.5rem); overflow-y: auto; overflow-x: hidden; }}
 </style>"""
 
 
@@ -6875,8 +6961,12 @@ def render_discussion_body(
     key_prefix: str,
     height: int | str,
     in_dialog: bool = False,
-) -> None:
-    """Transcript, follow-up box and clear button, shared by the side panel and the pop-out."""
+    model_select: tuple[str, list[str], str] | None = None,
+):
+    """Transcript, follow-up box and clear button, shared by the side panel and the pop-out. Returns the dock
+    holding the follow-up box, for the Agent box to go in too.
+
+    `model_select` (widget key, model options, library key) puts the Follow-up model picker in the box."""
     discussion = search_state["discussion"]
     with st.container(height=height, border=True, autoscroll=True):
         if not discussion:
@@ -6916,16 +7006,35 @@ def render_discussion_body(
 
     render_follow_up_context(search_state, key_prefix)
     if not in_dialog:
-        st.html(sticky_follow_up_style(f"{key_prefix}_follow_up_box"))
-    with st.container(border=True, key=f"{key_prefix}_follow_up_box"):
+        st.html(sticky_follow_up_style(f"{key_prefix}_follow_up_dock"))
+    # The side panel's dock: the follow-up box, and the Agent box the caller adds to it, stay in view together.
+    dock = st.container() if in_dialog else st.container(key=f"{key_prefix}_follow_up_dock")
+    with dock, st.container(border=True, key=f"{key_prefix}_follow_up_box"):
         # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
         with st.container(horizontal=True, vertical_alignment="center"):
             st.markdown("Ask a follow-up", width="stretch")
+            if model_select:
+                select_key, options, safe_lib = model_select
+                model_name = st.selectbox(
+                    "Follow-up model",
+                    options=options,
+                    key=select_key,
+                    on_change=persist_follow_up_model,
+                    args=(safe_lib,),
+                    label_visibility="collapsed",
+                    width=190,
+                    help=(
+                        "Ollama model for the next follow-up. It can differ from the main answer model: a larger "
+                        "one for deeper discussion, a smaller one for a quick reply. Saved per corpus."
+                    ),
+                )
             big_box = st.toggle(
                 "Expand",
                 key=f"{key_prefix}_follow_up_expanded",
                 help="Make the follow-up box bigger for longer replies.",
             )
+        if model_select:
+            st.caption(describe_llm_speed(model_name))
         with st.form(f"{key_prefix}_follow_up_form", clear_on_submit=True, border=False):
             follow_up = st.text_area(
                 "Ask a follow-up",
@@ -6947,6 +7056,7 @@ def render_discussion_body(
     if submitted and follow_up.strip():
         if add_discussion_turn(search_state, follow_up.strip(), model_name, max_tokens, temperature, corpus_prompt):
             st.rerun(scope=rerun_scope)
+    return dock
 
 
 @st.dialog("Discussion", width="large", on_dismiss="rerun")
@@ -7001,6 +7111,50 @@ def render_library_counts(search_state: dict, key_prefix: str = "results") -> No
                 )
 
 
+FOLD_FOLDERS_OVER = 50  # in-scope notes beyond which folders fold up, so a long listing stays quick
+OPEN_FOLDERS_KEY = "gathered_open_folders"  # ids of the folders opened with ▸ while folded
+FOLDER_SELECTION_HELP = ("🚫 excludes every note in this folder and its sub-folders. 🎯 keeps them and excludes the "
+                         "other listed notes you haven't picked with 🎯.")
+
+
+def toggle_open_folder(folder_id: str) -> None:
+    opened = st.session_state.setdefault(OPEN_FOLDERS_KEY, set())
+    (opened.discard if folder_id in opened else opened.add)(folder_id)
+
+
+def folder_tree(notes: dict, safe_lib: str) -> list[dict]:
+    """The listed notes' folders, parents before children: {"path", "label", "depth", "direct": the notes in the
+    folder itself, "notes": (library key, file) of every note under it}. A folder holding no notes of its own
+    and a single sub-folder is merged with it ("Clients > Customers"); notes whose folder isn't known come last."""
+    root: dict = {"children": {}, "direct": []}
+    for note_key, blocks in notes.items():
+        path = blocks[0].get("_folder_path", "")
+        node = root
+        for part in path.split(FOLDER_PATH_SEPARATOR) if path else ["\uffff"]:  # sorts last
+            node = node["children"].setdefault(part, {"children": {}, "direct": []})
+        node["direct"].append((note_key, blocks))
+
+    def under(node: dict) -> list[tuple[str, str]]:
+        own = [(blocks[0].get("_safe_lib", safe_lib), file_source) for (_lib, file_source), blocks in node["direct"]]
+        return own + [key for child in node["children"].values() for key in under(child)]
+
+    nodes: list[dict] = []
+
+    def walk(node: dict, path: list[str], depth: int) -> None:
+        for name in sorted(node["children"], key=str.lower):
+            child, parts = node["children"][name], [name]
+            while not child["direct"] and len(child["children"]) == 1:
+                (next_name, child), = child["children"].items()
+                parts.append(next_name)
+            label = "Folder not known" if parts == ["\uffff"] else FOLDER_PATH_SEPARATOR.join(parts)
+            nodes.append({"path": path + parts, "label": label, "depth": depth, "direct": child["direct"],
+                          "notes": under(child)})
+            walk(child, path + parts, depth + 1)
+
+    walk(root, [], 0)
+    return nodes
+
+
 def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str, pick: dict | None = None) -> None:
     """The notes gathered by Find notes and Filter search only, one row per note, most recent hit first.
 
@@ -7041,14 +7195,38 @@ def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str, p
     label_col.caption("Exclude all")
     st.markdown('<hr style="margin:0.1rem 0 0.6rem">', unsafe_allow_html=True)
 
-    # Grouped under their folder path, sorted by path; notes whose folder isn't known come last.
-    folders: dict[str, list] = {}
-    for note_key, blocks in notes.items():
-        folders.setdefault(blocks[0].get("_folder_path", ""), []).append((note_key, blocks))
+    # Grouped under their folders as a tree, each folder with 🚫 and 🎯 for all the notes under it. Past
+    # FOLD_FOLDERS_OVER notes the folders fold up and a folder's notes are drawn only when it's opened.
+    folded = len(notes) > FOLD_FOLDERS_OVER
+    if folded:
+        st.caption(f"Over {FOLD_FOLDERS_OVER} notes, so folders are folded: **▸** opens one. 🚫 and 🎯 on a folder "
+                   "act on every note in it and its sub-folders.")
+    opened = st.session_state.setdefault(OPEN_FOLDERS_KEY, set())
     row = 0
-    for folder in sorted(folders, key=lambda path: (not path, path.lower())):
-        st.markdown(f"📁 **{folder or 'Folder not known'}** · {len(folders[folder])}")
-        for (library, file_source), blocks in folders[folder]:
+    for node in folder_tree(notes, safe_lib):
+        folder_id = hashlib.md5(json.dumps(node["path"]).encode()).hexdigest()[:12]
+        under = node["notes"]
+        excluded = sum(1 for lib, source in under if source in get_excluded_notes(lib))
+        box = f"exclude_folder_{folder_id}"
+        st.session_state[box] = excluded == len(under)
+        indent = "\u2003" * node["depth"]
+        text = (f"{indent}📁 **{node['label']}** · {plural(len(under), 'note')}"
+                + (f" · {excluded} excluded" if excluded else ""))
+        check_col, target_col, help_col, label_col = st.columns([1, 1, 0.6, 9.4], vertical_alignment="center")
+        check_col.checkbox("🚫", key=box, on_change=toggle_folder_excluded, args=(box, under))
+        target_col.button("🎯", key=f"target_folder_{folder_id}", type="tertiary", on_click=target_notes,
+                          args=(under, listed))
+        help_col.markdown("\u200b", help=FOLDER_SELECTION_HELP)
+        is_open = not folded or folder_id in opened
+        if folded:
+            label_col.button(f"{'▾' if is_open else '▸'} {text}", key=f"open_folder_{folder_id}", type="tertiary",
+                             on_click=toggle_open_folder, args=(folder_id,),
+                             help="Show or hide the notes directly in this folder")
+        else:
+            label_col.markdown(text)
+        if not is_open:
+            continue
+        for (library, file_source), blocks in node["direct"]:
             route = routes[(blocks[0].get("_safe_lib", safe_lib), file_source)]
             with st.container(key=f"gathered_{route}_{row}"):
                 render_filter_result_row(library, file_source, blocks, listed, library_folder, safe_lib,
@@ -7157,6 +7335,34 @@ def describe_staged_item(item: dict) -> str:
     text = f"**{staged_item_title(item)}** — " + " · ".join(details) if details else f"**{staged_item_title(item)}**"
     body = item.get("description") or item.get("body") or ""
     return text + (f"  \n{truncate_text(body, 200)}" if body else "")
+
+
+STAGED_FIELD_NAMES = {
+    "subject": "Subject", "title": "Title", "description": "Description", "body": "Body", "to": "To",
+    "due_date": "Due date", "priority": "Priority", "owner": "Owner", "related_to": "Related to",
+    "field": "Field", "value": "New value", "previous": "Current value", "allow_duplicate": "Create anyway",
+}
+LONG_STAGED_FIELDS = ("description", "body", "value", "previous")  # shown in full in a copyable box
+
+
+def render_full_staged_item(item: dict) -> None:
+    """Folded under a staged item: every field exactly as it goes into the package, long text in full."""
+    sent = {key: value for key, value in item.items() if not key.startswith("_") and key != "type"}
+    with st.expander("Everything that will be sent", icon=":material/visibility:"):
+        for key, value in sent.items():
+            name = STAGED_FIELD_NAMES.get(key, key.replace("_", " ").capitalize())
+            if key in LONG_STAGED_FIELDS:
+                st.caption(f"**{name}**" + ("" if value else " · empty"))
+                if value:
+                    st.code(str(value), language=None, wrap_lines=True)
+                continue
+            if key == "related_to":
+                value = (value or {}).get("name", "") + (f" ({value['kind']})" if (value or {}).get("kind") else "")
+            elif key == "to":
+                value = ", ".join(value or [])
+            elif isinstance(value, bool):
+                value = "yes" if value else "no"
+            st.markdown(f"**{name}:** {value if value not in ('', None) else '*not set*'}")
 
 
 def unstage_item(agent: dict, index: int) -> None:
@@ -7481,6 +7687,19 @@ def render_agent_panel(
                 st.caption(
                     "No reference snapshot yet: the task executor can refresh one so the Agent uses real record names."
                 )
+        # Folded until needed; its title says when a note is waiting to go with Execute.
+        note_key = f"agent_last_note_{search_state.get('id', '')}"
+        typed = str(st.session_state.get(note_key, "")).strip()
+        with st.expander("One last note" + (" · will be sent" if typed else ""), icon=":material/edit_note:"):
+            last_note = st.text_area(
+                "One last note",
+                key=note_key,
+                height=90,
+                placeholder="e.g. exclude points 2-5, or make them all due Friday",
+                label_visibility="collapsed",
+                help="Sent with **Execute** only, as a final instruction that overrides the discussion where they "
+                "differ. Saves another round in the discussion before staging.",
+            )
         if st.button(
             f"Execute :material/smart_toy: {label} with context",
             key="agent_run",
@@ -7495,7 +7714,7 @@ def render_agent_panel(
             with st.spinner(f"`{model_name}` is staging the {item_kind}…"):
                 try:
                     agent["staged"] = stage_agent_batch(
-                        search_state, prompts, model_name, max_tokens, temperature, corpus_prompt
+                        search_state, prompts, model_name, max_tokens, temperature, corpus_prompt, last_note
                     )
                     agent["needs_work"] = False
                 except Exception as exc:
@@ -7519,6 +7738,7 @@ def render_agent_panel(
                             render_update_diff(item)
                         else:
                             st.markdown(link_opportunity_names(describe_staged_item(item)))
+                        render_full_staged_item(item)
                         render_reference_picker(agent, index, item)
                         render_duplicate_check(agent, index, item)
                         render_next_step_checks(agent, index, item)
@@ -7713,7 +7933,7 @@ def render_search_results(
                 )
 
     with chat_col:
-        follow_up_model = render_follow_up_discussion(
+        follow_up_model, dock = render_follow_up_discussion(
             search_state,
             model_name,
             max_tokens,
@@ -7723,7 +7943,9 @@ def render_search_results(
             safe_lib,
         )
         if search_state.get("agent"):
-            render_agent_panel(search_state, notes_in_use, follow_up_model, max_tokens, temperature, corpus_prompt)
+            with dock:  # under the follow-up box, so both stay in view as the answer is scrolled
+                render_agent_panel(search_state, notes_in_use, follow_up_model, max_tokens, temperature,
+                                   corpus_prompt)
 
 
 def get_pending_index_settings(safe_lib: str, corpus_config: dict) -> tuple[str, float, bool]:
@@ -9085,10 +9307,13 @@ def show_llm_cancel_button():
     Clicking it reruns the script, which stops the call at its next page update (see LLM_TICK_SECONDS).
     """
     slot = st.empty()
-    with slot.container(key=f"llm_cancel_{next(_LLM_CANCEL_KEYS)}"):
+    number = next(_LLM_CANCEL_KEYS)
+    with slot.container(key=f"llm_cancel_{number}"):
         st.html(LLM_CANCEL_STYLE)
         st.button(
             "Cancel Query",
+            # Unique per call, as one run can make several (Re-assess); not llm_cancel_*, which the style places.
+            key=f"stop_llm_{number}",
             icon=":material/stop_circle:",
             type="primary",
             on_click=cancel_llm,
@@ -9526,11 +9751,20 @@ def toggle_excluded_note(lib_key: str, file_source: str) -> None:
 
 def target_note(lib_key: str, file_source: str, notes: list[tuple[str, str]]) -> None:
     """🎯 shortcut: include this note and exclude every listed note not also picked with 🎯."""
+    target_notes([(lib_key, file_source)], notes)
+
+
+def target_notes(picked: list[tuple[str, str]], notes: list[tuple[str, str]]) -> None:
+    """🎯 on a note or a folder: include these and exclude every listed note not also picked with 🎯."""
     picks = st.session_state.setdefault(TARGET_PICKS_KEY, set())
-    picks.add((lib_key, file_source))
+    picks.update(picked)
     for lib, source in notes:
         _set_note_excluded(lib, source, (lib, source) not in picks)
     persist_excluded_notes()
+
+
+def toggle_folder_excluded(widget_key: str, notes: list[tuple[str, str]]) -> None:
+    set_notes_excluded(notes, bool(st.session_state.get(widget_key)))
 
 
 def set_notes_excluded(notes: list[tuple[str, str]], excluded: bool) -> None:
@@ -9853,8 +10087,8 @@ def clear_search_results() -> None:
 
 
 def clear_all_search_page() -> None:
-    """Clear all button: filter, exclusions, results and discussion, the question, Find notes about and the
-    injected task prompts. Settings (route, Max results, model, toggles) stay."""
+    """Clear all button: filter, exclusions, results and discussion, the question, Find notes about, the
+    injected task prompts and the Ask box's Salesforce chip. Settings (route, Max results, model) stay."""
     clear_search_filter()
     clear_search_results()
     for field in SEARCH_FILTER_FIELDS:
@@ -9864,6 +10098,7 @@ def clear_all_search_page() -> None:
     st.session_state["find_notes_query"] = ""
     st.session_state[ACTIVE_TASK_PROMPTS_KEY] = []
     st.session_state.pop("question_task_token", None)
+    save_app_settings({SALESFORCE_CONTEXT_SETTING: False})
     for key in [key for key in st.session_state if str(key).endswith("_follow_up_text")]:
         del st.session_state[key]
 
@@ -10453,8 +10688,8 @@ with filter_box_col:
             on_click=clear_all_search_page,
             use_container_width=True,
             help="Start the page afresh: clears the filter, exclusions, results and discussion, your question, "
-            "**Find notes about** and any injected task prompt. Settings such as the route, **Max results** and "
-            "the model stay.",
+            "**Find notes about**, any injected task prompt and the **☁️ Salesforce** reference. Settings such "
+            "as the route, **Max results** and the model stay.",
         )
         # Two routes into the notes: semantic (vector) search or literal text matching. The controls below
         # follow the route; the Ask box's Search button uses it too.
@@ -10560,21 +10795,25 @@ with filter_box_col:
                         label_visibility="collapsed",
                     )
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
-        if "max_results" not in st.session_state:  # saved between searches and sessions
-            st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
+        _max_key = max_results_key(exact_text_only)
+        _max_limit = MAX_RESULTS_LIMITS["literal" if exact_text_only else "semantic"]
+        if _max_key not in st.session_state:  # saved between searches and sessions
+            st.session_state[_max_key] = min(max(int(load_app_settings().get(_max_key, 15) or 15), 1), _max_limit)
         search_filter = get_search_filter_from_widgets()
         # One line: Max results (its title beside the box), then what the filter and exclusions leave out, with
         # Clear exclusions rightmost.
         with st.container(horizontal=True, vertical_alignment="center", gap="small", key="max_results_row"):
             st.markdown("Max results", width="content",
-                        help="The most passages (Semantic route) or notes (Literal route) a search returns. "
-                        "Saved for next time.")
+                        help="The most passages (Semantic route, up to 50) or notes (Literal route, up to 1000) a "
+                        f"search returns. **Ask (filtered only)** answers from at most {ASK_NOTES_LIMIT} notes; "
+                        "**Filter search only** lists up to the full number. Each route's value is saved.")
             result_limit = st.number_input(
                 "Max results",
                 min_value=1,
-                max_value=50,
-                key="max_results",
+                max_value=_max_limit,
+                key=_max_key,
                 on_change=persist_max_results,
+                args=(_max_key,),
                 width=80,
                 label_visibility="collapsed",
             )
@@ -10819,9 +11058,10 @@ with ask_box_col:
             literal = (literal_matches(search_filter, safe_lib, library_folder, corpus_root_path,
                                        scan_libraries if search_all_libraries and not is_single_corpus_mode() else None)
                        if exact_text_only and has_positive_filter_terms(search_filter) else None)
+            ask_limit = min(result_limit, ASK_NOTES_LIMIT)
             literal_count = (
                 "" if literal is None else
-                f" · {result_limit} of {len(literal)} notes" if len(literal) > result_limit
+                f" · {ask_limit} of {len(literal)} notes" if len(literal) > ask_limit
                 else f" · {len(literal)} note{'' if len(literal) == 1 else 's'}"
             )
             search_clicked = st.button(
@@ -10836,12 +11076,13 @@ with ask_box_col:
                     else "**Semantic**: passages ranked by meaning."
                 )
                 + " Its notes are added to **In scope** under the Filter box."
-                + f" Returns at most {result_limit} results (**Max results**, in the Filter box).",
+                + f" Returns at most {ask_limit if exact_text_only else result_limit} results (**Max results**, in the "
+                "Filter box" + (f"; Ask answers from {ASK_NOTES_LIMIT} notes at most" if exact_text_only else "") + ").",
             )
             _in_scope = gathered_notes(safe_lib)
             _kept_in_scope = kept_gathered_notes(_in_scope) if _in_scope else []
             # Only worth offering when the in-scope notes aren't just what Ask (filtered only) sends anyway.
-            same_as_filtered = literal is not None and len(literal) <= result_limit and set(_kept_in_scope) == literal
+            same_as_filtered = literal is not None and len(literal) <= ask_limit and set(_kept_in_scope) == literal
             scope_clicked = bool(_kept_in_scope) and not same_as_filtered and st.button(
                 f"🗂 Ask about in-scope notes ({len(_kept_in_scope)})",
                 use_container_width=True,
@@ -10864,6 +11105,8 @@ if new_search:
     persist_question()
     remember_searched_dates()
 run_filter_only = filter_only_clicked or (search_clicked and exact_text_only)
+# Filter search only lists up to Max results (up to 1000); Ask (filtered only) answers from at most ASK_NOTES_LIMIT.
+notes_limit = result_limit if filter_only_clicked else min(result_limit, ASK_NOTES_LIMIT)
 _gathered = gathered_notes(safe_lib)
 _in_scope_before = len(_gathered["notes"]) if _gathered else 0
 search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode()
@@ -10905,7 +11148,7 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                 final_results, library_counts = exact_text_search_all_libraries(
                     filter_libraries_for_display(all_libraries),
                     search_filter,
-                    result_limit,
+                    notes_limit,
                     corpus_root_path,
                     apply_exclusions=not filter_only_clicked,
                 )
@@ -10925,7 +11168,7 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                     # Filter search only lists excluded notes too, so they can be un-ticked.
                     run_filter = search_filter if filter_only_clicked else with_exclusions(search_filter, safe_lib)
                     run_filter = with_path_matches(run_filter, safe_lib, library_folder, corpus_root_path)
-                    final_results = exact_text_search(safe_lib, run_filter, result_limit)
+                    final_results = exact_text_search(safe_lib, run_filter, notes_limit)
                 if not final_results:
                     notice = f"No notes match {describe_search_filter(search_filter)}."
             else:

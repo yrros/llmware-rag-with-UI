@@ -77,60 +77,9 @@ echo "Building app icon from LLM-RAG_logo.png…"
 build_icns_from_png "$LOGO_PNG" "$ICNS_PATH"
 
 echo "Creating Desktop launcher at: $APP_PATH"
-rm -rf "$APP_PATH"
-mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
-cp "$ICNS_PATH" "$APP_PATH/Contents/Resources/AppIcon.icns"
-
-cat > "$APP_PATH/Contents/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>launcher</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.llmware.llm-notes</string>
-    <key>CFBundleName</key>
-    <string>LLM-Notes</string>
-    <key>CFBundleDisplayName</key>
-    <string>LLM-Notes</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>0.1.0-beta</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>12.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-</dict>
-</plist>
-EOF
-
-cat > "$APP_PATH/Contents/MacOS/start.command" <<EOF
-#!/bin/bash
-PROJECT_DIR="$PROJECT_DIR"
-cd "\$PROJECT_DIR" || {
-    osascript -e 'display alert "LLM-Notes" message "Project folder not found at: $PROJECT_DIR"'
-    exit 1
-}
-exec bash "\$PROJECT_DIR/start_app.sh"
-EOF
-chmod +x "$APP_PATH/Contents/MacOS/start.command"
-
-cat > "$APP_PATH/Contents/MacOS/launcher" <<'EOF'
-#!/bin/bash
-APP_MACOS="$(cd "$(dirname "$0")" && pwd)"
-open -a Terminal "$APP_MACOS/start.command"
-EOF
-
-chmod +x "$APP_PATH/Contents/MacOS/launcher"
-
-# Clear quarantine so macOS allows the app to run when launched from Desktop.
-xattr -cr "$APP_PATH" 2>/dev/null || true
+# A small stay-open app: click to open LLM-Notes (starting it if needed); right-click its Dock icon > Quit
+# to stop it. It never starts at login.
+bash "$PROJECT_DIR/llm_notes_service.sh" install
 
 for legacy_path in "${LEGACY_APP_PATHS[@]}"; do
     if [[ -e "$legacy_path" ]]; then
@@ -139,10 +88,10 @@ for legacy_path in "${LEGACY_APP_PATHS[@]}"; do
     fi
 done
 
-touch "$APP_PATH"
 echo ""
 echo "Install complete."
 echo "  Project:  $PROJECT_DIR"
 echo "  Desktop:  $APP_PATH"
 echo ""
-echo "Double-click LLM-Notes on your Desktop to start the app."
+echo "Double-click LLM-Notes on your Desktop to start the app (http://localhost:8510)."
+echo "To stop it: right-click its Dock icon > Quit, or run ./stop_app.sh"
