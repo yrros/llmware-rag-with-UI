@@ -2,6 +2,7 @@ import math
 import re
 import json
 import gc
+import hashlib
 import shutil
 import sqlite3
 import sys
@@ -148,6 +149,7 @@ JOB_STATUS_PATH = APP_DATA_DIR / "job_status.json"
 APP_SETTINGS_PATH = APP_DATA_DIR / "app_settings.json"
 PROMPT_LIBRARY_PATH = APP_DATA_DIR / "prompt_library.json"
 TEXT_RESCAN_STATUS_PATH = APP_DATA_DIR / "text_rescan_status.json"
+ACTIONS_LOG_PATH = APP_DATA_DIR / "actions_log.json"  # which notes each Agent has actioned
 PROMPT_STACK_SIZE = 5
 
 DEFAULT_APP_SETTINGS = {
@@ -735,8 +737,17 @@ def saved_search_route() -> str:
     return "literal" if load_app_settings().get("exact_text_only", False) else "semantic"
 
 
-def persist_max_results() -> None:
-    save_app_settings({"max_results": int(st.session_state.get("max_results", 15))})
+MAX_RESULTS_LIMITS = {"semantic": 50, "literal": 1000}  # passages (Semantic) or notes listed (Literal)
+ASK_NOTES_LIMIT = 50  # notes Ask (filtered only) answers from, whatever Max results says: the LLM reads few anyway
+
+
+def max_results_key(literal: bool) -> str:
+    """Each route keeps its own Max results, so a big literal listing doesn't carry over to Semantic."""
+    return "max_results_literal" if literal else "max_results"
+
+
+def persist_max_results(key: str = "max_results") -> None:
+    save_app_settings({key: int(st.session_state.get(key, 15))})
 
 
 def persist_search_route() -> None:
@@ -1616,6 +1627,7 @@ def load_prompt_library() -> dict:
         library.setdefault("prompts", [])
         library.setdefault("links", [])  # common links: [{"id", "title", "url"}]; prompts pick theirs by id
         library.setdefault("references", [])  # reference documents: [{"id", "title", "notes", "last_used"?}]
+        library.setdefault("semantic_fixes", [])  # Agent Semantic Fixes: [{"id", "text", "added", "edited"?}]
         for prompt in library["prompts"]:
             # Libraries saved before Agent existed: prompts that already drafted output become Agents.
             prompt.setdefault("agent", prompt.get("output", "text") in DRAFT_OUTPUT_TYPES and not prompt.get("global"))
@@ -2954,12 +2966,13 @@ def stage_agent_batch(
     max_tokens: int,
     temperature: float,
     corpus_prompt: str,
+    last_note: str = "",
 ) -> dict:
     """Stage every injected Agent's records into one batch (one package). Each Agent is asked separately."""
     parts = len(prompts)
     batches = [
         stage_agent_items(search_state, prompt, model_name, max_tokens, temperature, corpus_prompt,
-                          part=(number, parts) if parts > 1 else None)
+                          part=(number, parts) if parts > 1 else None, last_note=last_note)
         for number, prompt in enumerate(prompts, 1)
     ]
     if parts == 1:
@@ -2983,10 +2996,12 @@ def stage_agent_items(
     temperature: float,
     corpus_prompt: str,
     part: tuple[int, int] | None = None,
+    last_note: str = "",
 ) -> dict:
     """Turn the discussion so far into exact records for the Agent's Action Command. Nothing is sent.
 
     `part` is (number, of) when several Agents were injected: only this Agent's part is staged here.
+    `last_note` is the One last note typed above Execute, e.g. "exclude points 2-5": it overrides the discussion.
     """
     item_type = get_prompt_output_type(prompt)
     messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
@@ -3002,7 +3017,10 @@ def stage_agent_items(
         "content": (
             f"{agent_command(prompt)}\n\n{only_part}Turn what we have agreed in this conversation into records now. "
             "Include only the items I selected or agreed, with the details we agreed, and leave out anything "
-            f"I said to ignore. {STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
+            "I said to ignore. "
+            + (f"One last note, which overrides anything above where they differ: {last_note.strip()} "
+               if last_note.strip() else "")
+            + f"{STRUCTURED_OUTPUT_GUIDES[item_type]} {STRUCTURED_RELATED_GUIDE}"
             + (f"\n\n{reference}" if reference else "")
             + (f"\n\n{open_tasks}" if open_tasks else "")
         ),
@@ -3029,6 +3047,8 @@ def stage_agent_items(
         items = expand_next_steps(entries, marker, profile_short_name(library), datetime.date.today())
     else:
         items = [apply_title_marker(normalise_draft_item(item_type, item), marker) for item in entries]
+    for item in items:
+        item["_agent_id"] = prompt["id"]  # which Agent staged it, for the actions log; not sent
     return {
         "id": uuid.uuid4().hex,  # the package id if this is sent; each staging is a new package
         "type": "mixed" if item_type == "next_step" else item_type,
@@ -3350,6 +3370,7 @@ def render_outbox_entry(entry: dict, state: str) -> None:
             st.info("No receipt yet.")
 
         results = {r.get("index"): r for r in receipt.get("items", []) if isinstance(r, dict)}
+        editable = editable_item_indexes(entry, state)
         for index, item in enumerate(items):
             result = results.get(index) or {}
             try:
@@ -3376,6 +3397,8 @@ def render_outbox_entry(entry: dict, state: str) -> None:
                 )
             if notes_line:
                 st.caption(" · ".join(notes_line))
+            if index in editable:
+                render_reassess_panel(entry, index, f"{state}_{entry['path'].name}")
             if state == "failed" and result.get("status") == "duplicate":
                 st.button(
                     "Create anyway and retry",
@@ -3599,6 +3622,329 @@ def save_package_edits(path_text: str, entry_key: str, indexes: list[int]) -> No
         del st.session_state[widget_key]
     st.session_state[f"actions_editing_{entry_key}"] = False
     st.session_state["actions_notice"] = f"Saved changes to `{path.name}`."
+
+
+# --- Agent Semantic Fixes and Re-assess on the Actions page ---------------------
+# Facts that repair what Agents send, e.g. "Joseph Oliver is known as J-O", kept in
+# the prompt library. Re-assess asks the model to correct one outbox item with them, any extra context typed
+# for it and the package's source notes; nothing changes until Apply.
+REASSESS_FIELDS = {
+    "task": ("subject", "description", "due_date", "priority", "owner", "related_to"),
+    "note": ("title", "body", "related_to"),
+    "email": ("to", "subject", "body", "related_to"),
+    "update": ("value", "related_to"),
+}
+REASSESS_FIELD_NAMES = {"value": "Next Step", "to": "To", "due_date": "Due date", "related_to": "Related to"}
+REASSESS_NOTES_CHARS = 8000  # source note text sent with a Re-assess, shared between the notes
+REASSESS_KEY = "reassess"  # session state: {entry key and item index: the last Re-assess's proposal}
+OFFER_FIX_KEY = "offer_semantic_fix"  # context just applied, to offer as a new Agent Semantic Fix
+
+
+def semantic_fixes(library: dict | None = None) -> list[dict]:
+    return (library or load_prompt_library()).get("semantic_fixes", [])
+
+
+def add_semantic_fix(text: str) -> None:
+    text = text.strip()
+    if not text:
+        return
+    library = load_prompt_library()
+    library.setdefault("semantic_fixes", []).append({"id": uuid.uuid4().hex, "text": text, "added": now_iso()})
+    save_prompt_library(library)
+
+
+def add_semantic_fix_from_form() -> None:
+    add_semantic_fix(str(st.session_state.get("new_semantic_fix", "")))
+
+
+def save_semantic_fix(fix_id: str) -> None:
+    """Save an edited fix; emptying the box keeps the old text (use ✕ to remove one)."""
+    text = str(st.session_state.get(f"semantic_fix_{fix_id}", "")).strip()
+    library = load_prompt_library()
+    fix = next((f for f in library.get("semantic_fixes", []) if f["id"] == fix_id), None)
+    if fix and text and text != fix["text"]:
+        fix.update(text=text, edited=now_iso())
+        save_prompt_library(library)
+        mark_text_saved(f"semantic_fix_{fix_id}")
+
+
+def delete_semantic_fix(fix_id: str) -> None:
+    library = load_prompt_library()
+    library["semantic_fixes"] = [f for f in library.get("semantic_fixes", []) if f["id"] != fix_id]
+    save_prompt_library(library)
+
+
+def format_fix_date(iso_time: str) -> str:
+    try:
+        return datetime.datetime.fromisoformat(iso_time).strftime("%d %b %Y")
+    except (TypeError, ValueError):
+        return "?"
+
+
+def render_semantic_fixes_section(library: dict) -> None:
+    """Prompt library: the Agent Semantic Fixes, each a big editable box with the date it was added."""
+    fixes = semantic_fixes(library)
+    st.html(f"<style>.st-key-prompt_page_fixes_open details {{ border: 1px solid rgb({AGENT_TINT}) !important; }}</style>")
+    with st.expander(
+        f"Agent Semantic Fixes · {len(fixes)}",
+        expanded=st.query_params.get("section") == "fixes",
+        key="prompt_page_fixes_open",
+        icon=":material/build:",
+    ):
+        st.caption(
+            "Facts that repair what Agents send, e.g. *Joseph Oliver is known as J-O*. "
+            "**Re-assess** on the Actions page uses them all to correct an item a connector couldn't process. "
+            "Applying a fix there offers to add its context here. Saved as you type."
+        )
+        for fix in fixes:
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.caption(f"Added {format_fix_date(fix.get('added'))}"
+                           + (f" · edited {format_fix_date(fix['edited'])}" if fix.get("edited") else ""))
+                st.button(":material/close:", key=f"semantic_fix_delete_{fix['id']}", type="tertiary",
+                          on_click=delete_semantic_fix, args=(fix["id"],), help="Remove this fix")
+            st.text_area(
+                "Fix", value=fix["text"], key=f"semantic_fix_{fix['id']}", height=120, label_visibility="collapsed",
+                on_change=save_semantic_fix, args=(fix["id"],),
+            )
+            render_saved_note(f"semantic_fix_{fix['id']}")
+        with st.form("add_semantic_fix_form", clear_on_submit=True, border=False):
+            st.text_area("New fix", key="new_semantic_fix", height=120,
+                         placeholder="e.g. Joseph Oliver is known as J-O")
+            st.form_submit_button("Add fix", icon=":material/add:", on_click=add_semantic_fix_from_form)
+
+
+def source_notes_text(package: dict, budget: int = REASSESS_NOTES_CHARS) -> str:
+    """The package's source notes re-read from disk, each cut to an equal share of `budget` characters."""
+    paths = [Path(n["path"]) for n in (package.get("source") or {}).get("notes", [])
+             if isinstance(n, dict) and n.get("path") and Path(n["path"]).is_file()]
+    share = budget // max(len(paths), 1)
+    parts = []
+    for path in paths:
+        try:
+            text = path.read_text(errors="replace").strip()
+        except OSError:
+            continue
+        parts.append(f"--- {path.name} ---\n" + (text[:share].rstrip() + " […]" if len(text) > share else text))
+    return "\n\n".join(parts)
+
+
+def reassess_schema(item: dict) -> dict:
+    """JSON schema for a Re-assess reply: the item's editable fields, plus `reason`."""
+    types = {"to": {"type": "array", "items": {"type": "string"}},
+             "related_to": {"type": "object", "properties": {"name": {"type": "string"}, "kind": {"type": "string"}},
+                            "required": ["name", "kind"]}}
+    fields = REASSESS_FIELDS.get(item.get("type"), ())
+    properties = {field: types.get(field, {"type": "string"}) for field in fields}
+    properties["reason"] = {"type": "string"}
+    return {"type": "object", "properties": properties, "required": [*fields, "reason"]}
+
+
+def reassess_messages(package: dict, index: int, receipt: dict | None, context: str, fixes: list[dict],
+                      item: dict | None = None) -> list[dict]:
+    item = item or package["items"][index]
+    fields = REASSESS_FIELDS.get(item.get("type"), ())
+    result = next((r for r in (receipt or {}).get("items", []) if isinstance(r, dict) and r.get("index") == index), {})
+    problem = " ".join(p for p in (str(result.get("message") or ""), ", ".join(
+        str(c.get("name", "")) for c in result.get("candidates", []) if isinstance(c, dict))) if p)
+    kind = ITEM_KIND_NAMES.get(item.get("type"), "Item").lower()
+    notes = source_notes_text(package)
+    parts = [f"Today is {datetime.date.today():%A %Y-%m-%d}. An Agent drafted this {kind} for Salesforce from my notes."]
+    if problem:
+        parts.append(f"The connector couldn't process it: {problem}")
+    if fixes:
+        parts.append("Facts to apply:\n" + "\n".join(f"- {f['text']}" for f in fixes))
+    if context.strip():
+        parts.append(f"More context for this {kind}:\n{context.strip()}")
+    if notes:
+        parts.append(f"The notes it came from:\n{notes}")
+    parts.append(f"The {kind} as JSON:\n" + json.dumps({f: item.get(f) for f in fields}, ensure_ascii=False))
+    parts.append(
+        "Return it with the same fields. Salesforce only recognises people by their full name, so wherever a "
+        "person's field (owner, recipients, related to) holds a nickname, short name or alias that the facts or "
+        "the context give a full name for, replace it with that full name, even if the notes use the nickname. "
+        "Otherwise change only what the facts, the context or the notes show is wrong or needed to fix the "
+        "problem, and keep every other field exactly as it is. Set `reason` to one short sentence on what you "
+        "changed and why, or why nothing needed changing."
+    )
+    return [{"role": "user", "content": "\n\n".join(parts)}]
+
+
+ALIAS_SCHEMA = {"type": "object", "required": ["aliases"], "properties": {"aliases": {"type": "array", "items": {
+    "type": "object", "required": ["alias", "full_name"],
+    "properties": {"alias": {"type": "string"}, "full_name": {"type": "string"}}}}}}
+PERSON_FIELDS = ("owner", "to")  # fields holding people, where a known nickname is replaced by the full name
+
+
+def extract_aliases(texts: list[str], model_name: str, chat) -> dict[str, str]:
+    """{nickname, lower case: full name} stated in the fixes and context. The model only reads them out; the
+    app makes the swap, so it doesn't depend on the model judging the item (cached for the session)."""
+    facts = "\n".join(f"- {t.strip()}" for t in texts if t.strip())
+    if not facts:
+        return {}
+    cache = st.session_state.setdefault("reassess_alias_cache", {})
+    key = json.dumps([facts, model_name])
+    if key not in cache:
+        reply, _usage = chat(
+            [{"role": "user", "content": (
+                "List every person these facts give a nickname, short name or alias for, with their full name. "
+                "Only pairs the facts state; an empty list if there are none.\n\n" + facts)}],
+            model_name, max_tokens=512, temperature=0.0, response_format=ALIAS_SCHEMA, think=False,
+        )
+        try:
+            pairs = json.loads(reply).get("aliases", [])
+        except (ValueError, AttributeError):
+            pairs = []
+        cache[key] = {
+            str(p.get("alias", "")).strip().lower(): str(p.get("full_name", "")).strip()
+            for p in pairs if isinstance(p, dict) and str(p.get("alias", "")).strip() and str(p.get("full_name", "")).strip()
+            and str(p.get("alias", "")).strip().lower() != str(p.get("full_name", "")).strip().lower()
+        }
+    return cache[key]
+
+
+def apply_aliases(item: dict, aliases: dict[str, str]) -> dict:
+    """The item with each person field that is exactly a known nickname replaced by the full name."""
+    resolved = dict(item)
+    if isinstance(resolved.get("owner"), str):
+        resolved["owner"] = aliases.get(resolved["owner"].strip().lower(), resolved["owner"])
+    if isinstance(resolved.get("to"), list):
+        resolved["to"] = [aliases.get(str(r).strip().lower(), r) for r in resolved["to"]]
+    return resolved
+
+
+def reassess_item(entry: dict, index: int, context: str, model_name: str, chat=None) -> dict:
+    """Dry run: the corrected item and what changed (each marked as a name fix or the model's). Nothing is written.
+
+    Known nicknames in person fields are swapped for full names first (see extract_aliases); the model then
+    re-assesses the item with those swaps in place, and can't undo them."""
+    chat = chat or chat_with_ollama
+    package = entry["package"]
+    item = package["items"][index]
+    fixes = semantic_fixes()
+    aliases = extract_aliases([f["text"] for f in fixes] + [context], model_name, chat)
+    resolved = apply_aliases(item, aliases)
+    reply, _usage = chat(reassess_messages(package, index, entry["receipt"], context, fixes, resolved), model_name,
+                         max_tokens=1024, temperature=0.1, num_ctx=FOLLOW_UP_NUM_CTX,
+                         response_format=reassess_schema(item), think=False)
+    try:
+        data = json.loads(reply)
+    except ValueError as exc:
+        raise RuntimeError(f"`{model_name}` didn't return complete JSON; try again or pick a larger model.") from exc
+    fields = REASSESS_FIELDS.get(item.get("type"), ())
+    cleaned = normalise_draft_item(item["type"], {**resolved, **{f: data[f] for f in fields if f in data}})
+    proposal = {**item, **{f: cleaned[f] for f in fields if f in cleaned}}  # keep any other keys as they were
+    named = [f for f in PERSON_FIELDS if f in item and resolved.get(f) != item.get(f)]
+    for field in named:
+        proposal[field] = resolved[field]
+    changes = [(f, item.get(f), proposal.get(f)) for f in fields if proposal.get(f) != item.get(f)]
+    return {"original": item, "proposal": proposal, "changes": changes, "named": named,
+            "reason": str(data.get("reason", "")).strip(), "context": context, "model": model_name}
+
+
+def describe_reassess_value(field: str, value) -> str:
+    if field == "related_to":
+        value = (value or {}).get("name", "") + (f" ({value['kind']})" if (value or {}).get("kind") else "")
+    elif field == "to":
+        value = ", ".join(value or [])
+    return f"`{value}`" if value else "*empty*"
+
+
+def run_reassess(entry: dict, index: int, entry_key: str) -> None:
+    context = str(st.session_state.get(f"reassess_context_{entry_key}_{index}", ""))
+    model = st.session_state.get("duplicate_check_model") or ""
+    try:
+        with st.spinner(f"Re-assessing with `{model}`…"):
+            outcome = reassess_item(entry, index, context, model)
+    except Exception as exc:
+        outcome = {"error": format_exception_for_user(exc)}
+    st.session_state.setdefault(REASSESS_KEY, {})[f"{entry_key}_{index}"] = outcome
+
+
+def apply_reassessment(path_text: str, index: int, entry_key: str) -> None:
+    """Write the proposal into the package, send it back to the outbox, then offer the context as a fix."""
+    outcome = st.session_state.get(REASSESS_KEY, {}).pop(f"{entry_key}_{index}", None)
+    if not outcome or "proposal" not in outcome:
+        return
+    picked = [f for f, _old, _new in outcome["changes"] if st.session_state.get(f"reassess_pick_{entry_key}_{index}_{f}", True)]
+    if not picked:
+        st.session_state["actions_notice"] = "Nothing applied: no change was ticked."
+        return
+    proposal = {**outcome["original"], **{f: outcome["proposal"][f] for f in picked}}
+
+    def change(item: dict) -> None:
+        item.clear()
+        item.update(proposal)
+
+    change_item_and_retry(path_text, index, change, "Re-assessed")
+    st.session_state[f"reassess_open_{entry_key}_{index}"] = False
+    applied = str(st.session_state.get("actions_notice", "")).startswith("Re-assessed")
+    if applied and outcome["context"].strip():
+        st.session_state[OFFER_FIX_KEY] = outcome["context"].strip()
+
+
+def discard_reassessment(entry_key: str, index: int) -> None:
+    st.session_state.get(REASSESS_KEY, {}).pop(f"{entry_key}_{index}", None)
+
+
+def render_reassess_panel(entry: dict, index: int, entry_key: str) -> None:
+    """Inline under an editable item: extra context, Re-assess (dry run), then the proposed changes to apply."""
+    slot = f"{entry_key}_{index}"
+    if not st.toggle("Fix with context", key=f"reassess_open_{slot}",
+                     help="Add context, e.g. who a nickname is, and have the model re-assess this item."):
+        return
+    with st.container(border=True):
+        st.text_area("Extra context", key=f"reassess_context_{slot}", height=80,
+                     placeholder="e.g. Joseph Oliver is known as J-O")
+        fixes = len(semantic_fixes())
+        model = st.session_state.get("duplicate_check_model") or ""
+        st.caption(
+            f"Re-assess sends the model this item, the connector's message, your context, the "
+            f"[{plural(fixes, 'Agent Semantic Fix')}]({PROMPT_LIBRARY_PAGE_URL}&section=fixes) and the package's "
+            f"source notes. It uses `{model}`, the **Model** picked above. Nothing changes until you apply it."
+        )
+        if st.button("Re-assess", icon=":material/psychology:", key=f"reassess_run_{slot}", disabled=not model):
+            run_reassess(entry, index, entry_key)
+        outcome = st.session_state.get(REASSESS_KEY, {}).get(slot)
+        if not outcome:
+            return
+        if outcome.get("error"):
+            st.error(f"Re-assess failed: {outcome['error']}")
+            return
+        if outcome["reason"]:
+            st.caption(f"**{outcome['model']}:** {outcome['reason']}")
+        if not outcome["changes"]:
+            st.info("No change proposed. Add more context and re-assess, or edit the item yourself.")
+            return
+        st.caption("Untick any change you don't want; only ticked ones are applied.")
+        for field, old, new in outcome["changes"]:
+            name = REASSESS_FIELD_NAMES.get(field, field.replace("_", " ").capitalize())
+            source = " · full name from the fixes" if field in outcome.get("named", []) else ""
+            st.checkbox(f"**{name}:** ~~{describe_reassess_value(field, old)}~~ → "
+                        f"{describe_reassess_value(field, new)}{source}", value=True, key=f"reassess_pick_{slot}_{field}")
+        with st.container(horizontal=True):
+            st.button("Apply and retry", type="primary", icon=":material/check:", key=f"reassess_apply_{slot}",
+                      on_click=apply_reassessment, args=(str(entry["path"]), index, entry_key),
+                      help="Save the ticked changes in the package and send it back to the outbox for the connector's "
+                      "next run (a withdrawn package goes back too). Anything already created isn't created twice.")
+            st.button("Discard", key=f"reassess_discard_{slot}", on_click=discard_reassessment, args=(entry_key, index))
+
+
+def add_offered_fix() -> None:
+    add_semantic_fix(str(st.session_state.get("offer_fix_text", "")))
+    st.session_state["actions_notice"] = "Added to Agent Semantic Fixes."
+
+
+@st.dialog("Add to Agent Semantic Fixes?")
+def offer_semantic_fix_dialog(text: str) -> None:
+    st.markdown("The fix is applied. Keep its context as an **Agent Semantic Fix**, so Re-assess uses it next time?")
+    st.text_area("Fix", value=text, key="offer_fix_text", height=120)
+    with st.container(horizontal=True):
+        # Saved in a callback, so it's kept even if the page reruns in full; then a full rerun closes the dialog.
+        add = st.button("Add to fixes", type="primary", icon=":material/add:", key="offer_fix_add",
+                        on_click=add_offered_fix)
+        skip = st.button("Not now", key="offer_fix_skip")
+    if add or skip:
+        st.rerun()
 
 
 # --- Duplicate check on the Actions page ----------------------------------------
@@ -3860,6 +4206,411 @@ def render_duplicate_check_panel(entries: dict[str, list[dict]]) -> None:
                        "Each item also links to its record in Salesforce.")
 
 
+# Actions log: which notes each Agent has actioned, for tracking. A note is logged when its package is sent
+# (That's right), marked done when the connector's receipt says its items went through, and logged as done
+# when the Agent's mark (e.g. [SF_Tasks]) is found in the note, for things done by hand in Apple Notes.
+ACTIONS_LOG_FORMAT = "llm-notes-actions-log/v1"
+ACTION_STATUS_BADGES = {"done": "✓", "sent": "⏳", "failed": "⚠", "withdrawn": "↩"}
+ACTION_STATUS_TEXT = {"done": "done", "sent": "sent, waiting for the connector", "failed": "failed",
+                      "withdrawn": "withdrawn"}
+ACTIONED_STATUSES = ("sent", "done")  # what counts as actioned for the badges' tally and the Actioned filter
+ACTIONED_FILTER_SETTING = "actioned_filter"  # {"mode": one of ACTIONED_FILTER_MODES, "agent": prompt id or ""}
+ACTIONED_FILTER_MODES = {"all": "All notes", "hide": "Not yet actioned", "only": "Only actioned"}
+ACTIONS_LOG_RUN_KEY = "actions_log_this_run"  # the log as synced at the top of this run
+
+
+def actions_mark(prompt: dict) -> str:
+    """The text that marks a note as actioned by this Agent: its own, or [<Agent name>]."""
+    return str(prompt.get("mark") or "").strip() or f"[{prompt['name']}]"
+
+
+def agent_prompts(library: dict | None = None) -> list[dict]:
+    return [p for p in (library or load_prompt_library())["prompts"] if is_agent_prompt(p)]
+
+
+def load_actions_log() -> dict:
+    log = read_json_file(ACTIONS_LOG_PATH)
+    log["format"] = ACTIONS_LOG_FORMAT
+    log["entries"] = [e for e in log.get("entries") or [] if isinstance(e, dict)]
+    log["marks_scanned"] = log.get("marks_scanned") if isinstance(log.get("marks_scanned"), dict) else {}
+    return log
+
+
+def save_actions_log(log: dict) -> None:
+    write_text_atomically(ACTIONS_LOG_PATH, json.dumps(log, indent=2, ensure_ascii=False))
+    st.session_state[ACTIONS_LOG_RUN_KEY] = log
+
+
+def current_actions_log() -> dict:
+    """The log as synced this run (see sync_actions_log), or as saved."""
+    return st.session_state.get(ACTIONS_LOG_RUN_KEY) or load_actions_log()
+
+
+def now_iso() -> str:
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def note_library_key(result: dict, search_state: dict) -> str:
+    """The library a result's note is in: all-library and in-scope hits carry their own."""
+    return result.get("_safe_lib") or search_state["library"]
+
+
+def log_sent_actions(search_state: dict, prompts: list[dict], staged: dict, package_file: Path) -> None:
+    """Log each note in use against each Agent that staged items from it, as sent."""
+    notes = list(dict.fromkeys(
+        (note_library_key(r, search_state), str(r.get("file_source", "")))
+        for r in discussion_results(search_state) if r.get("file_source")
+    ))
+    notes = [(lib, note) for lib, note in notes if lib != ALL_LIBRARIES_KEY]
+    log = load_actions_log()
+    for prompt in prompts:
+        indices = [i for i, item in enumerate(staged["items"]) if item.get("_agent_id") == prompt["id"]]
+        if not indices and len(prompts) == 1:
+            indices = list(range(len(staged["items"])))
+        if not indices:
+            continue  # this Agent staged nothing, so it actioned nothing
+        log["entries"] += [{
+            "id": uuid.uuid4().hex, "library": lib, "note": note, "agent_id": prompt["id"], "agent": prompt["name"],
+            "mark": actions_mark(prompt), "how": "sent", "status": "sent", "at": now_iso(),
+            "package": str(package_file), "items": indices, "links": [],
+        } for lib, note in notes]
+    save_actions_log(log)
+
+
+def package_action_status(entry: dict) -> tuple[str, list[str]]:
+    """(status, Salesforce links) of a sent entry, from where its package is and the connector's receipt."""
+    package_file = Path(entry["package"])
+    receipt = read_handoff_receipt(package_file)
+    if receipt:
+        results = [r for r in receipt.get("items") or [] if r.get("index") in entry.get("items", [])]
+        done = [r for r in results if r.get("status") in DONE_ITEM_STATUSES]
+        links = [str(r["url"]) for r in done if str(r.get("url") or "").startswith("https://")]
+        if done or (not results and receipt.get("status") == "done"):
+            return "done", links
+        return "failed", []
+    if (package_file.parent / WITHDRAWN_DIR / package_file.name).is_file() or not package_file.is_file():
+        return "withdrawn", []  # withdrawn on the Actions page, or deleted
+    return "sent", []
+
+
+def refresh_action_statuses(log: dict) -> bool:
+    """Bring sent entries up to date with their packages; done is final. Returns True if any changed."""
+    changed = False
+    for entry in log["entries"]:
+        if entry.get("how") != "sent" or entry.get("status") == "done":
+            continue
+        status, links = package_action_status(entry)
+        if status != entry.get("status"):
+            entry.update(status=status, links=links)
+            if status == "done":
+                entry["done_at"] = now_iso()
+            changed = True
+    return changed
+
+
+def mark_variants(mark: str) -> list[str]:
+    """The mark as typed and as a Markdown export may escape it, e.g. \\[SF\\_Tasks\\]."""
+    brackets = re.sub(r"([\[\]])", r"\\\1", mark)
+    escaped = re.sub(r"([\\`*_{}\[\]()#+\-.!|])", r"\\\1", mark)
+    return list(dict.fromkeys(v.lower() for v in (mark, brackets, escaped)))
+
+
+def notes_containing(lib_key: str, needles: list[str]) -> set[str]:
+    """Notes in a library's text index containing any of the (lower-case) needles."""
+    table = lib_key.replace('"', '""')
+    clause = " OR ".join("instr(lower(coalesce(text_block, '')), ?) > 0" for _ in needles)
+    try:
+        with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+            return {str(row[0]) for row in conn.execute(
+                f'SELECT DISTINCT file_source FROM "{table}" WHERE {clause}', needles)}
+    except sqlite3.Error:
+        return set()
+
+
+def scan_action_marks(log: dict, lib_keys: list[str], force: bool = False) -> bool:
+    """Log notes holding an Agent's mark as done by hand. A library is scanned when it was rescanned since its
+    last scan, the marks changed, or `force`. Entries stay when a mark is later removed. True if any changed."""
+    agents = agent_prompts()
+    signature = json.dumps(sorted((p["id"], actions_mark(p)) for p in agents))
+    rescans = load_text_rescan_status().get("libraries", {})
+    logged = {(e["library"], e["note"], e["agent_id"]) for e in log["entries"] if e.get("how") == "mark"}
+    changed = False
+    for lib in lib_keys:
+        scanned = log["marks_scanned"].get(lib) or {}
+        rescanned = (rescans.get(lib) or {}).get("at", "")
+        stale = (not scanned or scanned.get("marks") != signature
+                 or (rescanned and rescanned > scanned.get("rescan", "")))
+        if not (force or stale):
+            continue
+        for prompt in agents:
+            for note in sorted(notes_containing(lib, mark_variants(actions_mark(prompt)))):
+                if (lib, note, prompt["id"]) not in logged:
+                    log["entries"].append({
+                        "id": uuid.uuid4().hex, "library": lib, "note": note, "agent_id": prompt["id"],
+                        "agent": prompt["name"], "mark": actions_mark(prompt), "how": "mark", "status": "done",
+                        "at": now_iso(), "links": [],
+                    })
+                    logged.add((lib, note, prompt["id"]))
+        log["marks_scanned"][lib] = {"at": now_iso(), "rescan": rescanned, "marks": signature}
+        changed = True
+    return changed
+
+
+def sync_actions_log(lib_keys: list[str] | None = None, force_marks: bool = False) -> dict:
+    """Refresh sent entries and scan for marks in the given libraries (default: every visible corpus; hidden
+    ones are skipped, as in rescans), save if anything changed, and keep the result for this run."""
+    log = load_actions_log()
+    libraries = lib_keys if lib_keys is not None else [key for _name, key, _folder in resolve_text_rescan_targets(True)]
+    changed = refresh_action_statuses(log)
+    changed = scan_action_marks(log, libraries, force_marks) or changed
+    if changed:
+        save_actions_log(log)
+    st.session_state[ACTIONS_LOG_RUN_KEY] = log
+    return log
+
+
+def note_actions(lib_key: str, note: str) -> list[dict]:
+    """The most telling entry per Agent for a note: done before sent, then failed, then withdrawn."""
+    order = list(ACTION_STATUS_BADGES)
+    best: dict[str, dict] = {}
+    for entry in current_actions_log()["entries"]:
+        if entry["library"] != lib_key or entry["note"] != note:
+            continue
+        held = best.get(entry["agent_id"])
+        if held is None or (order.index(entry["status"]), entry.get("at", "")) < (order.index(held["status"]), held.get("at", "")):
+            best[entry["agent_id"]] = entry
+    return sorted(best.values(), key=lambda e: order.index(e["status"]))
+
+
+def agent_display_name(entry: dict, agents: dict[str, dict]) -> str:
+    prompt = agents.get(entry["agent_id"])
+    return prompt["name"] if prompt else entry.get("agent", "Agent")
+
+
+def action_badges(lib_key: str, note: str) -> str:
+    """' · ✓ SF_Tasks · ⏳ SF_Next_Step' for a note's label, or ''."""
+    agents = {p["id"]: p for p in load_prompt_library()["prompts"]}
+    return "".join(f" · {ACTION_STATUS_BADGES[e['status']]} {agent_display_name(e, agents)}"
+                   for e in note_actions(lib_key, note))
+
+
+def render_note_actions(lib_key: str, note: str) -> None:
+    """One caption line per Agent that actioned the note: how, when, and links to the Salesforce records."""
+    agents = {p["id"]: p for p in load_prompt_library()["prompts"]}
+    for entry in note_actions(lib_key, note):
+        when = format_when(datetime.datetime.fromisoformat(entry.get("done_at") or entry["at"]))
+        how = f"found `{entry['mark']}` in the note" if entry["how"] == "mark" else ACTION_STATUS_TEXT[entry["status"]]
+        links = " · ".join(f"[Open record ↗]({url})" for url in entry.get("links", []))
+        st.caption(f"{ACTION_STATUS_BADGES[entry['status']]} **{agent_display_name(entry, agents)}**: {how}, "
+                   f"{when}" + (f" · {links}" if links else ""))
+
+
+def actioned_filter_setting() -> dict:
+    setting = load_app_settings().get(ACTIONED_FILTER_SETTING) or {}
+    mode = setting.get("mode") if setting.get("mode") in ACTIONED_FILTER_MODES else "all"
+    return {"mode": mode, "agent": str(setting.get("agent") or "")}
+
+
+def persist_actioned_filter() -> None:
+    save_app_settings({ACTIONED_FILTER_SETTING: {
+        "mode": st.session_state.get("actioned_filter_mode") or "all",
+        "agent": st.session_state.get("actioned_filter_agent") or "",
+    }})
+
+
+def actioned_sources(lib_key: str, agent_id: str = "") -> set[str]:
+    return {e["note"] for e in current_actions_log()["entries"]
+            if e["library"] == lib_key and e["status"] in ACTIONED_STATUSES and (not agent_id or e["agent_id"] == agent_id)}
+
+
+def with_actioned_filter(search_filter: dict, lib_key: str) -> dict:
+    """Apply the Actioned filter: leave actioned notes out, or keep only them. Applying it twice changes nothing."""
+    setting = actioned_filter_setting()
+    if setting["mode"] == "all":
+        return search_filter
+    sources = actioned_sources(lib_key, setting["agent"])
+    if setting["mode"] == "hide":
+        return {**search_filter, "exclude_sources": sorted(set(search_filter.get("exclude_sources") or []) | sources)}
+    included = search_filter.get("include_sources")
+    return {**search_filter, "include_sources": sorted(sources if included is None else sources & set(included))}
+
+
+def describe_actioned_filter() -> str:
+    """'not yet actioned by SF_Tasks', or '' when the filter is off."""
+    setting = actioned_filter_setting()
+    if setting["mode"] == "all":
+        return ""
+    prompt = find_prompt(load_prompt_library(), setting["agent"]) if setting["agent"] else None
+    by = f"by {prompt['name']}" if prompt else "by any Agent"
+    return f"{'not yet actioned' if setting['mode'] == 'hide' else 'actioned'} {by}"
+
+
+def render_actioned_filter() -> None:
+    """Actioned: All notes / Not yet actioned / Only actioned, by one Agent or any."""
+    setting = actioned_filter_setting()
+    agents = {p["id"]: p["name"] for p in agent_prompts()}
+    st.session_state.setdefault("actioned_filter_mode", setting["mode"])
+    st.session_state.setdefault("actioned_filter_agent", setting["agent"] if setting["agent"] in agents else "")
+    with st.container(horizontal=True, vertical_alignment="center", gap="small", key="actioned_filter_row"):
+        st.markdown("Actioned", width="content", help=(
+            "Leave out notes an Agent has already actioned, or show only those. A note counts once its package "
+            "is sent (⏳) or done (✓), or when the Agent's mark, e.g. `[SF_Tasks]`, is in the note. Failed and "
+            "withdrawn packages don't count. Each Agent's mark is set on its card in the Prompt library."))
+        st.selectbox("Actioned", options=list(ACTIONED_FILTER_MODES), format_func=ACTIONED_FILTER_MODES.get,
+                     key="actioned_filter_mode", on_change=persist_actioned_filter, label_visibility="collapsed",
+                     width=170)
+        st.selectbox("Agent", options=["", *agents], format_func=lambda key: agents.get(key, "by any Agent"),
+                     key="actioned_filter_agent", on_change=persist_actioned_filter, label_visibility="collapsed",
+                     width=170, disabled=st.session_state["actioned_filter_mode"] == "all")
+
+
+def actions_log_backup() -> dict:
+    return {"format": ACTIONS_LOG_FORMAT, "exported_at": now_iso(), "entries": load_actions_log()["entries"]}
+
+
+def parse_actions_log_backup(raw: bytes) -> tuple[list[dict] | None, str]:
+    """The entries of an actions log backup, checked, or (None, why not)."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None, "That isn't an actions log backup (not valid JSON)."
+    if not isinstance(data, dict) or data.get("format") != ACTIONS_LOG_FORMAT:
+        return None, "That isn't an actions log backup from this app."
+    entries = data.get("entries")
+    required = ("id", "library", "note", "agent_id", "how", "status", "at")
+    if not isinstance(entries, list) or not all(
+        isinstance(e, dict) and all(e.get(k) for k in required) and e["status"] in ACTION_STATUS_BADGES
+        for e in entries
+    ):
+        return None, "The backup's entries are damaged."
+    return entries, ""
+
+
+def restore_actions_log(entries: list[dict], replace: bool) -> Path:
+    """Merge the entries into the log (by id, one mark entry per note and Agent), or replace it. The log as it
+    was is saved to the backups folder first; marks are scanned again on the next run. Returns that backup."""
+    SETTINGS_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    backup = SETTINGS_BACKUP_DIR / f"actions-log-before-restore-{datetime.datetime.now():%Y%m%d-%H%M%S}.json"
+    backup.write_text(json.dumps(actions_log_backup(), indent=2, ensure_ascii=False))
+    log = load_actions_log()
+    kept = [] if replace else log["entries"]
+    ids = {e["id"] for e in kept}
+    marks = {(e["library"], e["note"], e["agent_id"]) for e in kept if e["how"] == "mark"}
+    for entry in entries:
+        key = (entry["library"], entry["note"], entry["agent_id"])
+        if entry["id"] in ids or (entry["how"] == "mark" and key in marks):
+            continue
+        kept.append(entry)
+        ids.add(entry["id"])
+        if entry["how"] == "mark":
+            marks.add(key)
+    save_actions_log({**log, "entries": kept, "marks_scanned": {}})
+    return backup
+
+
+def restore_actions_log_from_upload() -> None:
+    upload = st.session_state.get("actions_log_upload")
+    if upload is None:
+        return
+    entries, problem = parse_actions_log_backup(upload.getvalue())
+    if entries is None:
+        st.session_state["actions_log_notice"] = ("error", problem)
+        return
+    replace = st.session_state.get("actions_log_restore_mode") == "Replace"
+    backup = restore_actions_log(entries, replace)
+    st.session_state["actions_log_notice"] = (
+        "success", f"{'Replaced the log with' if replace else 'Merged'} {plural(len(entries), 'entry')}"
+        f"{'' if replace else ' (ones already in the log are skipped)'}. The log as it was is in `{backup}`.")
+
+
+def render_actions_log_backup() -> None:
+    """Advanced: back up and restore the actions log."""
+    count = len(load_actions_log()["entries"])
+    st.caption(f"{plural(count, 'entry')} in `{ACTIONS_LOG_PATH}`. The log isn't in the Configure page's "
+               "settings export (it names notes), so back it up here.")
+    st.download_button(
+        "Back up actions log", data=json.dumps(actions_log_backup(), indent=2, ensure_ascii=False),
+        file_name=f"actions-log-{datetime.date.today()}.json", mime="application/json",
+        icon=":material/download:", key="actions_log_download", use_container_width=True, disabled=not count,
+    )
+    st.file_uploader("Restore from a backup", type=["json"], key="actions_log_upload")
+    st.radio("Restore", ["Merge", "Replace"], key="actions_log_restore_mode", horizontal=True,
+             label_visibility="collapsed",
+             help="**Merge** adds the backup's entries you don't have. **Replace** swaps the log for the backup. "
+             "Either way, the log as it was is saved to the backups folder first.")
+    st.button("Restore actions log", icon=":material/upload:", key="actions_log_restore",
+              on_click=restore_actions_log_from_upload, use_container_width=True,
+              disabled=st.session_state.get("actions_log_upload") is None)
+    if notice := st.session_state.pop("actions_log_notice", None):
+        (st.success if notice[0] == "success" else st.error)(notice[1])
+
+
+def delete_action_entries(entry_ids: list[str]) -> None:
+    log = load_actions_log()
+    log["entries"] = [e for e in log["entries"] if e["id"] not in set(entry_ids)]
+    save_actions_log(log)
+    st.session_state["actions_notice"] = f"Deleted {plural(len(entry_ids), 'entry')} from the actions log."
+
+
+def scan_marks_now() -> None:
+    sync_actions_log(force_marks=True)
+    st.session_state["actions_notice"] = "Scanned the indexed notes for Agents' marks."
+
+
+def render_actions_log() -> None:
+    """The Actions page's log tab: every note an Agent actioned, with filters and delete."""
+    log = sync_actions_log()
+    agents = {p["id"]: p for p in load_prompt_library()["prompts"]}
+    marks = ", ".join(f"`{actions_mark(p)}`" for p in agent_prompts())
+    st.caption(
+        "Notes logged when an Agent's package is sent (⏳), done once the connector's receipt says its items went "
+        f"through (✓), or failed (⚠) or withdrawn (↩). Notes holding an Agent's mark ({marks or 'none yet'}) are "
+        "logged as done by hand, after a rescan finds the mark. Entries stay if a mark is later removed."
+    )
+    entries = log["entries"]
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        agent_ids = list(dict.fromkeys(e["agent_id"] for e in entries))
+        chosen_agents = st.multiselect("Agent", agent_ids, key="actions_log_agents",
+                                       format_func=lambda key: agents[key]["name"] if key in agents else next(
+                                           (e.get("agent", key) for e in entries if e["agent_id"] == key), key),
+                                       placeholder="All Agents")
+        chosen_status = st.multiselect("Status", list(ACTION_STATUS_BADGES), key="actions_log_status",
+                                       format_func=lambda s: f"{ACTION_STATUS_BADGES[s]} {s}", placeholder="Any status")
+        query = st.text_input("Note", key="actions_log_query", placeholder="Search note names")
+        st.button("Scan notes for marks now", icon=":material/sell:", key="actions_log_scan", on_click=scan_marks_now,
+                  help="Look for each Agent's mark in every indexed note now, rather than after the next rescan.")
+    shown = sorted(
+        (e for e in entries if (not chosen_agents or e["agent_id"] in chosen_agents)
+         and (not chosen_status or e["status"] in chosen_status)
+         and query.strip().lower() in e["note"].lower()),
+        key=lambda e: e.get("done_at") or e["at"], reverse=True,
+    )
+    if not entries:
+        st.caption("Nothing logged yet.")
+        return
+    st.caption(f"{len(shown)} of {plural(len(entries), 'entry')}.")
+    rows = [{
+        "Status": f"{ACTION_STATUS_BADGES[e['status']]} {e['status']}",
+        "Note": Path(e["note"]).name,
+        "Library": e["library"],
+        "Agent": agent_display_name(e, agents),
+        "How": f"mark {e['mark']}" if e["how"] == "mark" else "sent",
+        "When": format_when(datetime.datetime.fromisoformat(e.get("done_at") or e["at"])),
+        "Record": (e.get("links") or [None])[0],
+    } for e in shown]
+    selection = st.dataframe(
+        rows, key="actions_log_table", on_select="rerun", selection_mode="multi-row", hide_index=True,
+        use_container_width=True,
+        column_config={"Record": st.column_config.LinkColumn("Record", display_text="Open ↗")},
+    )
+    picked = [shown[i]["id"] for i in selection.selection.rows if i < len(shown)]
+    with st.popover(f"Delete {len(picked)} selected" if picked else "Delete selected", icon=":material/delete:",
+                    disabled=not picked, help="Select rows in the table to delete them from the log"):
+        st.markdown(f"Delete {plural(len(picked), 'entry')} from the actions log? A note still holding its mark is "
+                    "logged again on the next scan.")
+        st.button("Delete", key="actions_log_delete", type="primary", on_click=delete_action_entries, args=(picked,))
+
+
 def render_actions_page() -> None:
     """Actions page (?page=actions): everything Agents sent to the outbox and what the connector did with it."""
     render_outbox_status(link=False)
@@ -3882,6 +4633,8 @@ def render_actions_page() -> None:
     )
     if notice := st.session_state.pop("actions_notice", None):
         st.toast(notice)
+    if offered := st.session_state.pop(OFFER_FIX_KEY, None):
+        offer_semantic_fix_dialog(offered)
     entries = load_outbox_entries(outbox)
     # "View in outbox" in the Agent box links here with ?package=<file name>: start filtered to it.
     if (linked := st.query_params.get("package")) and "actions_query" not in st.session_state:
@@ -3911,10 +4664,14 @@ def render_actions_page() -> None:
                for state in DUPLICATE_CHECK_STATES}
     # Tabs count packages and the items in them, as the duplicate check counts items.
     item_counts = {state: len(outbox_items({state: entries[state]})) for state in OUTBOX_STATES}
+    log_notes = {(e["library"], e["note"]) for e in sync_actions_log()["entries"]}
     tabs = st.tabs([
         f"{OUTBOX_STATES[state][0]} ({plural(len(entries[state]), 'package')}"
         + (f" · {plural(item_counts[state], 'item')}" if entries[state] else "") + ")"
-        + (f" · ⚠ {flagged[state]}" if flagged.get(state) else "") for state in OUTBOX_STATES])
+        + (f" · ⚠ {flagged[state]}" if flagged.get(state) else "") for state in OUTBOX_STATES
+    ] + [f"Actions log ({plural(len(log_notes), 'note')})"])
+    with tabs[-1]:
+        render_actions_log()
     for tab, state in zip(tabs, OUTBOX_STATES):
         with tab:
             shown = [entry for entry in entries[state] if outbox_entry_matches(entry, query)]
@@ -3984,6 +4741,8 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
         value = str(value or "")
     elif field in ("links", "references"):
         value = [str(item_id) for item_id in (value or [])]
+    elif field == "mark":
+        value = str(value or "").strip()  # empty means the default, [<Agent name>]
     else:
         value = str(value or "").strip()
         if not value:
@@ -3995,7 +4754,7 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
         update_prompt(prompt_id, output=output, command=before.get("command") or DEFAULT_AGENT_COMMANDS[output])
     if field == "output" and before.get("command", "") in ("", *DEFAULT_AGENT_COMMANDS.values()):
         update_prompt(prompt_id, command=DEFAULT_AGENT_COMMANDS[value])  # keep a default command in step with the output
-    if field in ("name", "text", "command"):
+    if field in ("name", "text", "command", "mark"):
         mark_text_saved(f"prompt_{prompt_id}")
 
 
@@ -4155,6 +4914,19 @@ def render_agent_workflow_editor(prompt: dict) -> None:
             "The last step. Its button in the Discussion panel stages what you agreed as "
             f"{OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()}; you confirm with **That's right** "
             "before anything goes to the outbox."
+        ),
+    )
+    st.text_input(
+        "Actioned mark",
+        value=prompt.get("mark", ""),
+        key=f"prompt_mark_{prompt_id}",
+        on_change=save_prompt_field,
+        args=(prompt_id, "mark"),
+        placeholder=f"[{prompt['name']}]",
+        help=(
+            "Tracks which notes this Agent has actioned. Notes it sends are logged in the **Actions log** "
+            "automatically. Type this mark into a note in Apple Notes to log something you did by hand: the next "
+            f"rescan finds it. Leave empty to use `[{prompt['name']}]`."
         ),
     )
 
@@ -4767,6 +5539,11 @@ def render_prompt_library_page() -> None:
     """Prompt library page (opened in its own tab): About me, corpus prompt, task prompts."""
     library = load_prompt_library()
     add_agent_border_style("[class*='st-key-agent_prompt_card_'] [data-testid='stExpander'] details")
+    # Agent cards also get a blue hue, folded or open, so they read as agentic at a glance.
+    st.html(f"<style>[class*='st-key-agent_prompt_card_'] [data-testid='stExpander'] details "
+            f"{{ background-color: rgba({AGENT_TINT}, 0.08) !important; }}"
+            f"[class*='st-key-agent_prompt_card_'] [data-testid='stExpander'] details > summary:hover "
+            f"{{ background-color: rgba({AGENT_TINT}, 0.14) !important; }}</style>")
     render_outbox_status()
     render_page_title("Prompt library")
     st.caption(
@@ -4932,6 +5709,8 @@ def render_prompt_library_page() -> None:
         )
         agents = [p for p in shown if is_agent_prompt(p)]
         render_prompt_section_cards("agent", agents, library, model_options, "No Agent prompts match.")
+
+    render_semantic_fixes_section(library)
 
     with st.container(border=True):
         st.subheader("Add a prompt")
@@ -5138,6 +5917,13 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict, safe_lib: str = 
     active = resolve_run_prompts(library, corpus_config)["tasks"]
     active_ids = {task["id"] for task in active}
     add_agent_border_style("[class*='st-key-use_agent_prompt_'] button", "[class*='st-key-active_agent_task']")
+    # Agent chips (Recent, Starred, Agent Starred) are shaded blue, deeper when chosen, whatever section they're in.
+    chip = "[class*='st-key-use_agent_prompt_'][class*='st-key-use_agent_prompt_'] button"
+    st.html(f"<style>[class*='st-key-use_agent_prompt_'] {{ --section: {AGENT_TINT}; }}"
+            f"{chip} {{ background-color: rgba({AGENT_TINT}, 0.22) !important; color: inherit !important; }}"
+            f"{chip}:hover {{ background-color: rgba({AGENT_TINT}, 0.36) !important; }}"
+            f"{chip}[data-testid='stBaseButton-primary'] {{ background-color: rgba({AGENT_TINT}, 0.55) !important; "
+            "font-weight: 600 !important; }</style>")
     st.html("<style>[class*='st-key-active_agent_task'] { padding: 0.1rem 0.25rem 0.1rem 0.75rem !important; }</style>")
     st.html(PROMPT_CHIP_STYLE)
 
@@ -6084,8 +6870,9 @@ def render_follow_up_discussion(
     corpus_prompt: str = "",
     model_options: list[str] | None = None,
     safe_lib: str = "",
-) -> str:
-    """Chat panel for follow-up questions about the notes from the last search; returns the follow-up model."""
+) -> tuple:
+    """Chat panel for follow-up questions about the notes from the last search; returns the follow-up model and
+    the dock holding the follow-up box (see render_discussion_body)."""
     st.subheader("Discussion")
 
     # Follow-ups can use a different (e.g. larger) model than the main answer.
@@ -6101,17 +6888,8 @@ def render_follow_up_discussion(
     model_key = f"follow_up_model_{safe_lib}"
     if st.session_state.get(model_key) not in options:
         st.session_state[model_key] = saved_model  # set here, not via index, so a prompt's model can replace it
-    model_name = st.selectbox(
-        "Follow-up model",
-        options=options,
-        key=model_key,
-        on_change=persist_follow_up_model,
-        args=(safe_lib,),
-        help=(
-            "Ollama model used for follow-up questions. It can differ from the main answer model, "
-            "e.g. a larger model for deeper discussion. Saved per corpus."
-        ),
-    )
+    # The picker is drawn in the Ask a follow-up box below; its value is already known from its key.
+    model_name = st.session_state[model_key]
     in_use = len({discussion_note_key(r) for r in discussion_results(search_state)})
     total = len({discussion_note_key(r) for r in search_state["results"]})
     notes = "the notes in this search" if in_use == total else f"{in_use} of {total} notes from this search"
@@ -6139,7 +6917,7 @@ def render_follow_up_discussion(
             help="Show the latest reply in the main output area; it keeps following new replies.",
         )
 
-    render_discussion_body(
+    dock = render_discussion_body(
         search_state,
         model_name,
         max_tokens,
@@ -6148,15 +6926,18 @@ def render_follow_up_discussion(
         key_prefix="panel",
         # A content-sized panel can be shorter than the default box, so expanding uses a fixed taller height.
         height=DISCUSSION_EXPANDED_HEIGHT if expanded else DISCUSSION_HEIGHT,
+        model_select=(model_key, options, safe_lib),
     )
-    return model_name
+    return model_name, dock
 
 
 def sticky_follow_up_style(box_key: str) -> str:
-    """CSS that keeps the follow-up box in view while a long answer beside it is scrolled.
+    """CSS that keeps the follow-up box and the Agent box (the dock holding both) in view while a long answer
+    beside them is scrolled, so you can answer its questions without scrolling back.
 
     A sticky element only travels within its parent, so the Discussion column is stretched to the full
-    height of the answer column first. The box gets the page background so text scrolling under it is hidden.
+    height of the answer column first. The dock gets the page background so text scrolling under it is hidden,
+    and scrolls within itself when it's taller than the window.
     """
     background = "#0e1117" if st.context.theme.type == "dark" else "#ffffff"
     # A column holds one .stVerticalBlock; the keyed box (or the wrapper carrying its key) sits directly in it.
@@ -6165,7 +6946,8 @@ def sticky_follow_up_style(box_key: str) -> str:
 [data-testid="stHorizontalBlock"]:has({column}) {{ align-items: stretch; }}
 {column} {{ align-self: stretch; }}
 {column} > .stVerticalBlock {{ height: 100%; }}
-.st-key-{box_key} {{ position: sticky; top: 4.25rem; z-index: 5; background: {background}; }}
+.st-key-{box_key} {{ position: sticky; top: 4.25rem; z-index: 5; background: {background};
+  max-height: calc(100vh - 5.5rem); overflow-y: auto; overflow-x: hidden; }}
 </style>"""
 
 
@@ -6179,8 +6961,12 @@ def render_discussion_body(
     key_prefix: str,
     height: int | str,
     in_dialog: bool = False,
-) -> None:
-    """Transcript, follow-up box and clear button, shared by the side panel and the pop-out."""
+    model_select: tuple[str, list[str], str] | None = None,
+):
+    """Transcript, follow-up box and clear button, shared by the side panel and the pop-out. Returns the dock
+    holding the follow-up box, for the Agent box to go in too.
+
+    `model_select` (widget key, model options, library key) puts the Follow-up model picker in the box."""
     discussion = search_state["discussion"]
     with st.container(height=height, border=True, autoscroll=True):
         if not discussion:
@@ -6220,16 +7006,35 @@ def render_discussion_body(
 
     render_follow_up_context(search_state, key_prefix)
     if not in_dialog:
-        st.html(sticky_follow_up_style(f"{key_prefix}_follow_up_box"))
-    with st.container(border=True, key=f"{key_prefix}_follow_up_box"):
+        st.html(sticky_follow_up_style(f"{key_prefix}_follow_up_dock"))
+    # The side panel's dock: the follow-up box, and the Agent box the caller adds to it, stay in view together.
+    dock = st.container() if in_dialog else st.container(key=f"{key_prefix}_follow_up_dock")
+    with dock, st.container(border=True, key=f"{key_prefix}_follow_up_box"):
         # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
         with st.container(horizontal=True, vertical_alignment="center"):
             st.markdown("Ask a follow-up", width="stretch")
+            if model_select:
+                select_key, options, safe_lib = model_select
+                model_name = st.selectbox(
+                    "Follow-up model",
+                    options=options,
+                    key=select_key,
+                    on_change=persist_follow_up_model,
+                    args=(safe_lib,),
+                    label_visibility="collapsed",
+                    width=190,
+                    help=(
+                        "Ollama model for the next follow-up. It can differ from the main answer model: a larger "
+                        "one for deeper discussion, a smaller one for a quick reply. Saved per corpus."
+                    ),
+                )
             big_box = st.toggle(
                 "Expand",
                 key=f"{key_prefix}_follow_up_expanded",
                 help="Make the follow-up box bigger for longer replies.",
             )
+        if model_select:
+            st.caption(describe_llm_speed(model_name))
         with st.form(f"{key_prefix}_follow_up_form", clear_on_submit=True, border=False):
             follow_up = st.text_area(
                 "Ask a follow-up",
@@ -6251,6 +7056,7 @@ def render_discussion_body(
     if submitted and follow_up.strip():
         if add_discussion_turn(search_state, follow_up.strip(), model_name, max_tokens, temperature, corpus_prompt):
             st.rerun(scope=rerun_scope)
+    return dock
 
 
 @st.dialog("Discussion", width="large", on_dismiss="rerun")
@@ -6305,6 +7111,50 @@ def render_library_counts(search_state: dict, key_prefix: str = "results") -> No
                 )
 
 
+FOLD_FOLDERS_OVER = 50  # in-scope notes beyond which folders fold up, so a long listing stays quick
+OPEN_FOLDERS_KEY = "gathered_open_folders"  # ids of the folders opened with ▸ while folded
+FOLDER_SELECTION_HELP = ("🚫 excludes every note in this folder and its sub-folders. 🎯 keeps them and excludes the "
+                         "other listed notes you haven't picked with 🎯.")
+
+
+def toggle_open_folder(folder_id: str) -> None:
+    opened = st.session_state.setdefault(OPEN_FOLDERS_KEY, set())
+    (opened.discard if folder_id in opened else opened.add)(folder_id)
+
+
+def folder_tree(notes: dict, safe_lib: str) -> list[dict]:
+    """The listed notes' folders, parents before children: {"path", "label", "depth", "direct": the notes in the
+    folder itself, "notes": (library key, file) of every note under it}. A folder holding no notes of its own
+    and a single sub-folder is merged with it ("Clients > Customers"); notes whose folder isn't known come last."""
+    root: dict = {"children": {}, "direct": []}
+    for note_key, blocks in notes.items():
+        path = blocks[0].get("_folder_path", "")
+        node = root
+        for part in path.split(FOLDER_PATH_SEPARATOR) if path else ["\uffff"]:  # sorts last
+            node = node["children"].setdefault(part, {"children": {}, "direct": []})
+        node["direct"].append((note_key, blocks))
+
+    def under(node: dict) -> list[tuple[str, str]]:
+        own = [(blocks[0].get("_safe_lib", safe_lib), file_source) for (_lib, file_source), blocks in node["direct"]]
+        return own + [key for child in node["children"].values() for key in under(child)]
+
+    nodes: list[dict] = []
+
+    def walk(node: dict, path: list[str], depth: int) -> None:
+        for name in sorted(node["children"], key=str.lower):
+            child, parts = node["children"][name], [name]
+            while not child["direct"] and len(child["children"]) == 1:
+                (next_name, child), = child["children"].items()
+                parts.append(next_name)
+            label = "Folder not known" if parts == ["\uffff"] else FOLDER_PATH_SEPARATOR.join(parts)
+            nodes.append({"path": path + parts, "label": label, "depth": depth, "direct": child["direct"],
+                          "notes": under(child)})
+            walk(child, path + parts, depth + 1)
+
+    walk(root, [], 0)
+    return nodes
+
+
 def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str, pick: dict | None = None) -> None:
     """The notes gathered by Find notes and Filter search only, one row per note, most recent hit first.
 
@@ -6345,14 +7195,38 @@ def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str, p
     label_col.caption("Exclude all")
     st.markdown('<hr style="margin:0.1rem 0 0.6rem">', unsafe_allow_html=True)
 
-    # Grouped under their folder path, sorted by path; notes whose folder isn't known come last.
-    folders: dict[str, list] = {}
-    for note_key, blocks in notes.items():
-        folders.setdefault(blocks[0].get("_folder_path", ""), []).append((note_key, blocks))
+    # Grouped under their folders as a tree, each folder with 🚫 and 🎯 for all the notes under it. Past
+    # FOLD_FOLDERS_OVER notes the folders fold up and a folder's notes are drawn only when it's opened.
+    folded = len(notes) > FOLD_FOLDERS_OVER
+    if folded:
+        st.caption(f"Over {FOLD_FOLDERS_OVER} notes, so folders are folded: **▸** opens one. 🚫 and 🎯 on a folder "
+                   "act on every note in it and its sub-folders.")
+    opened = st.session_state.setdefault(OPEN_FOLDERS_KEY, set())
     row = 0
-    for folder in sorted(folders, key=lambda path: (not path, path.lower())):
-        st.markdown(f"📁 **{folder or 'Folder not known'}** · {len(folders[folder])}")
-        for (library, file_source), blocks in folders[folder]:
+    for node in folder_tree(notes, safe_lib):
+        folder_id = hashlib.md5(json.dumps(node["path"]).encode()).hexdigest()[:12]
+        under = node["notes"]
+        excluded = sum(1 for lib, source in under if source in get_excluded_notes(lib))
+        box = f"exclude_folder_{folder_id}"
+        st.session_state[box] = excluded == len(under)
+        indent = "\u2003" * node["depth"]
+        text = (f"{indent}📁 **{node['label']}** · {plural(len(under), 'note')}"
+                + (f" · {excluded} excluded" if excluded else ""))
+        check_col, target_col, help_col, label_col = st.columns([1, 1, 0.6, 9.4], vertical_alignment="center")
+        check_col.checkbox("🚫", key=box, on_change=toggle_folder_excluded, args=(box, under))
+        target_col.button("🎯", key=f"target_folder_{folder_id}", type="tertiary", on_click=target_notes,
+                          args=(under, listed))
+        help_col.markdown("\u200b", help=FOLDER_SELECTION_HELP)
+        is_open = not folded or folder_id in opened
+        if folded:
+            label_col.button(f"{'▾' if is_open else '▸'} {text}", key=f"open_folder_{folder_id}", type="tertiary",
+                             on_click=toggle_open_folder, args=(folder_id,),
+                             help="Show or hide the notes directly in this folder")
+        else:
+            label_col.markdown(text)
+        if not is_open:
+            continue
+        for (library, file_source), blocks in node["direct"]:
             route = routes[(blocks[0].get("_safe_lib", safe_lib), file_source)]
             with st.container(key=f"gathered_{route}_{row}"):
                 render_filter_result_row(library, file_source, blocks, listed, library_folder, safe_lib,
@@ -6372,7 +7246,7 @@ def render_filter_result_row(
     name = Path(file_source).name
     label = (f"~~{name}~~ · excluded" if excluded else name) + (
         f"  ·  {library}" if library and not blocks[0].get("_folder_path") else ""
-    )
+    ) + action_badges(note_lib, file_source)
     if pick is not None:  # pick mode: add this note to the reference document, or take it out
         found = resolve_source_path(file_source, blocks[0].get("_library_folder", library_folder),
                                     blocks[0].get("_uploads_dirs", search_state["uploads_dirs"]))
@@ -6418,6 +7292,7 @@ def render_filter_result_row(
             note_uploads = blocks[0].get("_uploads_dirs", search_state["uploads_dirs"])
             path = resolve_source_path(file_source, note_folder, note_uploads)
             st.caption(str(path) if path else f"Source: `{file_source}`")
+            render_note_actions(note_lib, file_source)
             render_full_document(file_source, path, note_lib, "gathered")
 
 
@@ -6460,6 +7335,34 @@ def describe_staged_item(item: dict) -> str:
     text = f"**{staged_item_title(item)}** — " + " · ".join(details) if details else f"**{staged_item_title(item)}**"
     body = item.get("description") or item.get("body") or ""
     return text + (f"  \n{truncate_text(body, 200)}" if body else "")
+
+
+STAGED_FIELD_NAMES = {
+    "subject": "Subject", "title": "Title", "description": "Description", "body": "Body", "to": "To",
+    "due_date": "Due date", "priority": "Priority", "owner": "Owner", "related_to": "Related to",
+    "field": "Field", "value": "New value", "previous": "Current value", "allow_duplicate": "Create anyway",
+}
+LONG_STAGED_FIELDS = ("description", "body", "value", "previous")  # shown in full in a copyable box
+
+
+def render_full_staged_item(item: dict) -> None:
+    """Folded under a staged item: every field exactly as it goes into the package, long text in full."""
+    sent = {key: value for key, value in item.items() if not key.startswith("_") and key != "type"}
+    with st.expander("Everything that will be sent", icon=":material/visibility:"):
+        for key, value in sent.items():
+            name = STAGED_FIELD_NAMES.get(key, key.replace("_", " ").capitalize())
+            if key in LONG_STAGED_FIELDS:
+                st.caption(f"**{name}**" + ("" if value else " · empty"))
+                if value:
+                    st.code(str(value), language=None, wrap_lines=True)
+                continue
+            if key == "related_to":
+                value = (value or {}).get("name", "") + (f" ({value['kind']})" if (value or {}).get("kind") else "")
+            elif key == "to":
+                value = ", ".join(value or [])
+            elif isinstance(value, bool):
+                value = "yes" if value else "no"
+            st.markdown(f"**{name}:** {value if value not in ('', None) else '*not set*'}")
 
 
 def unstage_item(agent: dict, index: int) -> None:
@@ -6662,6 +7565,7 @@ def send_staged_to_outbox(
     except Exception as exc:
         agent["send_error"] = f"Couldn't write to the outbox: {exc}"
         return
+    log_sent_actions(search_state, prompts, staged, path)
     agent["sent"].append({
         "file": str(path),
         "type": staged["type"],
@@ -6783,6 +7687,19 @@ def render_agent_panel(
                 st.caption(
                     "No reference snapshot yet: the task executor can refresh one so the Agent uses real record names."
                 )
+        # Folded until needed; its title says when a note is waiting to go with Execute.
+        note_key = f"agent_last_note_{search_state.get('id', '')}"
+        typed = str(st.session_state.get(note_key, "")).strip()
+        with st.expander("One last note" + (" · will be sent" if typed else ""), icon=":material/edit_note:"):
+            last_note = st.text_area(
+                "One last note",
+                key=note_key,
+                height=90,
+                placeholder="e.g. exclude points 2-5, or make them all due Friday",
+                label_visibility="collapsed",
+                help="Sent with **Execute** only, as a final instruction that overrides the discussion where they "
+                "differ. Saves another round in the discussion before staging.",
+            )
         if st.button(
             f"Execute :material/smart_toy: {label} with context",
             key="agent_run",
@@ -6797,7 +7714,7 @@ def render_agent_panel(
             with st.spinner(f"`{model_name}` is staging the {item_kind}…"):
                 try:
                     agent["staged"] = stage_agent_batch(
-                        search_state, prompts, model_name, max_tokens, temperature, corpus_prompt
+                        search_state, prompts, model_name, max_tokens, temperature, corpus_prompt, last_note
                     )
                     agent["needs_work"] = False
                 except Exception as exc:
@@ -6821,6 +7738,7 @@ def render_agent_panel(
                             render_update_diff(item)
                         else:
                             st.markdown(link_opportunity_names(describe_staged_item(item)))
+                        render_full_staged_item(item)
                         render_reference_picker(agent, index, item)
                         render_duplicate_check(agent, index, item)
                         render_next_step_checks(agent, index, item)
@@ -6990,6 +7908,7 @@ def render_search_results(
             if best is not None:
                 label += f" (distance: {best:.3f})"
             hit_folder, hit_lib, hit_uploads = hit_location(hits[0])
+            label += action_badges(hit_lib, file_source)
             note_key = (library, file_source)
             use_key = f"use_note_{search_state.get('id', '')}_{library}_{file_source}"
             if use_key not in st.session_state:
@@ -7004,6 +7923,7 @@ def render_search_results(
                 help="Use this note in the discussion and for the Agent. Untick to leave it out of the next replies.",
             )
             with note_col.expander(label if note_key in in_use_keys else f"~~{label}~~ · left out"):
+                render_note_actions(hit_lib, file_source)
                 render_source_document(
                     file_source,
                     hits,
@@ -7013,7 +7933,7 @@ def render_search_results(
                 )
 
     with chat_col:
-        follow_up_model = render_follow_up_discussion(
+        follow_up_model, dock = render_follow_up_discussion(
             search_state,
             model_name,
             max_tokens,
@@ -7023,7 +7943,9 @@ def render_search_results(
             safe_lib,
         )
         if search_state.get("agent"):
-            render_agent_panel(search_state, notes_in_use, follow_up_model, max_tokens, temperature, corpus_prompt)
+            with dock:  # under the follow-up box, so both stay in view as the answer is scrolled
+                render_agent_panel(search_state, notes_in_use, follow_up_model, max_tokens, temperature,
+                                   corpus_prompt)
 
 
 def get_pending_index_settings(safe_lib: str, corpus_config: dict) -> tuple[str, float, bool]:
@@ -8364,7 +9286,13 @@ LLM_CANCEL_STYLE = """<style>
   position: fixed !important; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
   width: auto !important; z-index: 1000;
 }
-[class*="st-key-llm_cancel_"] button { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); }
+[class*="st-key-llm_cancel_"] button {
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+  background-color: rgb(255, 140, 0) !important; border-color: rgb(255, 140, 0) !important; color: #fff !important;
+}
+[class*="st-key-llm_cancel_"] button:hover {
+  background-color: rgb(230, 120, 0) !important; border-color: rgb(230, 120, 0) !important;
+}
 </style>"""
 _LLM_CANCEL_KEYS = itertools.count()  # one Cancel per LLM call; restarts each script run
 
@@ -8374,15 +9302,18 @@ def cancel_llm() -> None:
 
 
 def show_llm_cancel_button():
-    """A floating Cancel for the LLM call about to run; returns its slot, to clear when the call ends.
+    """A floating orange Cancel Query for the LLM call about to run; returns its slot, to clear when the call ends.
 
     Clicking it reruns the script, which stops the call at its next page update (see LLM_TICK_SECONDS).
     """
     slot = st.empty()
-    with slot.container(key=f"llm_cancel_{next(_LLM_CANCEL_KEYS)}"):
+    number = next(_LLM_CANCEL_KEYS)
+    with slot.container(key=f"llm_cancel_{number}"):
         st.html(LLM_CANCEL_STYLE)
         st.button(
-            "Cancel",
+            "Cancel Query",
+            # Unique per call, as one run can make several (Re-assess); not llm_cancel_*, which the style places.
+            key=f"stop_llm_{number}",
             icon=":material/stop_circle:",
             type="primary",
             on_click=cancel_llm,
@@ -8718,6 +9649,8 @@ def describe_search_filter(search_filter: dict) -> str:
     elif any_terms:
         parts.append("(" + " OR ".join(f"`{term}`" for term in any_terms) + ")")
     parts.extend(f"NOT `{term}`" for term in search_filter.get("none", []))
+    if actioned := describe_actioned_filter():
+        parts.append(actioned)
     return " AND ".join(parts)
 
 
@@ -8782,7 +9715,7 @@ def count_excluded_notes() -> int:
 
 
 def with_exclusions(search_filter: dict, lib_key: str) -> dict:
-    return {**search_filter, "exclude_sources": get_excluded_notes(lib_key)}
+    return with_actioned_filter({**search_filter, "exclude_sources": get_excluded_notes(lib_key)}, lib_key)
 
 
 def exclude_checkbox_key(lib_key: str, file_source: str) -> str:
@@ -8818,11 +9751,20 @@ def toggle_excluded_note(lib_key: str, file_source: str) -> None:
 
 def target_note(lib_key: str, file_source: str, notes: list[tuple[str, str]]) -> None:
     """🎯 shortcut: include this note and exclude every listed note not also picked with 🎯."""
+    target_notes([(lib_key, file_source)], notes)
+
+
+def target_notes(picked: list[tuple[str, str]], notes: list[tuple[str, str]]) -> None:
+    """🎯 on a note or a folder: include these and exclude every listed note not also picked with 🎯."""
     picks = st.session_state.setdefault(TARGET_PICKS_KEY, set())
-    picks.add((lib_key, file_source))
+    picks.update(picked)
     for lib, source in notes:
         _set_note_excluded(lib, source, (lib, source) not in picks)
     persist_excluded_notes()
+
+
+def toggle_folder_excluded(widget_key: str, notes: list[tuple[str, str]]) -> None:
+    set_notes_excluded(notes, bool(st.session_state.get(widget_key)))
 
 
 def set_notes_excluded(notes: list[tuple[str, str]], excluded: bool) -> None:
@@ -8847,7 +9789,7 @@ def clear_excluded_notes() -> None:
 
 def find_matching_sources(safe_lib: str, search_filter: dict, limit: int | None = None) -> list[str]:
     """File sources of notes matching the filter, in index order. Empty if the library has no index."""
-    having, params = build_note_filter_sql(search_filter)
+    having, params = build_note_filter_sql(with_actioned_filter(search_filter, safe_lib))
     if not having:
         return []
     table = safe_lib.replace('"', '""')
@@ -9086,7 +10028,8 @@ def gathered_full_notes(gathered: dict, keys: list[tuple[str, str]]) -> list[dic
     blocks: list[dict] = []
     for key in keys:
         entry = gathered["notes"][key]
-        blocks += entry["blocks"] if entry["route"] == "literal" else load_note_blocks(key[0], [key[1]])
+        note_blocks = entry["blocks"] if entry["route"] == "literal" else load_note_blocks(key[0], [key[1]])
+        blocks += [{**block, "_safe_lib": key[0]} for block in note_blocks]  # its library, for the actions log
     return blocks
 
 
@@ -9144,8 +10087,8 @@ def clear_search_results() -> None:
 
 
 def clear_all_search_page() -> None:
-    """Clear all button: filter, exclusions, results and discussion, the question, Find notes about and the
-    injected task prompts. Settings (route, Max results, model, toggles) stay."""
+    """Clear all button: filter, exclusions, results and discussion, the question, Find notes about, the
+    injected task prompts and the Ask box's Salesforce chip. Settings (route, Max results, model) stay."""
     clear_search_filter()
     clear_search_results()
     for field in SEARCH_FILTER_FIELDS:
@@ -9155,6 +10098,7 @@ def clear_all_search_page() -> None:
     st.session_state["find_notes_query"] = ""
     st.session_state[ACTIVE_TASK_PROMPTS_KEY] = []
     st.session_state.pop("question_task_token", None)
+    save_app_settings({SALESFORCE_CONTEXT_SETTING: False})
     for key in [key for key in st.session_state if str(key).endswith("_follow_up_text")]:
         del st.session_state[key]
 
@@ -9171,6 +10115,7 @@ def perform_search(
 
     Returns (result blocks, notice for the user, closest vector distance when no result carries one).
     """
+    search_filter = with_actioned_filter(search_filter, search_lib.library_name)
     q = Query(
         search_lib,
         embedding_model_name=embedding_model,
@@ -9348,6 +10293,8 @@ if not all_libraries:
     st.stop()
 # All-corpora scans and rebuilds skip hidden corpora.
 scan_libraries = filter_libraries_for_display(all_libraries)
+# Agents' actions, brought up to date (receipts, and marks in notes rescanned since) for the badges and filter.
+sync_actions_log([resolve_library_registry_name(lib) for lib in scan_libraries])
 
 if is_single_corpus_mode():
     selected_lib = SINGLE_CORPUS_DISPLAY_NAME
@@ -9578,6 +10525,9 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
             st.session_state["multi_rebuild_request"] = multi_rebuild_model
             st.session_state["multi_rebuild_text_only"] = True
 
+with st.sidebar.expander("Advanced — Actions log", expanded=False):
+    render_actions_log_backup()
+
 with st.sidebar.expander("Debug details", expanded=False):
     render_debug_panel(selected_lib, safe_lib, _status_lib, corpus_config)
 
@@ -9738,8 +10688,8 @@ with filter_box_col:
             on_click=clear_all_search_page,
             use_container_width=True,
             help="Start the page afresh: clears the filter, exclusions, results and discussion, your question, "
-            "**Find notes about** and any injected task prompt. Settings such as the route, **Max results** and "
-            "the model stay.",
+            "**Find notes about**, any injected task prompt and the **☁️ Salesforce** reference. Settings such "
+            "as the route, **Max results** and the model stay.",
         )
         # Two routes into the notes: semantic (vector) search or literal text matching. The controls below
         # follow the route; the Ask box's Search button uses it too.
@@ -9845,30 +10795,36 @@ with filter_box_col:
                         label_visibility="collapsed",
                     )
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
-        if "max_results" not in st.session_state:  # saved between searches and sessions
-            st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
+        _max_key = max_results_key(exact_text_only)
+        _max_limit = MAX_RESULTS_LIMITS["literal" if exact_text_only else "semantic"]
+        if _max_key not in st.session_state:  # saved between searches and sessions
+            st.session_state[_max_key] = min(max(int(load_app_settings().get(_max_key, 15) or 15), 1), _max_limit)
         search_filter = get_search_filter_from_widgets()
         # One line: Max results (its title beside the box), then what the filter and exclusions leave out, with
         # Clear exclusions rightmost.
         with st.container(horizontal=True, vertical_alignment="center", gap="small", key="max_results_row"):
             st.markdown("Max results", width="content",
-                        help="The most passages (Semantic route) or notes (Literal route) a search returns. "
-                        "Saved for next time.")
+                        help="The most passages (Semantic route, up to 50) or notes (Literal route, up to 1000) a "
+                        f"search returns. **Ask (filtered only)** answers from at most {ASK_NOTES_LIMIT} notes; "
+                        "**Filter search only** lists up to the full number. Each route's value is saved.")
             result_limit = st.number_input(
                 "Max results",
                 min_value=1,
-                max_value=50,
-                key="max_results",
+                max_value=_max_limit,
+                key=_max_key,
                 on_change=persist_max_results,
+                args=(_max_key,),
                 width=80,
                 label_visibility="collapsed",
             )
             # The filter takes the free space and wraps within it, so the rest stays on this line.
-            st.caption(f"Filter: {describe_search_filter(search_filter)}" if is_filter_active(search_filter) else "")
+            st.caption(f"Filter: {describe_search_filter(search_filter)}"
+                       if is_filter_active(search_filter) or describe_actioned_filter() else "")
             if count_excluded_notes():
                 st.caption(f"🚫 {count_excluded_notes()} excluded", width="content")
                 st.button("Clear", key="clear_exclusions", type="tertiary", on_click=clear_excluded_notes,
                           help=f"Clear exclusions: search the {count_excluded_notes()} excluded note(s) again.")
+        render_actioned_filter()
 
         # The route's search settings, at the bottom of the Filter box.
         with st.container():
@@ -10102,9 +11058,10 @@ with ask_box_col:
             literal = (literal_matches(search_filter, safe_lib, library_folder, corpus_root_path,
                                        scan_libraries if search_all_libraries and not is_single_corpus_mode() else None)
                        if exact_text_only and has_positive_filter_terms(search_filter) else None)
+            ask_limit = min(result_limit, ASK_NOTES_LIMIT)
             literal_count = (
                 "" if literal is None else
-                f" · {result_limit} of {len(literal)} notes" if len(literal) > result_limit
+                f" · {ask_limit} of {len(literal)} notes" if len(literal) > ask_limit
                 else f" · {len(literal)} note{'' if len(literal) == 1 else 's'}"
             )
             search_clicked = st.button(
@@ -10119,12 +11076,13 @@ with ask_box_col:
                     else "**Semantic**: passages ranked by meaning."
                 )
                 + " Its notes are added to **In scope** under the Filter box."
-                + f" Returns at most {result_limit} results (**Max results**, in the Filter box).",
+                + f" Returns at most {ask_limit if exact_text_only else result_limit} results (**Max results**, in the "
+                "Filter box" + (f"; Ask answers from {ASK_NOTES_LIMIT} notes at most" if exact_text_only else "") + ").",
             )
             _in_scope = gathered_notes(safe_lib)
             _kept_in_scope = kept_gathered_notes(_in_scope) if _in_scope else []
             # Only worth offering when the in-scope notes aren't just what Ask (filtered only) sends anyway.
-            same_as_filtered = literal is not None and len(literal) <= result_limit and set(_kept_in_scope) == literal
+            same_as_filtered = literal is not None and len(literal) <= ask_limit and set(_kept_in_scope) == literal
             scope_clicked = bool(_kept_in_scope) and not same_as_filtered and st.button(
                 f"🗂 Ask about in-scope notes ({len(_kept_in_scope)})",
                 use_container_width=True,
@@ -10147,6 +11105,8 @@ if new_search:
     persist_question()
     remember_searched_dates()
 run_filter_only = filter_only_clicked or (search_clicked and exact_text_only)
+# Filter search only lists up to Max results (up to 1000); Ask (filtered only) answers from at most ASK_NOTES_LIMIT.
+notes_limit = result_limit if filter_only_clicked else min(result_limit, ASK_NOTES_LIMIT)
 _gathered = gathered_notes(safe_lib)
 _in_scope_before = len(_gathered["notes"]) if _gathered else 0
 search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode()
@@ -10188,7 +11148,7 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                 final_results, library_counts = exact_text_search_all_libraries(
                     filter_libraries_for_display(all_libraries),
                     search_filter,
-                    result_limit,
+                    notes_limit,
                     corpus_root_path,
                     apply_exclusions=not filter_only_clicked,
                 )
@@ -10208,7 +11168,7 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                     # Filter search only lists excluded notes too, so they can be un-ticked.
                     run_filter = search_filter if filter_only_clicked else with_exclusions(search_filter, safe_lib)
                     run_filter = with_path_matches(run_filter, safe_lib, library_folder, corpus_root_path)
-                    final_results = exact_text_search(safe_lib, run_filter, result_limit)
+                    final_results = exact_text_search(safe_lib, run_filter, notes_limit)
                 if not final_results:
                     notice = f"No notes match {describe_search_filter(search_filter)}."
             else:

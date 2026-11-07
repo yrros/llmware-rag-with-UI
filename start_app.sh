@@ -4,6 +4,16 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
+# One fixed port, so a bookmark (or a Dock web app) always works. LLM_NOTES_SERVICE is set when
+# llm_notes_service.sh runs this in the background.
+PORT="${LLM_NOTES_PORT:-8510}"
+URL="http://localhost:$PORT"
+if curl -fsS -m 2 "$URL/_stcore/health" >/dev/null 2>&1; then
+    echo "LLM-Notes is already running at $URL"
+    [ -z "${LLM_NOTES_SERVICE:-}" ] && open "$URL"
+    exit 0
+fi
+
 # Large full-corpus ingests open many files (SQLite, LanceDB, PDFs). Raise the limit on macOS.
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
@@ -31,6 +41,10 @@ done
 echo "Ensuring Ollama is running for Answer with LLM..."
 python3 ensure_ollama_ready.py || echo "Warning: Ollama warm-up failed; continuing anyway."
 
-echo "Starting RAG Workspace Manager..."
-# Bind to localhost only — the app has no login and can show full documents.
-exec streamlit run UI-semantic-search.py --server.address localhost
+echo "Starting RAG Workspace Manager on $URL..."
+# Bind to localhost only — the app has no login and can show full documents. In the background service there's
+# no one to show a browser tab to, so it runs headless.
+HEADLESS=false
+[ -n "${LLM_NOTES_SERVICE:-}" ] && HEADLESS=true
+exec streamlit run UI-semantic-search.py --server.address localhost --server.port "$PORT" \
+    --server.headless "$HEADLESS"
