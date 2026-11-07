@@ -87,6 +87,10 @@
                 "type": "string",
                 "description": "Trimmed to 2000 characters."
               },
+              "close_date": {
+                "type": "string",
+                "description": "YYYY-MM-DD the opportunity is expected to close, or empty. Optional: older snapshots leave it out."
+              },
               "url": {
                 "type": "string",
                 "description": "The record's web page, for the notes app to link to. Optional."

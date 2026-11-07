@@ -10,6 +10,10 @@ import threading
 import datetime
 import difflib
 import html
+import http.client
+import itertools
+import queue
+import socket
 import uuid
 from contextlib import contextmanager
 from functools import lru_cache
@@ -114,6 +118,10 @@ FOLLOW_UP_NUM_CTX = 8192
 # the model isn't reloaded for every small change; bigger windows use more memory.
 OLLAMA_CONTEXT_SIZES = (8192, 16384, 32768, 65536)
 LLM_PROGRESS_SECONDS = 3  # how often the tokens-per-second count refreshes while an answer streams
+# How often the page is touched while waiting on Ollama: Streamlit only acts on a click (Cancel) when the
+# running script updates the page.
+LLM_TICK_SECONDS = 0.5
+LLM_CANCELLED_KEY = "llm_cancelled"
 # Max tokens: up to roughly a short novel. English runs at about 0.75 words per token.
 WORDS_PER_TOKEN = 0.75
 LLM_MAX_TOKENS_LIMIT = 50000
@@ -835,6 +843,30 @@ def persist_search_filter() -> None:
     save_app_settings({"search_filter": current})
 
 
+def search_inputs() -> tuple[str, str]:
+    """What's typed to search with: the question and Find notes about."""
+    return st.session_state.get("question_text", ""), st.session_state.get("find_notes_query", "")
+
+
+def remember_search_inputs() -> None:
+    """Note what's typed, once the question box is drawn, so a rerun with the same text isn't a new search."""
+    st.session_state["filter_revealed_for"] = search_inputs()
+
+
+def reveal_filter_for_new_search(terms_by_field: dict[str, list[str]]) -> None:
+    """Open Narrow by terms, and the folded fields holding terms, when a new search starts with a filter set.
+
+    A new search is a changed question or Find notes about text, or a Search or Find notes click (read from
+    their keys, as the buttons come after the filter). In between, the boxes stay as you left them.
+    """
+    clicked = st.session_state.get("search_button") or st.session_state.get("find_notes_button")
+    if any(terms_by_field.values()) and (clicked or search_inputs() != st.session_state.get("filter_revealed_for")):
+        st.session_state["narrow_by_terms"] = True
+        for field, terms in terms_by_field.items():
+            if field != "all" and terms:
+                st.session_state[f"filter_fold_{field}"] = True
+
+
 # Quick date buttons under Must include. Notes carry their date as 2026-10-25, and weekly notes are headed
 # "Week#43"; ISO weeks (Monday to Sunday) and ISO week-years, so 29 Dec 2025 is in 2026 Week#1.
 QUICK_DATE_LABELS = {
@@ -958,6 +990,10 @@ def route_tint_style(route: str) -> str:
 
 # Filter fields as small rounded boxes, and their quick dates and quick terms as rounded chips.
 FILTER_FIELD_STYLE = """<style>
+.st-key-filter_box .st-key-clear_all button[data-testid] { border: 1px solid #e5484d !important; color: #e5484d !important; }
+.st-key-filter_box .st-key-clear_all button[data-testid]:hover {
+  border-color: #e5484d !important; background: color-mix(in srgb, #e5484d 14%, transparent) !important;
+}
 [class*="st-key-filter_field_"] { padding: 0.45rem 0.7rem 0.6rem !important; border-radius: 0.75rem !important; }
 [class*="st-key-quick_date_"] button, [class*="st-key-quick_term_"] button {
   border: 1px solid color-mix(in srgb, currentColor 28%, transparent) !important;
@@ -967,6 +1003,13 @@ FILTER_FIELD_STYLE = """<style>
 [class*="st-key-quick_date_"] button:hover, [class*="st-key-quick_term_"] button:hover {
   border-color: currentColor !important;
 }
+/* Max results, the filter in words, exclusions and Clear exclusions stay on one line; the filter text takes
+   what's left and wraps within it. */
+.st-key-max_results_row { flex-wrap: nowrap; }
+.st-key-max_results_row > div { min-width: 0; }
+.st-key-max_results_row > div:has([data-testid="stCaptionContainer"]) { flex-shrink: 1; }
+/* The folded OR and NOT fields: a tighter fold, like the Must include box. */
+[class*="st-key-filter_fold_"] summary { padding-top: 0.35rem !important; padding-bottom: 0.35rem !important; }
 </style>"""
 
 
@@ -991,11 +1034,14 @@ def apply_quick_term(term: str, field: str) -> None:
     persist_search_filter()
 
 
-def render_filter_heading(field: str, label: str, field_help: str) -> None:
-    """A filter field's heading with its quick date buttons on the same line, and quick search terms below."""
+def render_filter_heading(field: str, label: str, field_help: str, show_label: bool = True) -> None:
+    """A filter field's heading with its quick date buttons on the same line, and quick search terms below.
+
+    In a fold the fold's title names the field, so `show_label=False` leaves just the help icon.
+    """
     today = datetime.date.today()
     with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
-        st.markdown(label, width="content", help=field_help)
+        st.markdown(label if show_label else "", width="content", help=field_help)
         for kind, button_label in QUICK_DATE_LABELS.items():
             terms = quick_date_terms(kind, today, field)
             shown = " and ".join(f"`{t}`" for t in terms) if len(terms) <= 2 else f"`{terms[0]}` … `{terms[-1]}`"
@@ -1532,6 +1578,7 @@ def new_prompt_record(
     output: str = "text",
     model: str = "",
     references=None,
+    salesforce: bool = False,
 ) -> dict:
     return {
         "id": uuid.uuid4().hex[:12],
@@ -1544,6 +1591,7 @@ def new_prompt_record(
         "command": DEFAULT_AGENT_COMMANDS.get(output, "") if agent else "",
         "model": model,  # empty: use whichever model is selected
         "references": list(references or []),  # reference documents sent whenever this prompt is used
+        "salesforce": bool(salesforce),  # send the Salesforce records the notes mention whenever it's used
         "tags": clean_filter_terms(tags or []),
         "starred": bool(starred),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1577,6 +1625,7 @@ def load_prompt_library() -> dict:
             prompt.setdefault("model", "")
             prompt.setdefault("links", [])
             prompt.setdefault("references", [])  # reference documents sent whenever this prompt is used
+            prompt.setdefault("salesforce", False)
         return library
     return save_prompt_library(
         {
@@ -1620,17 +1669,20 @@ def mark_prompt_used(prompt_id: str) -> None:
 
 
 def select_prompt_stacks(library: dict) -> tuple[list[dict], list[dict]]:
-    """Five most recently used task prompts, then the most recently used starred ones not already listed."""
+    """Five most recently used task prompts, and every starred one, most recently used first.
+
+    The Ask panel leaves out of its starred rows only the prompts its Recent row actually shows, so a
+    starred prompt never vanishes because Recent ran out of room.
+    """
     task_prompts = [p for p in library["prompts"] if not p.get("global")]
     recent = sorted(
         (p for p in task_prompts if p.get("last_used")), key=lambda p: p["last_used"], reverse=True
     )[:PROMPT_STACK_SIZE]
-    recent_ids = {p["id"] for p in recent}
     starred = sorted(
-        (p for p in task_prompts if p.get("starred") and p["id"] not in recent_ids),
+        (p for p in task_prompts if p.get("starred")),
         key=lambda p: (p.get("last_used") or "", p.get("created") or ""),
         reverse=True,
-    )[:PROMPT_STACK_SIZE]
+    )
     return recent, starred
 
 
@@ -2069,6 +2121,109 @@ def reference_prompt_text(records: list[dict], next_steps: bool = False) -> str:
     )
 
 
+SALESFORCE_CONTEXT_SETTING = "salesforce_context"  # the Ask box's Salesforce chip, kept between sessions
+SALESFORCE_PROMPT_HELP = (
+    "Whenever this prompt is used, send the Salesforce records for the opportunities the notes mention (stage, "
+    "close date, Next Step, ID and link) and your open tasks on them, from the connector's snapshot. Useful for "
+    "drafting updates that need the link or close date."
+)
+SALESFORCE_CONTEXT_LIMIT = 20  # opportunities sent as context, so a small local model isn't swamped
+
+
+def salesforce_context_records(results: list) -> list[dict]:
+    """The snapshot's opportunities that these notes mention, as sent with the Salesforce chip."""
+    return notes_reference_records(results)[:SALESFORCE_CONTEXT_LIMIT]
+
+
+def snapshot_taken(snapshot: dict | None) -> str:
+    """When the connector took the snapshot, e.g. "27 Oct 08:00", or ""."""
+    try:
+        return datetime.datetime.fromisoformat((snapshot or {}).get("generated_at", "")).strftime("%d %b %H:%M")
+    except ValueError:
+        return ""
+
+
+def salesforce_context_text(results: list) -> str:
+    """Salesforce facts for the opportunities the notes mention, plus my open tasks on them (empty if none).
+
+    Unlike the Agents' list, which only names records, this gives what a question might need: stage, close
+    date, Next Step, the record's ID and its link, so the model can quote them.
+    """
+    records = salesforce_context_records(results)
+    if not records:
+        return ""
+    lines = []
+    for r in records:
+        facts = [f"Account: {r['account']}" if r.get("account") else "",
+                 f"Stage: {r['stage']}" if r.get("stage") else "",
+                 f"Close date: {r['close_date']}" if r.get("close_date") else "",
+                 f"Next Step: “{r['next_step']}”" if r.get("next_step") else "Next Step: (empty)",
+                 f"Last activity: {r['last_activity']}" if r.get("last_activity") else "",
+                 f"Last updated: {r['last_updated']}" if r.get("last_updated") else "",
+                 f"Salesforce ID: {r['id']}" if r.get("id") else ""]
+        lines.append(f"- Opportunity: {r['name']}\n  " + "; ".join(f for f in facts if f)
+                     + (f"\n  Link: {r['url']}" if str(r.get("url") or "").startswith("https://") else ""))
+    names = {str(r.get(k) or "").strip().lower() for r in records for k in ("name", "account")} - {""}
+    tasks = [t for t in reference_open_tasks() if str(t.get("related") or "").strip().lower() in names]
+    for t in tasks[:OPEN_TASKS_PROMPT_LIMIT]:
+        facts = [f"due {t['due_date']}" if t.get("due_date") else "no due date", t.get("status") or "",
+                 f"on {t['related']}" if t.get("related") else ""]
+        lines.append(f"- My open task: {t['subject']} (" + ", ".join(f for f in facts if f) + ")"
+                     + (f"\n  Link: {t['url']}" if str(t.get("url") or "").startswith("https://") else ""))
+    taken = snapshot_taken(load_reference_snapshot())
+    return (
+        f"Salesforce records for the opportunities these notes mention (a read-only snapshot"
+        f"{' taken ' + taken if taken else ''}; the notes may be newer). Use them for facts such as stage, "
+        "close date, Next Step and links. When you give a link, copy it exactly from this list and put it on its "
+        "own line; never make a link up.\n" + "\n".join(lines)
+    )
+
+
+def with_salesforce_context(search_state: dict, corpus_prompt: str, results: list) -> str:
+    """The preamble plus Salesforce records when the search has the Salesforce chip on."""
+    if not search_state.get("salesforce_context"):
+        return corpus_prompt
+    return "\n\n".join(part for part in (corpus_prompt, salesforce_context_text(results)) if part.strip())
+
+
+def toggle_ask_salesforce_context() -> None:
+    save_app_settings({SALESFORCE_CONTEXT_SETTING: not load_app_settings().get(SALESFORCE_CONTEXT_SETTING, False)})
+
+
+def toggle_follow_up_salesforce_context(search_state: dict) -> None:
+    search_state["salesforce_context"] = not search_state.get("salesforce_context")
+
+
+def render_follow_up_context(search_state: dict, key_prefix: str) -> None:
+    """Discussion: extra context for the next follow-ups — the Salesforce records the notes in use mention."""
+    snapshot = load_reference_snapshot()
+    records = salesforce_context_records(discussion_results(search_state)) if snapshot else []
+    on = bool(search_state.get("salesforce_context"))
+    taken = snapshot_taken(snapshot)
+    count = f"{len(records)} opportunit{'y' if len(records) == 1 else 'ies'}"
+    if not snapshot:
+        note = "No Salesforce snapshot yet: the connector writes one when it refreshes."
+    elif not records:
+        note = "The notes in use mention no opportunities in the snapshot."
+    elif on:
+        note = f"Sending {count} and your open tasks on them · snapshot {taken}"
+    else:
+        note = f"{count} in the notes in use · snapshot {taken}"
+    with st.container(horizontal=True, vertical_alignment="center", gap="xsmall", key=f"{key_prefix}_add_context"):
+        st.caption("📎 Add context:", width="content")
+        st.button(
+            "☁️ Salesforce ✓" if on else "☁️ Salesforce",
+            key=f"{key_prefix}_salesforce_context",
+            type="primary" if on else "secondary",
+            disabled=not snapshot or (not records and not on),
+            on_click=toggle_follow_up_salesforce_context,
+            args=(search_state,),
+            help="Send the opportunities the notes in use mention (stage, close date, Next Step, ID and link) and "
+            "your open tasks on them with the next follow-ups. Click again to stop sending them.",
+        )
+        st.caption(note)
+
+
 def agent_action(prompt: dict) -> str:
     return f"\"{agent_command(prompt)}\" ({OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()})"
 
@@ -2204,14 +2359,14 @@ def link_markdown(link: dict, guess: str = "") -> str:
     return f"{link_status_dot(link['url'])}[{title}]({url.replace(' ', '%20').replace(')', '%29')})"
 
 
-def render_prompt_links(prompts: list[dict], library: dict, guess: str) -> None:
+def render_prompt_links(prompts: list[dict], library: dict, guess: str, width="stretch") -> None:
     """The injected prompts' links, inline (task executor first), each opening in a new tab."""
     chosen = {link_id for prompt in prompts for link_id in prompt.get("links", [])}
     if not chosen:
         return
     parts = [link_markdown(link, guess) for link in ordered_links(library) if link["id"] in chosen and link.get("url")]
     if parts:
-        st.markdown(" · ".join(parts))
+        st.markdown(" · ".join(parts), width=width)
 
 
 # --- Reference documents: notes sent to the LLM as background, attached to prompts or added for one question --
@@ -2403,15 +2558,30 @@ def render_ask_reference_row(library: dict, tasks: list[dict]) -> None:
     """Ask box: reference documents for this question — recent ones as chips, a finder for the rest, and what
     will be sent (with those the injected prompts bring)."""
     refs = reference_documents(library)
-    if not refs:
+    snapshot = load_reference_snapshot()
+    if not refs and not snapshot:
         return
     active = list(st.session_state.get(ACTIVE_REFERENCES_KEY, []))
     from_prompts = {i: task["name"] for task in tasks for i in task.get("references", [])}
-    with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
+    salesforce_on = bool(load_app_settings().get(SALESFORCE_CONTEXT_SETTING))
+    salesforce_prompts = [task["name"] for task in tasks if task.get("salesforce")]
+    with st.container(horizontal=True, vertical_alignment="center", gap="xsmall", key="ask_reference_row"):
         st.caption("Reference:")
+        if snapshot:
+            st.button(
+                "☁️ Salesforce ✓" if salesforce_on or salesforce_prompts else "☁️ Salesforce",
+                key="use_salesforce_context",
+                type="primary" if salesforce_on or salesforce_prompts else "secondary",
+                on_click=toggle_ask_salesforce_context,
+                disabled=bool(salesforce_prompts) and not salesforce_on,
+                help=(f"Sent with {', '.join(salesforce_prompts)}." if salesforce_prompts and not salesforce_on else
+                      "Send the Salesforce records for the opportunities the found notes mention (stage, close "
+                      "date, Next Step, ID and link) and your open tasks on them, from the connector's snapshot "
+                      f"taken {snapshot_taken(snapshot) or 'earlier'}. Stays on until you click it again."),
+            )
         for ref in recent_reference_documents(library):
             st.button(
-                reference_label(ref),
+                reference_label(ref) + (" ✓" if ref["id"] in active or ref["id"] in from_prompts else ""),
                 key=f"use_reference_{ref['id']}",
                 type="primary" if ref["id"] in active or ref["id"] in from_prompts else "secondary",
                 on_click=toggle_active_reference,
@@ -2421,23 +2591,28 @@ def render_ask_reference_row(library: dict, tasks: list[dict]) -> None:
                 else "Send this reference document with your question.",
             )
         labels = {ref["id"]: reference_label(ref) for ref in refs}
-        st.selectbox(
-            "Find a reference document",
-            options=list(labels),
-            index=None,
-            format_func=labels.get,
-            key="reference_finder",
-            on_change=pick_reference_from_finder,
-            placeholder="Find a reference document…",
-            label_visibility="collapsed",
-        )
+        if refs:
+            st.selectbox(
+                "Find a reference document",
+                options=list(labels),
+                index=None,
+                format_func=labels.get,
+                key="reference_finder",
+                on_change=pick_reference_from_finder,
+                placeholder="Find a reference document…",
+                label_visibility="collapsed",
+            )
     sending = run_reference_documents(tasks, library)
-    if sending:
+    salesforce_sending = bool(snapshot) and (salesforce_on or bool(salesforce_prompts))
+    if sending or salesforce_sending:
         st.markdown(
             "Sending: " + " · ".join(
-                reference_view_link(ref) + (f" <small>({html.escape(from_prompts[ref['id']])})</small>"
-                                            if ref["id"] in from_prompts else "")
-                for ref in sending
+                (["☁️ Salesforce records"
+                  + (f" <small>({html.escape(', '.join(salesforce_prompts))})</small>"
+                     if salesforce_prompts and not salesforce_on else "")] if salesforce_sending else [])
+                + [reference_view_link(ref) + (f" <small>({html.escape(from_prompts[ref['id']])})</small>"
+                                               if ref["id"] in from_prompts else "")
+                   for ref in sending]
             ),
             unsafe_allow_html=True,
         )
@@ -3131,10 +3306,13 @@ def render_outbox_entry(entry: dict, state: str) -> None:
     status = state if state in ("waiting", "withdrawn") else receipt.get("status", "")
     icon, status_text = PACKAGE_STATUS.get(status, PACKAGE_STATUS[""])
     kind = {"note": "note", "task": "task", "email": "email", "update": "update"}.get(package.get("item_type"), "item")
+    flagged = sum(1 for index, item in enumerate(items) if item_duplicate_matches(entry, index, item)) \
+        if state in DUPLICATE_CHECK_STATES else 0
     label = (
         f"{icon} {format_when(entry['when'])} · {len(items)} {kind}{'' if len(items) == 1 else 's'}"
         + (f" · Agent:{prompt_name}" if prompt_name else "")
         + f" · {status_text}"
+        + (f" · ⚠ {flagged} possible duplicate{'s' if flagged != 1 else ''}" if flagged else "")
     )
     with st.expander(label, expanded=state == "failed"):
         details = [f"File `{entry['path'].name}`"]
@@ -3180,6 +3358,11 @@ def render_outbox_entry(entry: dict, state: str) -> None:
                 line = f"**{staged_item_title(item)}**"
             icon = RECEIPT_ITEM_ICONS.get(result.get("status"), "⏳" if state == "waiting" else "")
             st.markdown(f"{icon} {link_opportunity_names(line)}")
+            if state in DUPLICATE_CHECK_STATES:
+                if links := item_salesforce_links(item):
+                    st.caption("Check in Salesforce: " + links)
+                for match in item_duplicate_matches(entry, index, item):
+                    st.markdown(describe_duplicate_match(match))
             notes_line = []
             if result.get("record_id"):
                 notes_line.append(f"{result.get('object', 'Record')} `{result['record_id']}`")
@@ -3418,6 +3601,265 @@ def save_package_edits(path_text: str, entry_key: str, indexes: list[int]) -> No
     st.session_state["actions_notice"] = f"Saved changes to `{path.name}`."
 
 
+# --- Duplicate check on the Actions page ----------------------------------------
+DUPLICATE_CHECK_KEY = "outbox_duplicate_check"  # the last check's results, for this session
+DUPLICATE_CHECK_STATES = ("waiting", "withdrawn")  # the items checked; any state can be what they repeat
+DUPLICATE_CHECK_MAX_TOKENS = 2048  # room for a reasoning model (e.g. Qwen3) to think before it answers
+DUPLICATE_CANDIDATE_LIMIT = 12  # existing items shown to the model per checked item, same record first
+# A verdict on every candidate, not just a list of matches: small models then flag far fewer false duplicates.
+DUPLICATE_CHECK_SCHEMA = {
+    "type": "object",
+    "properties": {"verdicts": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"number": {"type": "integer"}, "same": {"type": "boolean"}, "reason": {"type": "string"}},
+        "required": ["number", "same", "reason"],
+    }}},
+    "required": ["verdicts"],
+}
+ITEM_KIND_NAMES = {"task": "Task", "note": "Note", "email": "Email", "update": "Next Step"}
+
+
+def outbox_item_key(entry: dict, index: int) -> str:
+    return f"{entry['path'].name}#{index}"
+
+
+def outbox_item_text(item: dict) -> str:
+    """What an item says, for the model: its kind, title and the start of its body."""
+    body = item.get("description") or item.get("body") or ""
+    text = f"{ITEM_KIND_NAMES.get(item.get('type'), 'Item')}: {staged_item_title(item)}"
+    return text + (f" — {truncate_text(body, 300)}" if body else "")
+
+
+def item_title_words(item: dict) -> set[str]:
+    """Key words of an item's title (a Next Step's value), as task subjects are compared."""
+    return task_subject_words(item.get("value", "") if item.get("type") == "update" else staged_item_title(item))
+
+
+def item_record_name(item: dict) -> str:
+    return str((item.get("related_to") or {}).get("name") or "").strip().lower()
+
+
+def outbox_items(entries: dict[str, list[dict]]) -> list[dict]:
+    """Every readable item in the outbox, in every state, with where it is."""
+    found = []
+    for state, group in entries.items():
+        for entry in group:
+            package = entry["package"] if isinstance(entry["package"], dict) else {}
+            for index, item in enumerate(package.get("items", [])):
+                if isinstance(item, dict) and item.get("type"):
+                    found.append({"key": outbox_item_key(entry, index), "state": state, "item": item,
+                                  "when": entry["when"], "text": outbox_item_text(item)})
+    return found
+
+
+def duplicate_candidates(checked: dict, others: list[dict], open_tasks: list[dict]) -> list[dict]:
+    """What a checked item might repeat: items of the same kind on the same record, or, when either has no
+    record, sharing a key word; tasks also against my open tasks in Salesforce. Same record first, newest first."""
+    item, record = checked["item"], item_record_name(checked["item"])
+    words = item_title_words(item)
+
+    def related(other_record: str, other_words: set[str]) -> int:
+        if record and other_record:
+            return 2 if record == other_record else 0
+        return 1 if words & other_words else 0
+
+    found = []
+    for other in others:
+        if other["key"] == checked["key"] or other["item"].get("type") != item.get("type"):
+            continue
+        if score := related(item_record_name(other["item"]), item_title_words(other["item"])):
+            found.append({"kind": "outbox", "score": score, "when": other["when"], "key": other["key"],
+                          "state": other["state"], "text": other["text"]})
+    if item.get("type") == "task":
+        for task in open_tasks:
+            if score := related(str(task.get("related") or "").strip().lower(), task_subject_words(task["subject"])):
+                found.append({"kind": "salesforce", "score": score, "when": None, "task": task,
+                              "text": f"Task: {task['subject']}"})
+    found.sort(key=lambda c: (-c["score"], -(c["when"].timestamp() if c["when"] else 0)))
+    return found[:DUPLICATE_CANDIDATE_LIMIT]
+
+
+def duplicate_check_messages(checked: dict, candidates: list[dict]) -> list[dict]:
+    record = (checked["item"].get("related_to") or {}).get("name") or "no record"
+    lines = "\n".join(f"{n}. {c['text']}" + (" (already in Salesforce)" if c["kind"] == "salesforce" else "")
+                      for n, c in enumerate(candidates, 1))
+    return [{"role": "user", "content": (
+        "You check a CRM outbox for duplicates. Below is a NEW item and a numbered list of EXISTING items.\n"
+        "An existing item is a duplicate only when it is the same action or says the same thing as the new item, "
+        "even in different words (e.g. 'Send revised pricing' and 'Email Jo the updated price list'). Different "
+        "actions on the same deal are NOT duplicates (e.g. 'Book kickoff workshop' and 'Send revised pricing'), nor "
+        "is a follow-up to an earlier action unless it repeats it.\n"
+        "For every existing item, say whether it is the same action (same: true or false) with a short reason.\n\n"
+        f"NEW item (on {record}):\n{checked['text']}\n\nEXISTING items:\n{lines}"
+    )}]
+
+
+def run_duplicate_check(entries: dict[str, list[dict]], model_name: str, chat=None, on_step=None) -> dict:
+    """Ask the model, for each Waiting and Withdrawn item, which of its shortlisted items it repeats.
+
+    A pair is asked about once. Results map each item key to its matches, both ways round, so the other
+    item shows the match too when it's on screen.
+    """
+    chat = chat or chat_with_ollama
+    items = outbox_items(entries)
+    open_tasks = reference_open_tasks()
+    checked_items = [i for i in items if i["state"] in DUPLICATE_CHECK_STATES]
+    by_key = {i["key"]: i for i in items}
+    matches: dict[str, list[dict]] = {}
+    asked: set[frozenset] = set()
+    errors, comparisons = [], 0
+    for number, checked in enumerate(checked_items, 1):
+        if on_step:
+            on_step(number, len(checked_items))
+        candidates = [c for c in duplicate_candidates(checked, items, open_tasks)
+                      if c["kind"] == "salesforce" or frozenset((checked["key"], c["key"])) not in asked]
+        if not candidates:
+            continue
+        asked.update(frozenset((checked["key"], c["key"])) for c in candidates if c["kind"] == "outbox")
+        comparisons += len(candidates)
+        try:
+            # Thinking off: a reasoning model judges these as well without it, and many times faster.
+            reply, _usage = chat(duplicate_check_messages(checked, candidates), model_name,
+                                 max_tokens=DUPLICATE_CHECK_MAX_TOKENS, temperature=0.0,
+                                 response_format=DUPLICATE_CHECK_SCHEMA, think=False)
+            found = [v for v in json.loads(reply).get("verdicts", []) if isinstance(v, dict) and v.get("same") is True]
+        except Exception as exc:  # one bad reply shouldn't stop the rest
+            errors.append(f"{checked['text'][:60]}: {exc}")
+            continue
+        for match in found:
+            try:
+                candidate = candidates[int(match["number"]) - 1]
+            except (KeyError, ValueError, TypeError, IndexError):
+                continue
+            reason = str(match.get("reason") or "").strip()
+            if candidate["kind"] == "salesforce":
+                matches.setdefault(checked["key"], []).append(
+                    {"kind": "salesforce", "task": candidate["task"], "reason": reason, "text": checked["text"]})
+                continue
+            other = by_key[candidate["key"]]
+            matches.setdefault(checked["key"], []).append(
+                {"kind": "outbox", "key": other["key"], "state": other["state"], "when": other["when"],
+                 "text": checked["text"], "other_text": other["text"], "reason": reason})
+            matches.setdefault(other["key"], []).append(
+                {"kind": "outbox", "key": checked["key"], "state": checked["state"], "when": checked["when"],
+                 "text": other["text"], "other_text": checked["text"], "reason": reason})
+    return {"when": datetime.datetime.now(), "model": model_name, "checked": len(checked_items),
+            "comparisons": comparisons, "open_tasks": len(open_tasks), "matches": matches, "errors": errors}
+
+
+def item_duplicate_matches(entry: dict, index: int, item: dict) -> list[dict]:
+    """The last check's matches for this item, unless it has been edited since."""
+    check = st.session_state.get(DUPLICATE_CHECK_KEY) or {}
+    text = outbox_item_text(item)
+    return [m for m in check.get("matches", {}).get(outbox_item_key(entry, index), []) if m["text"] == text]
+
+
+def describe_duplicate_match(match: dict) -> str:
+    if match["kind"] == "salesforce":
+        return f"⚠ **Looks like your open Salesforce task** {describe_open_task(match['task'])} — {match['reason']}"
+    where = f"{OUTBOX_STATES.get(match['state'], ('',))[0]} · {format_when(match['when'])}"
+    return f"⚠ **Looks like** “{truncate_text(match['other_text'], 120)}” ({where}) — {match['reason']}"
+
+
+def item_salesforce_links(item: dict) -> str:
+    """Links to check an item in Salesforce: the record it's on, and my open tasks on that record."""
+    name = (item.get("related_to") or {}).get("name") or ""
+    record = find_reference_record(name) if name else None
+    links = []
+    if record and str(record.get("url") or "").startswith("https://"):
+        links.append(f"[Open {record['name']} ↗]({record['url']})")
+    on = name.strip().lower()
+    tasks = [t for t in reference_open_tasks() if on and str(t.get("related") or "").strip().lower() == on]
+    if tasks:
+        shown = [f"[{truncate_text(t['subject'], 40)} ↗]({t['url']})" if str(t.get("url") or "").startswith("https://")
+                 else f"“{truncate_text(t['subject'], 40)}”" for t in tasks[:5]]
+        links.append(f"your open tasks on it: {', '.join(shown)}" + (f" and {len(tasks) - 5} more" if len(tasks) > 5 else ""))
+    return " · ".join(links)
+
+
+def plural(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def describe_check_scope(entries: dict[str, list[dict]]) -> str:
+    """'7 items in 3 packages (6 tasks, 1 Next Step)': what the check covers, counted the way the tabs are."""
+    items = [i for i in outbox_items(entries) if i["state"] in DUPLICATE_CHECK_STATES]
+    packages = sum(len(entries[state]) for state in DUPLICATE_CHECK_STATES)
+    kinds: dict[str, int] = {}
+    for i in items:
+        name = ITEM_KIND_NAMES.get(i["item"].get("type"), "Item")
+        kinds[name] = kinds.get(name, 0) + 1
+    breakdown = ", ".join(plural(n, name if name == "Next Step" else name.lower()) for name, n in kinds.items())
+    return f"{plural(len(items), 'item')} in {plural(packages, 'package')}" + (f" ({breakdown})" if breakdown else "")
+
+
+def duplicate_check_model_options() -> tuple[bool, list[str]]:
+    ok, installed = discover_ollama_models()
+    return ok, list(installed if ok and installed else SUGGESTED_OLLAMA_MODELS)
+
+
+def model_size(name: str) -> float:
+    """Billions of parameters from a model tag such as `qwen3:30b` or `llama3.2:3b` (0 if it doesn't say)."""
+    match = re.search(r"(\d+(?:\.\d+)?)b\b", name.lower())
+    return float(match.group(1)) if match else 0.0
+
+
+def persist_duplicate_check_model() -> None:
+    save_app_settings({"duplicate_check_model": st.session_state.get("duplicate_check_model")})
+
+
+def render_duplicate_check_panel(entries: dict[str, list[dict]]) -> None:
+    """Actions page: a button to check Waiting and Withdrawn items for duplicates, and the last check's summary."""
+    to_check = sum(1 for i in outbox_items(entries) if i["state"] in DUPLICATE_CHECK_STATES)
+    ok, models = duplicate_check_model_options()
+    if st.session_state.get("duplicate_check_model") not in models:
+        # Until one is chosen, the largest installed model: small ones judge duplicates poorly.
+        saved = load_app_settings().get("duplicate_check_model")
+        st.session_state["duplicate_check_model"] = saved if saved in models else max(models, key=model_size)
+    with st.container(border=True):
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            model = st.selectbox("Model", models, key="duplicate_check_model", on_change=persist_duplicate_check_model,
+                                 width=220, help="The local Ollama model that judges whether two items are the same. A larger model "
+                                 "(e.g. `qwen3:30b`) judges much better; a small one like `llama3.2:3b` misses "
+                                 "rewordings and flags different actions.")
+            clicked = st.button(
+                "🔍 Check for duplicates",
+                key="duplicate_check_run",
+                disabled=not ok or not to_check,
+                help="Compares each Waiting and Withdrawn item with the other items in the outbox (any tab) and, for "
+                "tasks, your open tasks in Salesforce. Items on the same record, or sharing a word when one has no "
+                "record, are shortlisted; the model then judges which say the same thing, even in other words. "
+                "Nothing is changed: likely duplicates are marked ⚠ for you to withdraw or keep.",
+            )
+        if not ok:
+            st.caption("Ollama isn't running, so the check can't run.")
+        if clicked:
+            bar = st.progress(0.0, text="Checking…")
+            st.session_state[DUPLICATE_CHECK_KEY] = {
+                **run_duplicate_check(entries, model,
+                                      on_step=lambda n, total: bar.progress(n / total, text=f"Checking item {n} of {total}…")),
+                "scope": describe_check_scope(entries),
+            }
+            bar.empty()
+        check = st.session_state.get(DUPLICATE_CHECK_KEY)
+        if check:
+            flagged = sum(1 for i in outbox_items(entries) if i["state"] in DUPLICATE_CHECK_STATES
+                          and any(m["text"] == i["text"] for m in check["matches"].get(i["key"], [])))
+            st.caption(
+                f"Checked {check['scope']} on the Waiting and Withdrawn tabs at "
+                f"{check['when']:%H:%M} with `{check['model']}`: {check['comparisons']} comparisons, against the "
+                f"outbox and your {check['open_tasks']} open Salesforce tasks. "
+                + (f"**⚠ {plural(flagged, 'item')} look{'s' if flagged == 1 else ''} like duplicates** (marked below)."
+                   if flagged else "No likely duplicates.")
+                + (f" **{len(check['errors'])} couldn't be checked:**" if check["errors"] else "")
+            )
+            for error in check["errors"]:
+                st.caption(f"Couldn't check {error}")
+        else:
+            st.caption(f"To check: {describe_check_scope(entries)} on the Waiting and Withdrawn tabs. "
+                       "Each item also links to its record in Salesforce.")
+
+
 def render_actions_page() -> None:
     """Actions page (?page=actions): everything Agents sent to the outbox and what the connector did with it."""
     render_outbox_status(link=False)
@@ -3462,7 +3904,17 @@ def render_actions_page() -> None:
                 help="Clear the filter",
             )
         st.button("Refresh", icon=":material/refresh:", key="actions_refresh")
-    tabs = st.tabs([f"{OUTBOX_STATES[state][0]} ({len(entries[state])})" for state in OUTBOX_STATES])
+    render_duplicate_check_panel(entries)
+    check = st.session_state.get(DUPLICATE_CHECK_KEY) or {}
+    flagged = {state: sum(1 for i in outbox_items({state: entries[state]})
+                          if any(m["text"] == i["text"] for m in check.get("matches", {}).get(i["key"], [])))
+               for state in DUPLICATE_CHECK_STATES}
+    # Tabs count packages and the items in them, as the duplicate check counts items.
+    item_counts = {state: len(outbox_items({state: entries[state]})) for state in OUTBOX_STATES}
+    tabs = st.tabs([
+        f"{OUTBOX_STATES[state][0]} ({plural(len(entries[state]), 'package')}"
+        + (f" · {plural(item_counts[state], 'item')}" if entries[state] else "") + ")"
+        + (f" · ⚠ {flagged[state]}" if flagged.get(state) else "") for state in OUTBOX_STATES])
     for tab, state in zip(tabs, OUTBOX_STATES):
         with tab:
             shown = [entry for entry in entries[state] if outbox_entry_matches(entry, query)]
@@ -3524,7 +3976,7 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
     value = st.session_state.get(f"prompt_{field}_{prompt_id}")
     if field == "tags":
         value = clean_filter_terms(value)
-    elif field in ("global", "starred", "agent"):
+    elif field in ("global", "starred", "agent", "salesforce"):
         value = bool(value)
     elif field == "output":
         value = value if value in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
@@ -3606,6 +4058,7 @@ def add_prompt_from_form() -> None:
             model=st.session_state.get("new_prompt_model") or "",
             references=[ref_id for ref_id in st.session_state.get("new_prompt_references", [])
                         if find_reference_document(ref_id, library)],
+            salesforce=bool(st.session_state.get("new_prompt_salesforce", False)),
         )
     )
     save_prompt_library(library)
@@ -3798,7 +4251,7 @@ def render_prompt_card(
                     key=f"prompt_starred_{prompt_id}",
                     on_change=save_prompt_field,
                     args=(prompt_id, "starred"),
-                    help="Starred prompts fill the Ask panel's Starred row.",
+                    help="Starred prompts fill the Ask panel's Starred row (Agents: its Agent Starred row).",
                 )
                 st.checkbox(
                     "Agent",
@@ -3887,6 +4340,14 @@ def render_prompt_card(
                     help="Sent to the LLM as background whenever this prompt is used, Agent or not. "
                     "Make them in **Reference documents** at the top of this page.",
                 )
+            st.checkbox(
+                "☁️ Send Salesforce records",
+                value=bool(prompt.get("salesforce")),
+                key=f"prompt_salesforce_{prompt_id}",
+                on_change=save_prompt_field,
+                args=(prompt_id, "salesforce"),
+                help=SALESFORCE_PROMPT_HELP,
+            )
             if agent:
                 render_agent_workflow_editor(prompt)
             if prompt.get("last_used"):
@@ -3926,12 +4387,261 @@ def render_prompt_section_cards(
                   on_click=set_prompts_open, args=(ids, True))
         st.button("Collapse all", key=f"prompts_collapse_{section}", icon=":material/unfold_less:", type="tertiary",
                   on_click=set_prompts_open, args=(ids, False))
-    for prompt in prompts:
-        render_prompt_card(prompt, model_options, ordered_links(library), reference_documents(library))
+    for index, prompt in enumerate(prompts):
+        # The card, with ↑ / ↓ beside it to move it within its section.
+        with st.container(horizontal=True, vertical_alignment="top", gap="xsmall"):
+            render_prompt_card(prompt, model_options, ordered_links(library), reference_documents(library))
+            with st.container(horizontal=True, gap=None, width="content"):
+                st.button(":material/arrow_upward:", key=f"prompt_up_{prompt['id']}", type="tertiary",
+                          disabled=index == 0, on_click=swap_prompts, args=(prompt["id"], ids[index - 1]),
+                          help="Move up")
+                st.button(":material/arrow_downward:", key=f"prompt_down_{prompt['id']}", type="tertiary",
+                          disabled=index == len(prompts) - 1, on_click=swap_prompts,
+                          args=(prompt["id"], ids[min(index + 1, len(ids) - 1)]), help="Move down")
+
+
+def swap_prompts(first_id: str, second_id: str) -> None:
+    """Swap two prompts' places in the library (its order is the order everywhere prompts are listed)."""
+    library = load_prompt_library()
+    order = [p["id"] for p in library["prompts"]]
+    if first_id in order and second_id in order and first_id != second_id:
+        i, j = order.index(first_id), order.index(second_id)
+        library["prompts"][i], library["prompts"][j] = library["prompts"][j], library["prompts"][i]
+        save_prompt_library(library)
+
+
+# --- Export and import of all settings (no note content) --------------------------------------------------
+# One JSON file with the notes app's settings and prompts, the Salesforce connector's config.toml and the Notes
+# exporter's config.json, so that after the notes are put back and indexed everything is as it was. Nothing
+# from the notes themselves: no text, no indexes, no references to particular notes.
+
+SETTINGS_FORMAT = "rag-workspace-settings/v1"
+NOTE_DERIVED_SETTINGS = {"excluded_notes", "last_question", "search_filter", "llm_speed"}  # about notes, not settings
+OTHER_CONFIG_DEFAULTS = {
+    "connector": PROJECT_DIR.parent / "rag-action-interface" / "config.toml",  # the Salesforce connector
+    "exporter": Path("~/.config/notes-export/config.json").expanduser(),  # the Notes exporter
+}
+OTHER_CONFIG_LABELS = {"connector": "Salesforce connector", "exporter": "Notes exporter"}
+SETTINGS_BACKUP_DIR = APP_DATA_DIR / "backups"
+
+
+def other_config_path(kind: str) -> Path:
+    """Where the connector's or exporter's settings file is (set on the Configure page, else its default)."""
+    raw = str(load_app_settings().get(f"{kind}_config_path") or "").strip()
+    return Path(raw).expanduser() if raw else OTHER_CONFIG_DEFAULTS[kind]
+
+
+def persist_other_config_path(kind: str) -> None:
+    save_app_settings({f"{kind}_config_path": str(st.session_state.get(f"{kind}_config_path_input", "")).strip()})
+
+
+def read_json_file(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def build_settings_bundle(parts: set[str], full: bool = False) -> dict:
+    """The settings file. `full` (local backups only) keeps what an export leaves out about notes."""
+    bundle = {"format": SETTINGS_FORMAT, "exported_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+              "notes_app": None, "connector": None, "exporter": None}
+    if "notes_app" in parts:
+        app = read_json_file(APP_SETTINGS_PATH)
+        library = json.loads(json.dumps(load_prompt_library()))
+        if not full:
+            app = {key: value for key, value in app.items() if key not in NOTE_DERIVED_SETTINGS}
+            library.pop("references", None)  # reference documents point at notes
+            for prompt in library["prompts"]:
+                prompt["references"] = []
+        bundle["notes_app"] = {"app_settings": app, "prompt_library": library,
+                               "corpus_settings": read_json_file(CORPUS_SETTINGS_PATH)}
+    connector = other_config_path("connector")
+    if "connector" in parts and connector.is_file():
+        bundle["connector"] = {"path": str(connector), "config_toml": connector.read_text()}
+    exporter = other_config_path("exporter")
+    if "exporter" in parts and exporter.is_file():
+        config = read_json_file(exporter)
+        if not full:
+            for key in ("include_notes", "exclude_notes"):  # single notes, named by title or Apple Notes ID
+                (config.get("filter") or {}).pop(key, None)
+        bundle["exporter"] = {"path": str(exporter), "config": config}
+    return bundle
+
+
+def parse_settings_bundle(raw: bytes) -> tuple[dict | None, str]:
+    """A settings file read and checked, or (None, why not)."""
+    import tomllib
+
+    try:
+        bundle = json.loads(raw)
+    except ValueError:
+        return None, "That isn't a settings file (not valid JSON)."
+    if not isinstance(bundle, dict) or bundle.get("format") != SETTINGS_FORMAT:
+        return None, f"That isn't a settings file from this app (format {bundle.get('format') if isinstance(bundle, dict) else '?'!r})."
+    notes = bundle.get("notes_app")
+    if notes is not None and not (isinstance(notes, dict) and isinstance(notes.get("prompt_library"), dict)
+                                  and isinstance(notes.get("app_settings"), dict)):
+        return None, "The notes app part of the file is damaged."
+    if bundle.get("connector"):
+        try:
+            tomllib.loads(bundle["connector"].get("config_toml", ""))
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return None, "The Salesforce connector part of the file is damaged."
+    if bundle.get("exporter") and not isinstance(bundle["exporter"].get("config"), dict):
+        return None, "The Notes exporter part of the file is damaged."
+    return bundle, ""
+
+
+def write_settings_backup() -> Path:
+    """Everything as it is now (including what exports leave out), before an import replaces it."""
+    SETTINGS_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    path = SETTINGS_BACKUP_DIR / f"settings-before-import-{datetime.datetime.now():%Y%m%d-%H%M%S}.json"
+    path.write_text(json.dumps(build_settings_bundle({"notes_app", "connector", "exporter"}, full=True), indent=2))
+    return path
+
+
+def write_text_atomically(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(text)
+    temp.replace(path)
+
+
+def apply_settings_bundle(bundle: dict, parts: set[str]) -> tuple[list[str], Path]:
+    """Restore the chosen parts, to the paths in the file. Returns (what was restored, the backup made first)."""
+    backup = write_settings_backup()
+    restored = []
+    notes = bundle.get("notes_app")
+    if "notes_app" in parts and notes:
+        app = {**read_json_file(APP_SETTINGS_PATH), **notes["app_settings"]}
+        write_text_atomically(APP_SETTINGS_PATH, json.dumps(app, indent=2))
+        library = dict(notes["prompt_library"])
+        library["references"] = load_prompt_library().get("references", [])  # this machine's own, if any
+        save_prompt_library(library)
+        corpora = {**read_json_file(CORPUS_SETTINGS_PATH), **(notes.get("corpus_settings") or {})}
+        write_text_atomically(CORPUS_SETTINGS_PATH, json.dumps(corpora, indent=2))
+        restored.append(f"the notes app ({len(library.get('prompts', []))} prompts, {len(corpora)} corpora)")
+    for kind in ("connector", "exporter"):
+        part = bundle.get(kind)
+        if kind not in parts or not part:
+            continue
+        path = Path(part["path"]).expanduser()
+        text = part["config_toml"] if kind == "connector" else json.dumps(part["config"], indent=2)
+        write_text_atomically(path, text)
+        save_app_settings({f"{kind}_config_path": str(path)})
+        restored.append(f"the {OTHER_CONFIG_LABELS[kind]} (`{path}`)")
+    return restored, backup
+
+
+def describe_settings_bundle(bundle: dict) -> dict[str, str]:
+    """{part: one line on what it holds} for the import's checkboxes."""
+    lines = {}
+    if notes := bundle.get("notes_app"):
+        prompts = notes["prompt_library"].get("prompts", [])
+        agents = sum(1 for prompt in prompts if prompt.get("agent") and not prompt.get("global"))
+        lines["notes_app"] = (
+            f"Notes app: {len(prompts)} prompts ({agents} Agents), {len(notes['prompt_library'].get('links', []))} "
+            f"links, settings for {len(notes.get('corpus_settings') or {})} corpora; notes folder "
+            f"`{notes['app_settings'].get('corpus_root_path', '?')}`"
+        )
+    if connector := bundle.get("connector"):
+        import tomllib
+
+        org = tomllib.loads(connector["config_toml"]).get("org", "?")
+        lines["connector"] = f"Salesforce connector: org `{org}`, to `{connector['path']}`"
+    if exporter := bundle.get("exporter"):
+        lines["exporter"] = (f"Notes exporter: export folder `{exporter['config'].get('output', '?')}`, to "
+                             f"`{exporter['path']}`")
+    return lines
+
+
+def index_all_corpora_here() -> None:
+    """After an import: index every visible corpus, each with its restored embedding model (Rescan all corpora)."""
+    corpus_root = get_corpus_root_path()
+    if corpus_root is None or not corpus_root.exists():
+        st.error("The notes folder from the settings isn't there yet: put the notes back, then index.")
+        return
+    if is_single_corpus_mode():
+        st.info("Single-corpus mode: open the RAG workspace and click **⚡ Rescan (incremental)** in the left panel.")
+        return
+    set_embedding_acceleration(get_use_gpu_for_embeddings())
+    summary = run_multi_corpus_rescan(filter_libraries_for_display(get_libraries()), corpus_root, st.container())
+    st.session_state["multi_rebuild_summary"] = summary
+    st.success("Indexing finished. Reload the RAG workspace tab to search.")
+
+
+def render_settings_transfer_section() -> None:
+    """Configure page: export all settings to a file, or import them from one."""
+    with st.expander("Export and import settings", expanded=True, key="configure_transfer_open",
+                     icon=":material/import_export:"):
+        st.caption(
+            "Settings only, for moving to another Mac or starting again: prompts (with About me and Agents), "
+            "links, quick search terms, the title marker, each corpus's settings and corpus prompt, the app's "
+            "settings, and the Salesforce connector's and Notes exporter's settings. **Nothing from your notes:** "
+            "no text, no indexes, no reference documents, no excluded notes, filter terms or last question, and "
+            "none of the exporter's single-note exceptions. To restore: put the notes back where they were "
+            "(e.g. export them again), import this file, then index."
+        )
+        st.markdown("**Export**")
+        found = {}
+        for kind, label in OTHER_CONFIG_LABELS.items():
+            path = other_config_path(kind)
+            found[kind] = path.is_file()
+            st.text_input(f"{label} settings file", value=str(path), key=f"{kind}_config_path_input",
+                          on_change=persist_other_config_path, args=(kind,),
+                          help="✓ found" if found[kind] else "Not found here: it won't be in the export.")
+        with st.container(horizontal=True, vertical_alignment="center"):
+            parts = {"notes_app"}
+            for kind, label in OTHER_CONFIG_LABELS.items():
+                if st.checkbox(label, value=found[kind], disabled=not found[kind], key=f"export_{kind}"):
+                    parts.add(kind)
+        st.download_button(
+            "Download settings",
+            data=json.dumps(build_settings_bundle(parts), indent=2),
+            file_name=f"rag-workspace-settings-{datetime.date.today():%Y-%m-%d}.json",
+            mime="application/json",
+            icon=":material/download:",
+            key="settings_download",
+        )
+
+        st.markdown("**Import**")
+        if done := st.session_state.get("settings_imported"):
+            st.success("Restored " + ", ".join(done["restored"]) + f". Your previous settings are in `{done['backup']}`.")
+            st.caption(
+                "Next: make sure the notes are back in their folder, then index them. Reload the RAG workspace tab "
+                "so it picks the settings up. If you use the connector's or exporter's schedule, turn it on again "
+                "in that app (the import doesn't install schedules)."
+            )
+            with st.container(horizontal=True):
+                if st.button("Index all corpora now", type="primary", icon=":material/bolt:", key="settings_index_now"):
+                    index_all_corpora_here()
+                st.button("Later", key="settings_index_later", on_click=st.session_state.pop,
+                          args=("settings_imported", None),
+                          help="Index later with **⚡ Rescan all corpora** in the RAG workspace's left panel.")
+            return
+        upload = st.file_uploader("Settings file", type=["json"], key="settings_import_file",
+                                  help="A file from **Download settings**.")
+        if upload is None:
+            return
+        bundle, problem = parse_settings_bundle(upload.getvalue())
+        if bundle is None:
+            st.error(problem)
+            return
+        st.caption(f"Exported {bundle.get('exported_at', '?')}. Restore:")
+        chosen = {kind for kind, line in describe_settings_bundle(bundle).items()
+                  if st.checkbox(line, value=True, key=f"import_{kind}")}
+        st.caption("Each part replaces what's there now, at the path in the file; everything is backed up first.")
+        if st.button("Import settings", type="primary", icon=":material/upload:", disabled=not chosen,
+                     key="settings_import_apply"):
+            restored, backup = apply_settings_bundle(bundle, chosen)
+            st.session_state["settings_imported"] = {"restored": restored, "backup": str(backup)}
+            st.rerun()
 
 
 def render_configure_page() -> None:
-    """Configure page (?page=configure): the task executor and other links, the outbox and the title marker."""
+    """Configure page (?page=configure): links, the outbox, the title marker, and export / import of settings."""
     library = load_prompt_library()
     render_outbox_status()
     render_page_title("Configure")
@@ -4048,6 +4758,9 @@ def render_configure_page() -> None:
             )
         if marker["text"]:
             st.caption(f"Example: **{marked_title('Follow up with Acme on the pilot', marker)}**")
+
+    render_settings_transfer_section()
+    install_save_flash()
 
 
 def render_prompt_library_page() -> None:
@@ -4232,7 +4945,7 @@ def render_prompt_library_page() -> None:
             )
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.checkbox("Global", key="new_prompt_global", help="Send with every LLM request in every corpus.")
-                st.checkbox("Starred", key="new_prompt_starred", help="Show it in the Ask panel's Starred row.")
+                st.checkbox("Starred", key="new_prompt_starred", help="Show it in the Ask panel's Starred row (Agents: its Agent Starred row).")
                 st.checkbox(
                     "Agent",
                     key="new_prompt_agent",
@@ -4280,6 +4993,7 @@ def render_prompt_library_page() -> None:
             else:
                 st.caption("No reference documents yet: make them in **Reference documents** above, then attach "
                            "them here or on the prompt's card.")
+            st.checkbox("☁️ Send Salesforce records", key="new_prompt_salesforce", help=SALESFORCE_PROMPT_HELP)
             st.form_submit_button("Add prompt", type="primary", icon=":material/add:", on_click=add_prompt_from_form)
         if error := st.session_state.pop("add_prompt_error", None):
             st.warning(error)
@@ -4288,6 +5002,7 @@ def render_prompt_library_page() -> None:
 
     install_filter_commit_on_blur()
     install_tooltip_hide_on_click()
+    install_save_flash()
 
 
 ACTIVE_TASK_PROMPTS_KEY = "active_task_prompt_ids"
@@ -4382,13 +5097,38 @@ def describe_run_prompts(run_prompts: dict, corpus_prompt: str) -> list[str]:
 # The Recent and Starred prompt buttons, about a quarter smaller than a normal button; the text keeps its size.
 PROMPT_CHIP_STYLE = """<style>
 [class*="st-key-use_prompt_"] button, [class*="st-key-use_agent_prompt_"] button,
-[class*="st-key-use_reference_"] button {
+[class*="st-key-use_reference_"] button, .st-key-use_salesforce_context button {
   min-height: 1.875rem !important; padding: 0.05rem 0.55rem !important;
+}
+/* Section shading paints every button alike, so a chip that's switched on gets a firm outline and bold text. */
+.st-key-ask_reference_row button[data-testid="stBaseButton-primary"],
+[class*="_add_context"] button[data-testid="stBaseButton-primary"] {
+  box-shadow: inset 0 0 0 2px currentColor !important; font-weight: 600 !important;
 }
 </style>"""
 
 
-def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
+PROMPT_ROW_CHARS = 52  # about what fits on the Recent or Starred row after its label; chips that don't are left out
+
+
+def fit_prompt_chips(prompts: list[dict], row_chars: int = PROMPT_ROW_CHARS) -> list[tuple[dict, str]]:
+    """(prompt, chip label) for as many prompts as fit on one line, in order, skipping any that would overflow."""
+    shown, width = [], 0
+    for prompt in prompts:
+        label = truncate_text(agent_prompt_label(prompt), 34 if is_agent_prompt(prompt) else 28)
+        cost = len(label) + 4  # a chip's padding and the gap
+        if width + cost <= row_chars:
+            shown.append((prompt, label))
+            width += cost
+    return shown
+
+
+def set_corpus_prompt_enabled(safe_lib: str) -> None:
+    """The Ask box's Corpus prompt toggle: the same per-corpus setting as Apply corpus prompt."""
+    save_corpus_config(safe_lib, {"corpus_prompt_enabled": bool(st.session_state.get(f"ask_corpus_prompt_{safe_lib}"))})
+
+
+def render_ask_prompt_panel(library: dict, corpus_config: dict, safe_lib: str = "") -> None:
     """Compact 'Prompt library' box in the Ask panel: always-included prompts, task, recent and starred."""
     profile = library["profile"]
     profile_text = str(profile.get("text", "")).strip() if profile.get("enabled") else ""
@@ -4402,41 +5142,64 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict) -> None:
     st.html(PROMPT_CHIP_STYLE)
 
     with st.container(border=True, gap="xsmall"):
-        with st.container(horizontal=True, vertical_alignment="center"):
-            st.markdown("**Prompt library**")
+        with st.container(horizontal=True, vertical_alignment="center", gap="xsmall", key="prompt_panel_title"):
+            st.markdown("**Prompt library**", width="content")
+            # Icon only, so About me and Corpus prompt fit on this line.
             st.link_button(
-                "Manage",
+                ":material/open_in_new:",
                 PROMPT_LIBRARY_PAGE_URL,
-                icon=":material/open_in_new:",
                 type="tertiary",
-                help="Opens the prompt library in a new tab.",
+                help="Manage: opens the prompt library in a new tab.",
+            )
+            if profile_text:
+                st.toggle("About me", value=True, key="run_include_profile", help=profile_text)
+            # Kept in step with the saved setting, which the Prompt library page can change too.
+            corpus_text = str(corpus_config.get("corpus_prompt", "")).strip()
+            corpus_key = f"ask_corpus_prompt_{safe_lib}"
+            st.session_state[corpus_key] = bool(corpus_config.get("corpus_prompt_enabled")) and bool(corpus_text)
+            st.toggle(
+                "Corpus prompt",
+                key=corpus_key,
+                on_change=set_corpus_prompt_enabled,
+                args=(safe_lib,),
+                disabled=not corpus_text,
+                help=(corpus_text + "\n\nSent ahead of the notes for every answer and follow-up in this corpus. "
+                      "Saved per corpus." if corpus_text
+                      else "This corpus has no corpus prompt yet: write one on the Prompt library page (the ↗ beside **Prompt library**)."),
             )
 
-        if profile_text or corpus_prompt or global_prompts:
+        if global_prompts:
             with st.container(horizontal=True, vertical_alignment="center", gap="small"):
                 st.caption("Always:")
-                if profile_text:
-                    st.checkbox("About me", value=True, key="run_include_profile", help=profile_text)
-                if corpus_prompt:
-                    st.checkbox("Corpus prompt", value=True, key="run_include_corpus", help=corpus_prompt)
                 for prompt in global_prompts:
                     st.checkbox(
                         prompt["name"], value=True, key=f"run_include_global_{prompt['id']}", help=prompt["text"]
                     )
 
         recent, starred = select_prompt_stacks(library)
-        for title, prompts in (("Recent", recent), ("Starred", starred)):
-            if not prompts:
+        recent_chips = fit_prompt_chips(recent)
+        in_recent = {prompt["id"] for prompt, _label in recent_chips}
+        starred = [prompt for prompt in starred if prompt["id"] not in in_recent]
+        # The longer "Agent Starred:" label leaves less room for chips.
+        agent_row_chars = PROMPT_ROW_CHARS - (len("Agent Starred") - len("Starred"))
+        rows = (
+            ("Recent", recent_chips),
+            ("Starred", fit_prompt_chips([p for p in starred if not is_agent_prompt(p)])),
+            ("Agent Starred", fit_prompt_chips([p for p in starred if is_agent_prompt(p)], agent_row_chars)),
+        )
+        for title, chips in rows:
+            if not chips:
                 continue
             with st.container(horizontal=True, vertical_alignment="center", gap="xsmall"):
-                st.caption(f"{title}:")
-                for prompt in prompts:
+                st.caption(f"{title}:", width="content")
+                # Only what fits on this line; the rest are in Find a prompt.
+                for prompt, label in chips:
                     is_active = prompt["id"] in active_ids
                     agent = is_agent_prompt(prompt)
                     st.button(
-                        truncate_text(agent_prompt_label(prompt), 34 if agent else 28),
+                        label,
                         # Agent keys pick up the blue border style above.
-                        key=f"use_{'agent_' if agent else ''}prompt_{title}_{prompt['id']}",
+                        key=f"use_{'agent_' if agent else ''}prompt_{title.replace(' ', '')}_{prompt['id']}",
                         help=(f"**Agent** — ends by sending {OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()} "
                               f"to the outbox: *{agent_command(prompt)}*\n\n" if agent else "") + prompt["text"],
                         type="primary" if is_active else "secondary",
@@ -4900,7 +5663,7 @@ def build_discussion_messages(search_state: dict, max_tokens: int, temperature: 
             discussion_results(search_state),
             max_tokens,
             temperature,
-            corpus_prompt,
+            with_salesforce_context(search_state, corpus_prompt, discussion_results(search_state)),
             search_state.get("task_prompt", ""),
         ),
     }]
@@ -4981,6 +5744,50 @@ def persist_follow_up_model(safe_lib: str) -> None:
     save_corpus_config(safe_lib, {"follow_up_model": st.session_state.get(f"follow_up_model_{safe_lib}")})
 
 
+def set_big_screen(search_state: dict, choice: int | str | None) -> None:
+    """Show a discussion reply in the main output area: a turn index, "last" (follows new replies) or None."""
+    search_state["big_screen"] = choice
+
+
+def big_screen_turn(search_state: dict) -> tuple[int, dict] | None:
+    """The discussion reply chosen for the main output area, as (index, turn), or None for the answer."""
+    choice = search_state.get("big_screen")
+    discussion = search_state.get("discussion") or []
+    replies = [i for i, turn in enumerate(discussion) if turn["role"] == "assistant"]
+    if choice == "last" and replies:
+        return replies[-1], discussion[replies[-1]]
+    if isinstance(choice, int) and choice in replies:
+        return choice, discussion[choice]
+    return None
+
+
+def render_big_screen_reply(search_state: dict, index: int, turn: dict) -> None:
+    """A discussion reply in the main output area, with the question that led to it and the way back."""
+    discussion = search_state["discussion"]
+    replies = [i for i, t in enumerate(discussion) if t["role"] == "assistant"]
+    number = replies.index(index) + 1
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.subheader("Discussion reply", width="content")
+        render_copy_buttons([("Copy all output", full_llm_output(search_state))])
+    following = " · follows new replies" if search_state.get("big_screen") == "last" else ""
+    model = f" · `{turn['model']}`" if turn.get("model") else ""
+    st.caption(f"Reply {number} of {len(replies)} from the discussion{model}{following}")
+    asked = discussion[index - 1]["content"] if index and discussion[index - 1]["role"] == "user" else ""
+    if asked:
+        with st.expander("Question asked"):
+            st.markdown(asked)
+    st.markdown(link_opportunity_names(turn["content"]))
+    render_copy_buttons([("Copy reply", link_opportunity_names(turn["content"])),
+                         ("Copy all output", full_llm_output(search_state))])
+    st.button(
+        "↩ Back to the answer",
+        key="big_screen_back",
+        on_click=set_big_screen,
+        args=(search_state, None),
+        help="Show the first answer here again; the reply stays in the discussion.",
+    )
+
+
 def render_copy_button(text: str, label: str = "Copy") -> None:
     """Small button that copies `text` to the clipboard (component iframes may write to it)."""
     render_copy_buttons([(label, text)])
@@ -4991,29 +5798,37 @@ def full_llm_output(search_state: dict) -> str:
     parts = []
     if search_state.get("question"):
         parts.append("## Question\n\n" + search_state["question"].strip())
-    parts.append("## Answer\n\n" + (search_state.get("answer") or "").strip())
+    # Copied text carries the opportunity links the app adds on screen.
+    parts.append("## Answer\n\n" + link_opportunity_names((search_state.get("answer") or "").strip()))
     turns = []
     for turn in search_state.get("discussion") or []:
         if turn["role"] == "user":
             turns.append("**You:** " + turn["content"].strip())
         else:
             model = f" (`{turn['model']}`)" if turn.get("model") else ""
-            turns.append(f"**LLM**{model}:\n\n" + turn["content"].strip())
+            turns.append(f"**LLM**{model}:\n\n" + link_opportunity_names(turn["content"].strip()))
     if turns:
         parts.append("## Discussion\n\n" + "\n\n".join(turns))
     return "\n\n".join(parts)
 
 
-def render_copy_buttons(buttons: list[tuple[str, str]]) -> None:
-    """A row of small copy buttons, one per (label, text), in a single component iframe."""
+def render_copy_buttons(buttons: list[tuple[str, str]], fit: bool = False) -> None:
+    """A row of small copy buttons, one per (label, text), in a single component iframe.
+
+    `fit` sizes the iframe to its buttons, so other elements can sit beside it on the same line.
+    """
     buttons = [(label, text) for label, text in buttons if text and text.strip()]
     if not buttons:
         return
     payload = json.dumps([text for _label, text in buttons]).replace("</", "<\\/")
     labels = json.dumps([label for label, _text in buttons]).replace("</", "<\\/")
+    # About 7px a character at 12px, plus the icon, padding and border; the body's side margins add 16px.
+    # The row fills the frame's height with the buttons centred, so they aren't cut off at the bottom.
+    width = sum(len(label) * 7 + 48 for label, _text in buttons) + 6 * (len(buttons) - 1) + 16 if fit else None
     components.html(
         f"""
-<div id="row" style="display:flex;gap:6px"></div>
+<style>body{{margin:0 8px}}</style>
+<div id="row" style="display:flex;gap:6px;height:32px;align-items:center"></div>
 <script>
 const texts = {payload};
 const labels = {labels};
@@ -5041,6 +5856,7 @@ labels.forEach((label, i) => {{
 }});
 </script>
 """,
+        width=width,
         height=32,
     )
 
@@ -5078,6 +5894,80 @@ if (page.__filterCommitOnBlurVersion !== 2) {
     input.dispatchEvent(new page.KeyboardEvent("keydown", enter));
   }, true);
 }
+</script>
+""",
+        height=0,
+    )
+
+
+# Text boxes that save when you leave them (their on_change saves), by widget key or key prefix.
+SAVE_ON_BLUR_KEYS = (
+    "corpus_prompt_", "corpus_root_path_input", "max_results", "connector_config_path_input",
+    "exporter_config_path_input", "outbox_path_input", "question_text", "executor_title", "executor_url",
+    "link_title_", "link_url_", "profile_short_name", "profile_text", "prompt_command_", "prompt_text_",
+    "prompt_name_", "prompt_step_text_", "prompt_step_name_", "quick_search_term_", "reference_title_",
+    "title_marker_text",
+)
+NOT_SAVED_WHEN_EMPTY = ("prompt_name_", "prompt_text_", "prompt_command_")  # an empty one keeps the old value
+
+
+def install_save_flash() -> None:
+    """Flash a text box green with a 'Saved' tag when leaving it (or Enter) saved a change."""
+    keys = json.dumps(SAVE_ON_BLUR_KEYS)
+    keep = json.dumps(NOT_SAVED_WHEN_EMPTY)
+    components.html(
+        f"""
+<script>
+const page = window.parent;
+const doc = page.document;
+if (page.__saveFlashVersion !== 1) {{
+  page.__saveFlashVersion = 1;
+  const keys = {keys}, keepIfEmpty = {keep}, green = "33, 195, 84";
+  const style = doc.createElement("style");
+  style.textContent = ".save-flash {{ position: absolute; pointer-events: none; z-index: 1000; border-radius: 0.5rem; "
+    + `border: 2px solid rgb(${{green}}); background: rgba(${{green}}, 0.18); transition: opacity 0.6s ease; }}`
+    + ".save-flash span {{ position: absolute; right: 6px; top: -11px; font: 600 11px -apple-system, sans-serif; "
+    + `color: #fff; background: rgb(${{green}}); border-radius: 999px; padding: 1px 8px; }}`;
+  doc.head.appendChild(style);
+  // The saving key a field belongs to (e.g. "prompt_text_"), or null for boxes that don't save.
+  const savingKey = (el) => {{
+    const box = el instanceof page.Element ? el.closest('[class*="st-key-"]') : null;
+    const key = box && [...box.classList].find((c) => c.startsWith("st-key-"));
+    return key ? keys.find((k) => key.slice(7).startsWith(k)) || null : null;
+  }};
+  const isField = (el) => el instanceof page.HTMLTextAreaElement
+    || (el instanceof page.HTMLInputElement && ["text", "number", ""].includes(el.type));
+  const flash = (el) => {{
+    const field = el.closest('[data-testid="stTextInputRootElement"], [data-testid="stTextAreaRootElement"], '
+      + '[data-testid="stNumberInputContainer"]') || el;
+    const r = field.getBoundingClientRect();
+    const mark = doc.createElement("div");
+    mark.className = "save-flash";
+    mark.innerHTML = "<span>✓ Saved</span>";
+    Object.assign(mark.style, {{ left: `${{r.left + page.scrollX - 2}}px`, top: `${{r.top + page.scrollY - 2}}px`,
+                                 width: `${{r.width + 4}}px`, height: `${{r.height + 4}}px` }});
+    doc.body.appendChild(mark);
+    setTimeout(() => (mark.style.opacity = "0"), 1100);
+    setTimeout(() => mark.remove(), 1800);
+  }};
+  const before = new page.WeakMap();
+  const check = (el) => {{
+    const key = savingKey(el);
+    if (!key || !before.has(el) || before.get(el) === el.value) return;
+    before.set(el, el.value);
+    if (!el.value.trim() && keepIfEmpty.includes(key)) return;  // not saved
+    flash(el);
+  }};
+  doc.addEventListener("focusin", (event) => {{
+    if (isField(event.target)) before.set(event.target, event.target.value);
+  }}, true);
+  doc.addEventListener("focusout", (event) => {{ if (isField(event.target)) check(event.target); }}, true);
+  doc.addEventListener("keydown", (event) => {{
+    if (event.key === "Enter" && event.target instanceof page.HTMLInputElement && isField(event.target)) {{
+      setTimeout(() => check(event.target), 0);
+    }}
+  }}, true);
+}}
 </script>
 """,
         height=0,
@@ -5148,6 +6038,12 @@ if (page.__tooltipTidyVersion !== 3) {
 
 
 QUESTION_LABEL = "What would you like to ask?"
+QUESTION_BIG_HEIGHT = 220
+# The question box at one line's height (a text area keeps Enter for new lines and stays selectable on focus).
+QUESTION_ONE_LINE_STYLE = """<style>
+.st-key-question_text [data-testid="stTextAreaRootElement"] { height: auto !important; min-height: 0 !important; }
+.st-key-question_text textarea { height: 2.4rem !important; min-height: 2.4rem !important; resize: none; }
+</style>"""
 
 
 def install_select_question_on_focus() -> None:
@@ -5225,16 +6121,23 @@ def render_follow_up_discussion(
     # heading), ready to paste into a flow or a test.
     render_copy_buttons([("Copy task prompt", search_state.get("task_prompt", ""))])
 
-    view_col, popout_col = st.columns(2)
-    with view_col:
+    # Sized to their labels, so a narrow panel wraps the row instead of cutting the labels short.
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
         expanded = st.toggle(
             "Expand",
             key="discussion_expanded",
             help="Make the discussion panel much taller. For very long conversations, use **Pop out**.",
         )
-    with popout_col:
-        if st.button("⤢ Pop out", use_container_width=True, help="Open the discussion in a large window."):
+        if st.button("⤢ Pop out", help="Open the discussion in a large window."):
             show_discussion_dialog(search_state, model_name, max_tokens, temperature, corpus_prompt)
+        st.button(
+            "⤢ Last reply on big screen",
+            key="big_screen_last",
+            disabled=not any(turn["role"] == "assistant" for turn in search_state["discussion"]),
+            on_click=set_big_screen,
+            args=(search_state, "last"),
+            help="Show the latest reply in the main output area; it keeps following new replies.",
+        )
 
     render_discussion_body(
         search_state,
@@ -5247,6 +6150,23 @@ def render_follow_up_discussion(
         height=DISCUSSION_EXPANDED_HEIGHT if expanded else DISCUSSION_HEIGHT,
     )
     return model_name
+
+
+def sticky_follow_up_style(box_key: str) -> str:
+    """CSS that keeps the follow-up box in view while a long answer beside it is scrolled.
+
+    A sticky element only travels within its parent, so the Discussion column is stretched to the full
+    height of the answer column first. The box gets the page background so text scrolling under it is hidden.
+    """
+    background = "#0e1117" if st.context.theme.type == "dark" else "#ffffff"
+    # A column holds one .stVerticalBlock; the keyed box (or the wrapper carrying its key) sits directly in it.
+    column = f'[data-testid="stColumn"]:has(> .stVerticalBlock > .st-key-{box_key})'
+    return f"""<style>
+[data-testid="stHorizontalBlock"]:has({column}) {{ align-items: stretch; }}
+{column} {{ align-self: stretch; }}
+{column} > .stVerticalBlock {{ height: 100%; }}
+.st-key-{box_key} {{ position: sticky; top: 4.25rem; z-index: 5; background: {background}; }}
+</style>"""
 
 
 def render_discussion_body(
@@ -5265,19 +6185,43 @@ def render_discussion_body(
     with st.container(height=height, border=True, autoscroll=True):
         if not discussion:
             st.caption("No follow-up questions yet.")
-        for turn in discussion:
+        for index, turn in enumerate(discussion):
             with st.chat_message(turn["role"]):
                 st.markdown(link_opportunity_names(turn["content"]))
                 if turn.get("model"):
                     st.caption(f"`{turn['model']}`")
                 # Every turn can be copied. When the model was sent more than is shown (a step's prompt, or
                 # Needs work with the rejected list), that full prompt can be copied too, to reuse in flows.
-                buttons = [("Copy", turn["content"])]
+                buttons = [("Copy", link_opportunity_names(turn["content"]) if turn["role"] == "assistant"
+                             else turn["content"])]
                 if turn.get("prompt") and turn["prompt"] != turn["content"]:
                     buttons.append(("Copy prompt sent", turn["prompt"]))
-                render_copy_buttons(buttons)
+                # Copy and Big screen share one line.
+                with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                    render_copy_buttons(buttons, fit=True)
+                    if turn["role"] == "assistant":
+                        on_big_screen = big_screen_turn(search_state)
+                        if on_big_screen and on_big_screen[0] == index:
+                            st.caption("Showing on the big screen", width="content")
+                        elif in_dialog:
+                            # A full rerun closes the pop-out so the reply can be read in the main area.
+                            if st.button("⤢ Big screen", key=f"{key_prefix}_big_screen_{index}", type="tertiary"):
+                                set_big_screen(search_state, index)
+                                st.rerun()
+                        else:
+                            st.button(
+                                "⤢ Big screen",
+                                key=f"{key_prefix}_big_screen_{index}",
+                                type="tertiary",
+                                on_click=set_big_screen,
+                                args=(search_state, index),
+                                help="Show this reply in the main output area.",
+                            )
 
-    with st.container(border=True):
+    render_follow_up_context(search_state, key_prefix)
+    if not in_dialog:
+        st.html(sticky_follow_up_style(f"{key_prefix}_follow_up_box"))
+    with st.container(border=True, key=f"{key_prefix}_follow_up_box"):
         # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
         with st.container(horizontal=True, vertical_alignment="center"):
             st.markdown("Ask a follow-up", width="stretch")
@@ -5301,6 +6245,7 @@ def render_discussion_body(
 
     if discussion and st.button("Clear discussion", key=f"{key_prefix}_clear", use_container_width=True):
         discussion.clear()
+        search_state["big_screen"] = None
         st.rerun(scope=rerun_scope)
 
     if submitted and follow_up.strip():
@@ -5330,8 +6275,11 @@ def show_discussion_dialog(
     )
 
 
-def render_library_counts(search_state: dict) -> None:
-    """Per-library match counts for all-library searches, with buttons to switch library."""
+def render_library_counts(search_state: dict, key_prefix: str = "results") -> None:
+    """Per-library match counts for all-library searches, with buttons to switch library.
+
+    `key_prefix` keeps button keys unique when the gathered notes and an answer both show counts.
+    """
     library_counts = search_state.get("library_counts") or []
     results = search_state["results"]
     if library_counts:
@@ -5348,7 +6296,7 @@ def render_library_counts(search_state: dict) -> None:
                 name_col.markdown(f"**{library}** — {count} note(s)")
                 button_col.button(
                     "Use library",
-                    key=f"use_library_{library}",
+                    key=f"use_library_{key_prefix}_{library}",
                     on_click=switch_to_library,
                     args=(library,),
                     disabled=library == st.session_state.get("selected_library"),
@@ -5365,7 +6313,7 @@ def render_gathered_notes(gathered: dict, library_folder: Path, safe_lib: str, p
     keys = list(reversed(gathered["notes"]))
     results = [block for key in keys for block in gathered["notes"][key]["blocks"]]
     routes = {key: gathered["notes"][key]["route"] for key in keys}
-    render_library_counts({"library_counts": gathered["library_counts"], "results": results})
+    render_library_counts({"library_counts": gathered["library_counts"], "results": results}, key_prefix="gathered")
 
     notes: dict[tuple[str, str], list[dict]] = {}
     for result in results:
@@ -5816,24 +6764,28 @@ def render_agent_panel(
                             temperature, corpus_prompt, sent_text=step["text"],
                         ):
                             st.rerun()
-        st.caption(
-            "Reply in the discussion to pick items (e.g. *Yes:1,2,3 ignore 4,5,6*), set dates and answer questions. "
-            f"When it's right, stage the {item_kind}. Untick notes under Sources to narrow what the LLM uses."
-        )
-        snapshot = load_reference_snapshot()
-        if snapshot:
-            refreshed = datetime.datetime.fromisoformat(snapshot["generated_at"]).strftime("%d %b %H:%M")
+        # Guidance, folded so the step buttons and Execute stay close together.
+        with st.expander("How it works", expanded=False):
             st.caption(
-                f"Reference: {len(reference_records())} {snapshot.get('scope', 'records')} from "
-                f"{snapshot.get('source', 'the connector')} ({snapshot.get('target', '?')}), refreshed {refreshed}. "
-                "The Agent uses their exact names; refresh it from the task executor."
+                "Reply in the discussion to pick items (e.g. *Yes:1,2,3 ignore 4,5,6*), set dates and answer "
+                f"questions. When it's right, stage the {item_kind}. Untick notes under Sources to narrow what "
+                "the LLM uses."
             )
-        else:
-            st.caption("No reference snapshot yet: the task executor can refresh one so the Agent uses real record names.")
+            snapshot = load_reference_snapshot()
+            if snapshot:
+                refreshed = datetime.datetime.fromisoformat(snapshot["generated_at"]).strftime("%d %b %H:%M")
+                st.caption(
+                    f"Reference: {len(reference_records())} {snapshot.get('scope', 'records')} from "
+                    f"{snapshot.get('source', 'the connector')} ({snapshot.get('target', '?')}), refreshed "
+                    f"{refreshed}. The Agent uses their exact names; refresh it from the task executor."
+                )
+            else:
+                st.caption(
+                    "No reference snapshot yet: the task executor can refresh one so the Agent uses real record names."
+                )
         if st.button(
-            label,
+            f"Execute :material/smart_toy: {label} with context",
             key="agent_run",
-            icon=":material/smart_toy:",
             use_container_width=True,
             help=(
                 "**Action Command" + ("s" if several else "") + ":** "
@@ -5974,14 +6926,21 @@ def render_search_results(
     main_col, chat_col = st.columns([3, 2], gap="large")
 
     with main_col:
-        if search_state["answer"]:
+        on_big_screen = big_screen_turn(search_state)
+        if on_big_screen:
+            render_big_screen_reply(search_state, *on_big_screen)
+            if search_state["answer"]:
+                with st.expander("Answer"):
+                    st.markdown(link_opportunity_names(search_state["answer"]))
+                    render_copy_buttons([("Copy answer", link_opportunity_names(search_state["answer"]))])
+        elif search_state["answer"]:
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.subheader("Answer", width="content")
                 render_copy_buttons([("Copy all output", full_llm_output(search_state))])
             st.markdown(link_opportunity_names(search_state["answer"]))
             render_copy_buttons([
                 ("Copy all output", full_llm_output(search_state)),
-                ("Copy answer", search_state["answer"]),
+                ("Copy answer", link_opportunity_names(search_state["answer"])),
                 ("Copy question", search_state.get("question", "")),
                 ("Copy task prompt", search_state.get("task_prompt", "")),
             ])
@@ -7399,6 +8358,77 @@ def answer_with_ollama(
     )
 
 
+# Cancel floats at the bottom centre of the window, wherever the page is scrolled to.
+LLM_CANCEL_STYLE = """<style>
+[class*="st-key-llm_cancel_"] {
+  position: fixed !important; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+  width: auto !important; z-index: 1000;
+}
+[class*="st-key-llm_cancel_"] button { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); }
+</style>"""
+_LLM_CANCEL_KEYS = itertools.count()  # one Cancel per LLM call; restarts each script run
+
+
+def cancel_llm() -> None:
+    st.session_state[LLM_CANCELLED_KEY] = True
+
+
+def show_llm_cancel_button():
+    """A floating Cancel for the LLM call about to run; returns its slot, to clear when the call ends.
+
+    Clicking it reruns the script, which stops the call at its next page update (see LLM_TICK_SECONDS).
+    """
+    slot = st.empty()
+    with slot.container(key=f"llm_cancel_{next(_LLM_CANCEL_KEYS)}"):
+        st.html(LLM_CANCEL_STYLE)
+        st.button(
+            "Cancel",
+            icon=":material/stop_circle:",
+            type="primary",
+            on_click=cancel_llm,
+            help="Stop the LLM now, e.g. to change the task or prompts and run it again.",
+        )
+    return slot
+
+
+class OllamaChatStream:
+    """POST /api/chat on a worker thread, putting each streamed line on `lines`.
+
+    The script thread stays free to update the page (so Streamlit can act on Cancel), and `close` can cut
+    the connection at any point, even while Ollama is still reading the prompt; Ollama stops generating
+    when its client goes away.
+    """
+
+    def __init__(self, host: str, port: int, payload: dict):
+        self.conn = http.client.HTTPConnection(host, port, timeout=10)
+        self.conn.connect()  # here, so close() always has a socket to cut
+        self.conn.sock.settimeout(900)  # longest wait between streamed pieces: a big prompt can take minutes
+        self.lines: queue.Queue = queue.Queue()
+        threading.Thread(target=self._run, args=(payload,), daemon=True).start()
+
+    def _run(self, payload: dict) -> None:
+        try:
+            self.conn.request(
+                "POST", "/api/chat", body=json.dumps(payload), headers={"Content-Type": "application/json"}
+            )
+            response = self.conn.getresponse()
+            if response.status != 200:
+                self.lines.put(("http_error", (response.status, response.read(500).decode(errors="replace"))))
+                return
+            for line in response:
+                self.lines.put(("line", line))
+            self.lines.put(("end", None))
+        except Exception as exc:
+            self.lines.put(("error", exc))
+
+    def close(self) -> None:
+        try:
+            self.conn.sock and self.conn.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.conn.close()
+
+
 def chat_with_ollama(
     messages: list[dict],
     model_name: str,
@@ -7409,23 +8439,23 @@ def chat_with_ollama(
     num_ctx: int | None = None,
     response_format: dict | None = None,
     on_progress=None,
+    think: bool | None = None,
 ) -> tuple[str, dict]:
     """Send a chat conversation to a local Ollama model and return (reply, usage).
 
     `response_format` is a JSON schema; Ollama then constrains the reply to match it.
+    `think=False` asks a reasoning model (e.g. Qwen3) to answer without thinking first; other models ignore it.
     The reply is streamed, so long answers have no overall time limit; `on_progress(tokens, seconds)`
     is called every LLM_PROGRESS_SECONDS with the tokens generated so far and the seconds since the
     first one (None while the model is still reading the prompt).
+    A floating Cancel shows while the call runs; clicking it stops the call and closes the connection.
     """
-    import requests
-
     options = {
         "temperature": temperature,
         "num_predict": max_tokens,
         "num_ctx": context_window_for(messages, max_tokens, num_ctx),
     }
 
-    url = f"http://{host}:{port}/api/chat"
     payload = {
         "model": model_name,
         "messages": messages,
@@ -7434,49 +8464,61 @@ def chat_with_ollama(
     }
     if response_format:
         payload["format"] = response_format
+    if think is not None:
+        payload["think"] = think
 
     try:
-        # (connect, longest wait between streamed pieces): a big prompt can take minutes before the first token.
-        response = requests.post(url, json=payload, stream=True, timeout=(10, 900))
-    except requests.RequestException as exc:
+        stream = OllamaChatStream(host, port, payload)
+    except OSError as exc:
         raise RuntimeError(
             f"Could not reach Ollama at `{host}:{port}`. "
             f"Start Ollama or run `./start_app.sh`. Details: {exc}"
         ) from exc
 
-    if not response.ok:
-        raise RuntimeError(
-            f"Ollama returned HTTP {response.status_code} for model `{model_name}`: "
-            f"{response.text[:500]}"
-        )
-
+    cancel_slot = show_llm_cancel_button()
+    tick = st.empty()
     content, thinking, data = [], [], {}
     generated, first_token_at = 0, None
     last_report = time.monotonic()
     try:
-        for line in response.iter_lines():
-            if not line:
-                continue
+        while True:
             try:
-                chunk = json.loads(line)
-            except ValueError as exc:
-                raise RuntimeError(f"Ollama returned invalid JSON: {line[:500]!r}") from exc
-            if chunk.get("error"):
-                raise RuntimeError(f"Ollama error for model `{model_name}`: {chunk['error']}")
-            piece = chunk.get("message") or {}
-            if piece.get("content") or piece.get("thinking"):
-                content.append(piece.get("content") or "")
-                thinking.append(piece.get("thinking") or "")
-                generated += 1  # Ollama streams about one token per piece
-                first_token_at = first_token_at or time.monotonic()
-            if chunk.get("done"):
-                data = chunk
+                kind, value = stream.lines.get(timeout=LLM_TICK_SECONDS)
+            except queue.Empty:
+                kind, value = "wait", None
+                tick.empty()  # a page update, so a Cancel click takes effect here
+            if kind == "http_error":
+                status, body = value
+                raise RuntimeError(f"Ollama returned HTTP {status} for model `{model_name}`: {body}")
+            if kind == "error":
+                raise RuntimeError(
+                    f"Lost the connection to Ollama while `{model_name}` was answering: {value}"
+                ) from value
+            if kind == "end":
                 break
+            if kind == "line" and value.strip():
+                try:
+                    chunk = json.loads(value)
+                except ValueError as exc:
+                    raise RuntimeError(f"Ollama returned invalid JSON: {value[:500]!r}") from exc
+                if chunk.get("error"):
+                    raise RuntimeError(f"Ollama error for model `{model_name}`: {chunk['error']}")
+                piece = chunk.get("message") or {}
+                if piece.get("content") or piece.get("thinking"):
+                    content.append(piece.get("content") or "")
+                    thinking.append(piece.get("thinking") or "")
+                    generated += 1  # Ollama streams about one token per piece
+                    first_token_at = first_token_at or time.monotonic()
+                if chunk.get("done"):
+                    data = chunk
+                    break
             if on_progress and time.monotonic() - last_report >= LLM_PROGRESS_SECONDS:
                 last_report = time.monotonic()
                 on_progress(generated, last_report - first_token_at if first_token_at else None)
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Lost the connection to Ollama while `{model_name}` was answering: {exc}") from exc
+    finally:
+        # Also runs when Cancel stops the script: dropping the connection stops Ollama generating.
+        stream.close()
+        cancel_slot.empty()
 
     message = {"content": "".join(content), "thinking": "".join(thinking)}
     # Reasoning models (e.g. Qwen3) may inline their thinking; keep only the answer.
@@ -8020,6 +9062,20 @@ def gather_results(
     st.session_state[GATHERED_KEY] = gathered
 
 
+def restrict_gathered_to_library(safe_lib: str) -> None:
+    """Drop gathered notes from other libraries and their per-library counts.
+
+    For a literal search with Search all libraries unticked: its output is this library only, even when
+    an earlier all-library search gathered notes elsewhere.
+    """
+    gathered = st.session_state.get(GATHERED_KEY)
+    if not gathered or gathered["library"] != safe_lib:
+        return
+    gathered["notes"] = {key: entry for key, entry in gathered["notes"].items() if key[0] == safe_lib}
+    gathered["library_counts"] = []
+    st.session_state[GATHERED_KEY] = gathered
+
+
 def kept_gathered_notes(gathered: dict) -> list[tuple[str, str]]:
     """Gathered notes not excluded with 🚫, most recent hit first."""
     return [key for key in reversed(gathered["notes"]) if key[1] not in get_excluded_notes(key[0])]
@@ -8032,6 +9088,28 @@ def gathered_full_notes(gathered: dict, keys: list[tuple[str, str]]) -> list[dic
         entry = gathered["notes"][key]
         blocks += entry["blocks"] if entry["route"] == "literal" else load_note_blocks(key[0], [key[1]])
     return blocks
+
+
+def literal_matches(
+    search_filter: dict, safe_lib: str, library_folder: Path, corpus_root: Path | None, libraries: list[str] | None
+) -> set[tuple[str, str]]:
+    """(library key, file) of every note the filter terms match now, minus excluded ones: what Ask (filtered
+    only) answers from (up to Max results). `libraries`: all of them, when Search all libraries is ticked."""
+    targets = ([(resolve_library_registry_name(lib), resolve_library_content_path(corpus_root, lib)) for lib in libraries]
+               if libraries and corpus_root else [(safe_lib, library_folder)])
+    # Each library's filter carries its excluded notes, so the cache below sees exclusions change.
+    return set(_literal_matches(tuple(
+        (key, str(folder), json.dumps(with_exclusions(search_filter, key), sort_keys=True)) for key, folder in targets
+    ), str(corpus_root or "")))
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _literal_matches(targets: tuple, corpus_root: str) -> list[tuple[str, str]]:
+    found = []
+    for lib_key, folder, filter_json in targets:
+        lib_filter = with_path_matches(json.loads(filter_json), lib_key, Path(folder), Path(corpus_root) if corpus_root else None)
+        found += [(lib_key, source) for source in find_matching_sources(lib_key, lib_filter)]
+    return found
 
 
 def share_context(gathered: dict, keys: list[tuple[str, str]], budget: int) -> tuple[list[dict], int]:
@@ -8063,6 +9141,22 @@ def clear_search_results() -> None:
     """Clear results button: the gathered notes and the last search's results (and its discussion)."""
     clear_gathered_notes()
     st.session_state.pop(LAST_SEARCH_KEY, None)
+
+
+def clear_all_search_page() -> None:
+    """Clear all button: filter, exclusions, results and discussion, the question, Find notes about and the
+    injected task prompts. Settings (route, Max results, model, toggles) stay."""
+    clear_search_filter()
+    clear_search_results()
+    for field in SEARCH_FILTER_FIELDS:
+        st.session_state[f"searched_dates_{field}"] = []
+    st.session_state["question_text"] = ""
+    persist_question()
+    st.session_state["find_notes_query"] = ""
+    st.session_state[ACTIVE_TASK_PROMPTS_KEY] = []
+    st.session_state.pop("question_task_token", None)
+    for key in [key for key in st.session_state if str(key).endswith("_follow_up_text")]:
+        del st.session_state[key]
 
 
 def perform_search(
@@ -8139,9 +9233,19 @@ _migrated_tables = migrate_all_legacy_vectors()
 # ---------------------------------------------------------------------------
 # PAGE SETUP
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="RAG Workspace Manager", layout="wide")
+# Each sub-page names its purpose in the browser tab.
+PAGE_TITLES = {
+    "prompts": "RAG - Prompt library",
+    "actions": "RAG - Actions",
+    "configure": "RAG - Configure",
+    "reference": "RAG - Reference document",
+}
+st.set_page_config(page_title=PAGE_TITLES.get(st.query_params.get("page"), "RAG Workspace Manager"),
+                   layout="wide")
 # Starts the background auto-rescan thread once per server process.
 get_text_rescan_scheduler()
+if st.session_state.pop(LLM_CANCELLED_KEY, False):
+    st.toast("Stopped the LLM. Change what you need and run it again.", icon=":material/stop_circle:")
 if st.query_params.get("page") == "prompts":
     render_prompt_library_page()
     st.stop()
@@ -8610,7 +9714,9 @@ filter_box_col, ask_box_col = (st.container(), st.container()) if pick_ref is no
 
 with filter_box_col:
     with st.container(border=True, key="filter_box"):
-        title_col, clear_filter_col, clear_results_col = st.columns([2.4, 1.2, 1.2], vertical_alignment="center")
+        title_col, clear_filter_col, clear_results_col, clear_all_col = st.columns(
+            [1.6, 1.2, 1.2, 1], vertical_alignment="center"
+        )
         title_col.markdown("**Filter**")
         clear_filter_col.button(
             "Clear Filter",
@@ -8625,6 +9731,15 @@ with filter_box_col:
             disabled=not (gathered_notes(safe_lib) or st.session_state.get(LAST_SEARCH_KEY)),
             help="Clear the gathered notes and the last results, so **Search** looks through the whole library "
             "again. Filter terms and exclusions stay.",
+        )
+        clear_all_col.button(
+            "Clear all",
+            key="clear_all",
+            on_click=clear_all_search_page,
+            use_container_width=True,
+            help="Start the page afresh: clears the filter, exclusions, results and discussion, your question, "
+            "**Find notes about** and any injected task prompt. Settings such as the route, **Max results** and "
+            "the model stay.",
         )
         # Two routes into the notes: semantic (vector) search or literal text matching. The controls below
         # follow the route; the Ask box's Search button uses it too.
@@ -8681,14 +9796,17 @@ with filter_box_col:
         }
         st.html(FILTER_FIELD_STYLE)
         # On the Semantic route the terms only narrow which notes are searched, so they're folded away.
-        set_terms = [
-            t for field in SEARCH_FILTER_FIELDS
-            for t in st.session_state.get(f"filter_{field}", _saved_filter.get(field, []))
-        ]
+        terms_by_field = {
+            field: st.session_state.get(f"filter_{field}", _saved_filter.get(field, [])) for field in SEARCH_FILTER_FIELDS
+        }
+        set_terms = [t for terms in terms_by_field.values() for t in terms]
+        if not exact_text_only:  # a filter set when you start a new search is shown, not folded away
+            reveal_filter_for_new_search(terms_by_field)
         terms_area = st.container() if exact_text_only else st.expander(
             "Narrow by terms" + (f" · {len(set_terms)} set ({truncate_text(', '.join(set_terms), 40)})" if set_terms else ""),
             key="narrow_by_terms",
             icon=":material/filter_alt:",
+            on_change="rerun",
         )
         with terms_area:
             for field, (label, field_help) in FILTER_WIDGETS.items():
@@ -8698,7 +9816,15 @@ with filter_box_col:
                     # Dates restored from the last session count as left over from an earlier search.
                     st.session_state[f"searched_dates_{field}"] = date_terms(st.session_state[_key])
                 # Each field is one small box: heading and quick dates, quick terms, then the terms themselves.
-                with st.container(border=True, gap="xsmall", key=f"filter_field_{field}"):
+                # Any of (OR) and Exclude (NOT) are folded, with their terms in the title, to keep the box short.
+                folded = field != "all"
+                field_terms = st.session_state[_key]
+                field_box = st.expander(
+                    label + (f" · {len(field_terms)}: {truncate_text(', '.join(field_terms), 40)}" if field_terms else ""),
+                    key=f"filter_fold_{field}",
+                    on_change="rerun",
+                ) if folded else st.container(border=True, gap="xsmall", key=f"filter_field_{field}")
+                with field_box:
                     render_filter_heading(field, label, (
                         f"{field_help}\n\n"
                         "Each term is matched **literally** (case-insensitive) anywhere in the note or its "
@@ -8708,7 +9834,7 @@ with filter_box_col:
                             if exact_text_only
                             else "On the **Semantic** route, passages are ranked **only within** the matching notes."
                         )
-                    ))
+                    ), show_label=not folded)
                     st.multiselect(
                         label,
                         options=st.session_state[_key],
@@ -8718,40 +9844,34 @@ with filter_box_col:
                         placeholder="Type a term, press Enter",
                         label_visibility="collapsed",
                     )
-        if not exact_text_only:  # under the terms, so you can narrow first
-            find_clicked = st.button(
-                "🔎 Find notes",
-                key="find_notes_button",
-                use_container_width=True,
-                help="Lists the notes about what's in **Find notes about**, within **Narrow by terms** if set.",
-            )
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
         if "max_results" not in st.session_state:  # saved between searches and sessions
             st.session_state["max_results"] = min(max(int(load_app_settings().get("max_results", 15) or 15), 1), 50)
-        result_limit = st.number_input(
-            "Max results",
-            min_value=1,
-            max_value=50,
-            key="max_results",
-            on_change=persist_max_results,
-            width=160,
-            help="The most passages (Semantic route) or notes (Literal route) a search returns. Saved for next time.",
-        )
-        install_filter_commit_on_blur()
-        install_tooltip_hide_on_click()
         search_filter = get_search_filter_from_widgets()
-        if is_filter_active(search_filter):
-            st.caption(f"Filter: {describe_search_filter(search_filter)}")
-        if count_excluded_notes():
-            excluded_col, clear_col = st.columns([3, 1.4], vertical_alignment="center")
-            excluded_col.caption(f"🚫 {count_excluded_notes()} note(s) excluded from **Search**.")
-            clear_col.button("Clear exclusions", on_click=clear_excluded_notes, use_container_width=True)
-
-        with st.container(border=True):
-            st.markdown(
-                "**Advanced search settings** · "
-                + ("literal: whole notes that match the filter" if exact_text_only else "semantic: passages ranked by meaning")
+        # One line: Max results (its title beside the box), then what the filter and exclusions leave out, with
+        # Clear exclusions rightmost.
+        with st.container(horizontal=True, vertical_alignment="center", gap="small", key="max_results_row"):
+            st.markdown("Max results", width="content",
+                        help="The most passages (Semantic route) or notes (Literal route) a search returns. "
+                        "Saved for next time.")
+            result_limit = st.number_input(
+                "Max results",
+                min_value=1,
+                max_value=50,
+                key="max_results",
+                on_change=persist_max_results,
+                width=80,
+                label_visibility="collapsed",
             )
+            # The filter takes the free space and wraps within it, so the rest stays on this line.
+            st.caption(f"Filter: {describe_search_filter(search_filter)}" if is_filter_active(search_filter) else "")
+            if count_excluded_notes():
+                st.caption(f"🚫 {count_excluded_notes()} excluded", width="content")
+                st.button("Clear", key="clear_exclusions", type="tertiary", on_click=clear_excluded_notes,
+                          help=f"Clear exclusions: search the {count_excluded_notes()} excluded note(s) again.")
+
+        # The route's search settings, at the bottom of the Filter box.
+        with st.container():
             if exact_text_only:
                 all_libs_col, filter_btn_col = st.columns([1, 1.2], vertical_alignment="center")
                 with all_libs_col:
@@ -8779,7 +9899,7 @@ with filter_box_col:
 
                 rescan_all = search_all_libraries and not is_single_corpus_mode()
                 rescan_libraries = scan_libraries if rescan_all else [selected_lib]
-                rescan_note_col, rescan_btn_col = st.columns([2, 1.2], vertical_alignment="center")
+                rescan_note_col, rescan_btn_col = st.columns([1.5, 1.3], vertical_alignment="center")
                 rescan_note_slot = rescan_note_col.empty()
                 if rescan_btn_col.button(
                     "🔄 Rescan → Filter search",
@@ -8834,6 +9954,17 @@ with filter_box_col:
                 )
                 distance_threshold = float(st.session_state[_cutoff_key])
                 distance_map_slot = st.container()
+                # Last in the box, under every setting it uses.
+                find_clicked = st.button(
+                    "🔎 Find notes",
+                    key="find_notes_button",
+                    use_container_width=True,
+                    help="Lists the notes about what's in **Find notes about**, within **Narrow by terms** if set.",
+                )
+        # Scripts with no visible part: last in the Filter box, so their empty slots don't open gaps between rows.
+        install_filter_commit_on_blur()
+        install_tooltip_hide_on_click()
+        install_save_flash()
 
     # Filter-only results are listed here, under the Filter box.
     filter_results_slot = st.container()
@@ -8856,39 +9987,52 @@ with ask_box_col:
         search_progress_slot = st.empty()
     else:
         with st.container(border=True, key="ask_box"):  # green, like the answer (route_tint_style)
-            st.markdown("**Ask**")
             if "question_text" not in st.session_state:
                 st.session_state["question_text"] = str(load_app_settings().get("last_question", ""))
-            install_select_question_on_focus()
-            prompt_text = st.text_area(
-                QUESTION_LABEL,
-                height=100,
-                key="question_text",
-                on_change=persist_question,
-                help="Saved locally and restored when the page is reloaded.",
-            )
-            # The injected prompt's links (e.g. Salesforce, the connector app), between the question and its token.
-            last_search_state = st.session_state.get(LAST_SEARCH_KEY)
-            render_prompt_links(
-                resolve_run_prompts(prompt_library, corpus_config)["tasks"],
-                prompt_library,
-                best_guess(prompt_text, search_filter, last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
-            )
+            # One line: the title, Answer with LLM, then the injected prompt's links (e.g. Salesforce, the
+            # connector app). The links' best guess uses the question as typed so far.
+            with st.container(gap="xsmall", key="ask_top"):
+                with st.container(horizontal=True, vertical_alignment="center", gap="medium", key="ask_header"):
+                    st.markdown("**Ask**", width="content")
+                    use_llm_answer = st.checkbox(
+                        "Answer with LLM",
+                        value=True,
+                        key="use_llm_answer",
+                        width="content",
+                        help=(
+                            "**Semantic search** finds relevant note chunks using embedding vectors. "
+                            "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
+                            "Search still runs first; the LLM does not replace retrieval."
+                        ),
+                    )
+                    last_search_state = st.session_state.get(LAST_SEARCH_KEY)
+                    render_prompt_links(
+                        resolve_run_prompts(prompt_library, corpus_config)["tasks"],
+                        prompt_library,
+                        best_guess(str(st.session_state.get("question_text", "")), search_filter,
+                                   last_search_state if (last_search_state or {}).get("library") == safe_lib else None),
+                    )
+                # The question: one line unless Bigger is on, its title and the toggle on the line above.
+                with st.container(horizontal=True, vertical_alignment="center", key="question_heading"):
+                    st.markdown(QUESTION_LABEL, width="stretch",
+                                help="Saved locally and restored when the page is reloaded.")
+                    big_question = st.toggle("Bigger", key="question_bigger", help="A taller box for long questions.")
+                if not big_question:
+                    st.html(QUESTION_ONE_LINE_STYLE)
+                prompt_text = st.text_area(
+                    QUESTION_LABEL,
+                    height=QUESTION_BIG_HEIGHT if big_question else "content",
+                    key="question_text",
+                    on_change=persist_question,
+                    label_visibility="collapsed",
+                )
+                remember_search_inputs()
+            install_select_question_on_focus()  # no visible part: after the box, so it adds no gap above it
             render_injected_prompt_token(prompt_library)
-            # Top to bottom: question → Answer with LLM → prompt library → model details → cutoff → Search → progress.
-            use_llm_answer = st.checkbox(
-                "Answer with LLM",
-                value=True,
-                key="use_llm_answer",
-                help=(
-                    "**Semantic search** finds relevant note chunks using embedding vectors. "
-                    "**Answer with LLM** sends those chunks to Ollama to write a natural-language summary. "
-                    "Search still runs first; the LLM does not replace retrieval."
-                ),
-            )
+            # Top to bottom: title, Answer with LLM and links → question → prompt library → model details → Search.
 
             if use_llm_answer:
-                render_ask_prompt_panel(prompt_library, corpus_config)
+                render_ask_prompt_panel(prompt_library, corpus_config, safe_lib)
                 # A task prompt with its own model preselects it. The box has no key, so its default changes with
                 # the prompt; picking another model here overrides it for this run.
                 prompt_model = first_prompt_model(resolve_run_prompts(prompt_library, corpus_config)["tasks"])
@@ -8954,9 +10098,19 @@ with ask_box_col:
                 llm_max_tokens = int(corpus_config["llm_max_tokens"])
                 llm_temperature = float(corpus_config["llm_temperature"])
 
+            # Literal route: how many notes Ask (filtered only) would send, to compare with the in-scope notes.
+            literal = (literal_matches(search_filter, safe_lib, library_folder, corpus_root_path,
+                                       scan_libraries if search_all_libraries and not is_single_corpus_mode() else None)
+                       if exact_text_only and has_positive_filter_terms(search_filter) else None)
+            literal_count = (
+                "" if literal is None else
+                f" · {result_limit} of {len(literal)} notes" if len(literal) > result_limit
+                else f" · {len(literal)} note{'' if len(literal) == 1 else 's'}"
+            )
             search_clicked = st.button(
-                "🔍 Ask (filtered only)" if exact_text_only else "🔍 Search",
+                f"🔍 Ask (filtered only){literal_count}" if exact_text_only else "🔍 Search",
                 type="primary",
+                key="search_button",
                 use_container_width=True,
                 help="Uses the route chosen in the Filter box: "
                 + (
@@ -8969,10 +10123,11 @@ with ask_box_col:
             )
             _in_scope = gathered_notes(safe_lib)
             _kept_in_scope = kept_gathered_notes(_in_scope) if _in_scope else []
-            scope_clicked = st.button(
+            # Only worth offering when the in-scope notes aren't just what Ask (filtered only) sends anyway.
+            same_as_filtered = literal is not None and len(literal) <= result_limit and set(_kept_in_scope) == literal
+            scope_clicked = bool(_kept_in_scope) and not same_as_filtered and st.button(
                 f"🗂 Ask about in-scope notes ({len(_kept_in_scope)})",
                 use_container_width=True,
-                disabled=not _kept_in_scope,
                 help="Answers your question from every note in **In scope** (under the Filter box) that you haven't "
                 "excluded, e.g. *list the actions* across two companies' conversations. Each note gets an equal "
                 "share of the LLM's context.",
@@ -9094,6 +10249,8 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
             route = "scope" if scope_clicked else (
                 "literal" if filter_only_clicked or (search_clicked and exact_text_only) else "semantic"
             )
+            if route == "literal" and not search_all_libraries:
+                restrict_gathered_to_library(safe_lib)
             if final_results and not scope_clicked:  # every search adds its notes to the in-scope list
                 gather_results(safe_lib, final_results, route, library_counts, uploads_dirs)
             # Corpus prompts describe one library's author role, so skip them across libraries.
@@ -9101,6 +10258,10 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
             tasks = run_prompts["tasks"]
             agents = [task for task in tasks if is_agent_prompt(task)]
             run_references = run_reference_documents(tasks, prompt_library) if use_llm_answer else []
+            # The Ask box's Salesforce chip, or a prompt that asks for Salesforce records.
+            salesforce_prompts = [task["name"] for task in tasks if task.get("salesforce")]
+            run_salesforce = use_llm_answer and bool(load_reference_snapshot()) and (
+                bool(load_app_settings().get(SALESFORCE_CONTEXT_SETTING)) or bool(salesforce_prompts))
             search_state = {
                 "filter_only": listing,
                 "route": route,
@@ -9133,7 +10294,9 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                     else tasks[0]["text"] if tasks else ""
                 ),
                 "prompt_parts": describe_run_prompts(run_prompts, search_corpus_prompt)
-                + [f"Reference: {reference_label(ref)}" for ref in run_references],
+                + [f"Reference: {reference_label(ref)}" for ref in run_references]
+                + (["Salesforce records"] if run_salesforce else []),
+                "salesforce_context": run_salesforce,
                 "library_display": selected_lib if state_library == safe_lib else "All libraries",
                 "id": uuid.uuid4().hex[:8],  # keys this search's per-note widgets
                 "left_out_notes": [],
@@ -9157,7 +10320,8 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                             model_name=selected_ollama_model,
                             max_tokens=llm_max_tokens,
                             temperature=llm_temperature,
-                            corpus_prompt=search_state["prompt_context"],
+                            corpus_prompt=with_salesforce_context(
+                                search_state, search_state["prompt_context"], final_results),
                             task_prompt=search_state["task_prompt"],
                             on_progress=report,
                         )
