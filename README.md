@@ -118,7 +118,7 @@ ollama pull llama3.2:3b
 
 **First run:** the app opens a **Getting started** guide that walks you through choosing your notes folder, how to index it, and the embedding engine — see [Getting started guide](#getting-started-guide).
 
-**In the app:** use **Notes location** at the top of the left sidebar. Enter the path to your export folder or click **Browse…** to pick it. The path is saved to `./llmware_data/app_settings.json`.
+**In the app:** open **Configure** near the top of the left sidebar (under **Chat with LLM**); its **Notes location** holds the corpus root folder and corpus mode. Enter the path to your export folder or click **Browse…** to pick it. Configure is folded once the folder is set, and opens by itself if it isn't, or can't be found. The path is saved to `./llmware_data/app_settings.json`.
 
 **Export from Apple Notes:** use our companion app [Local Apple Notes Export](https://github.com/yrros/Local-Apple-Notes-Export), or the [Falcon Notes Exporter](https://falcon.star-lord.me/exporter), to produce a folder of markdown files (typically with an `iCloud` subfolder containing one directory per note account or category).
 
@@ -242,7 +242,7 @@ On first run — and after `./reset_rag.sh` — the app shows a three-step guide
 
 ### First-time indexing (manual)
 
-1. Set **Notes location** to your Apple Notes export folder (or use **Browse…**).
+1. Set **Notes location** (under **Configure** in the sidebar) to your Apple Notes export folder (or use **Browse…**).
 2. Select a **library** (corpus) in the left sidebar.
 2. Open **Advanced — Indexing & Embeddings** if you want to change the embedding model or relevance cutoff.
 3. Click **Re-index (full rebuild)** for a new corpus, or **Rescan (incremental)** to pick up new, edited and deleted notes.
@@ -328,6 +328,24 @@ The Ask box reads top to bottom: a title line with **Ask**, **Answer with LLM** 
 - While the LLM is working (an answer, a Discussion follow-up or an Agent step), an orange **Cancel Query** button floats at the bottom of the window wherever you've scrolled. It stops the request within about half a second, even while the model is still reading the notes, and Ollama stops generating. Change the task, prompts or filter and run it again.
 - **Folder paths.** Each result gets its note's folder path from where the file sits under the notes folder, e.g. *Clients > Prospects > Acme*. It's shown on the note in **Sources** and given to the LLM with every passage (`[Source 2: Kickoff-2026-10-20.md, in Clients > Prospects > Acme]`), so the model knows what each note is about even for passages that don't include its title. No rebuild is needed. When two notes in a library share a file name, the path is left out rather than guessed. Local Apple Notes Export can also put the path in each note's title line (its *Folder path in titles* option), which puts it in the indexed text for search, after a rescan and re-embed.
 
+### Chat with LLM
+
+**Chat with LLM**, at the very top of the left sidebar, opens a classic chat with any model installed in Ollama, in the same tab (**Back to search**, or the 🧠, returns to the search page with everything as you left it).
+
+- **Chats are saved** once they have a message, as `llmware_data/chats/<id>.json` on your machine only. They're listed in the sidebar, most recent first; click one to carry on. **New chat** starts afresh. A chat is titled from its first message; **Rename** and **Delete** sit beside the title.
+- **Model** (per chat) can be changed mid-chat to have another model carry on; new chats start with the last one used. The line under it shows the model's last measured speed.
+- **About me** sends your About me from the Prompt library as background. **Prompt** sends a prompt from your library as standing instructions with every message.
+- **Attach notes in scope (N)** attaches a copy of the notes kept in scope on the search page (gather them there first with a search, Find notes or Filter search only), up to 24,000 characters shared between them. They're sent with every message in that chat; **Notes attached** lists them, and a click removes them.
+- **Model options** (per chat):
+  - **Max tokens** (4,096 to start, room for a reasoning model to think) and **Temperature**.
+  - **Context window**: how much of the chat (and attached notes) the model sees at once. **Auto** sizes it to the chat, capped at the model's own limit (e.g. 131,072 for `llama3.2:3b`), but each step up reloads the model, so that reply starts slower. A fixed size avoids the reloads; a smaller one uses less memory.
+  - **Thinking**: *Model default*, *On* or *Off*, for models that can think (e.g. Qwen). *Off* is much faster. Greyed out for models that can't.
+  - **Top P**, **Top K**, **Repeat penalty** and **Seed**: empty means the model's own default (from its Modelfile), which usually suits it best. A seed makes replies repeatable, to compare models or options.
+  - **Reset to defaults** puts the context window, thinking and sampling back.
+- Replies stream in as they're written. A reasoning model's thinking streams into a folded **Thinking** section above its answer (*Thought for 12s*), open it to read. Under each reply, **Copy** and a stats line: model, **tokens per second**, tokens written, time taken and how much of the context window was used. Hover it for the breakdown: writing speed, prompt reading time and speed, model load time, time to the first token and the window size.
+- **Context meter**: under the model line, how full the context window was at the last reply (*Context: 3,120 of 8,192 tokens (38%)*). Past 85% it warns that the model is about to stop seeing the oldest messages: pick a bigger window or start a new chat.
+- The orange **Cancel Query** stops a reply. Your message is kept; **Get a reply** asks again, e.g. after switching to a faster model.
+
 ### Prompt library
 
 Open it with the **Prompt library** button in the left panel (hover it for a summary of what is switched on), or the **↗** beside the title of the Ask panel's Prompt library box. It opens in a new tab (`?page=prompts`) and saves to `llmware_data/prompt_library.json` (the corpus prompt stays in `corpus_settings.json`). Top to bottom: About me, corpus prompt, quick search filters, reference documents, task prompts and Agent prompts. Links, the outbox and the title marker are on the [Configure](#configure) page.
@@ -377,7 +395,7 @@ Requires Ollama running locally (`localhost:11434`).
 
 ### Configure
 
-Open it with the **Configure** button under **Prompt library** in the left panel (a new tab, `?page=configure`). It holds the settings for what happens to an Agent's drafts:
+Open it with **Configure page** inside the **Configure** dropdown near the top of the left sidebar (a new tab, `?page=configure`). It holds the settings for what happens to an Agent's drafts:
 
 | Section | What it does |
 |---------|--------------|
@@ -610,7 +628,7 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 
 | Problem | Likely cause | Fix |
 |---------|--------------|-----|
-| Wrong or missing corpus root | Path not set or folder moved | Set **Notes location** in the sidebar; use **Browse…** |
+| Wrong or missing corpus root | Path not set or folder moved | Set **Notes location** under **Configure** in the sidebar (it opens by itself); use **Browse…** |
 | Search returns nothing | Index empty or stale LanceDB path | Run **Re-index**; check Debug details for vector count |
 | A new or edited note isn't found by the filter | Not rescanned yet, or its corpus is hidden | Click **🔄 Rescan → Filter search**, or turn on auto-rescan; unhide the corpus or select it and **⚡ Rescan** |
 | A new or edited note is found by the filter but not by semantic search | Auto-rescan is text only | Click **⚡ Rescan** (or **⚡ Rescan all corpora**) to embed it |

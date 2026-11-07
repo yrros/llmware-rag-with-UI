@@ -6050,14 +6050,6 @@ def render_prompt_library_sidebar(corpus_config: dict) -> None:
             "Opens in a new tab."
         ),
     )
-    st.sidebar.link_button(
-        "Configure",
-        CONFIGURE_PAGE_URL,
-        icon=":material/settings:",
-        width="stretch",
-        help="Task executor settings (the connector and other links), the outbox and the task title marker. "
-        "Opens in a new tab.",
-    )
 
 
 def is_hide_corpora_enabled() -> bool:
@@ -9294,6 +9286,7 @@ LLM_CANCEL_STYLE = """<style>
   background-color: rgb(230, 120, 0) !important; border-color: rgb(230, 120, 0) !important;
 }
 </style>"""
+LLM_TEXT_SECONDS = 0.15  # how often a streamed reply is redrawn (on_text)
 _LLM_CANCEL_KEYS = itertools.count()  # one Cancel per LLM call; restarts each script run
 
 
@@ -9371,6 +9364,8 @@ def chat_with_ollama(
     response_format: dict | None = None,
     on_progress=None,
     think: bool | None = None,
+    on_text=None,
+    extra_options: dict | None = None,
 ) -> tuple[str, dict]:
     """Send a chat conversation to a local Ollama model and return (reply, usage).
 
@@ -9380,12 +9375,16 @@ def chat_with_ollama(
     is called every LLM_PROGRESS_SECONDS with the tokens generated so far and the seconds since the
     first one (None while the model is still reading the prompt).
     A floating Cancel shows while the call runs; clicking it stops the call and closes the connection.
+    `on_text(content, thinking)` gets the reply so far as it streams (every LLM_TEXT_SECONDS, and once at the end),
+    for pages that show it live, e.g. Chat with LLM. `extra_options` are more Ollama options (e.g. top_p, seed, or
+    an exact num_ctx), set over the ones above.
     """
     options = {
         "temperature": temperature,
         "num_predict": max_tokens,
         "num_ctx": context_window_for(messages, max_tokens, num_ctx),
     }
+    options.update({key: value for key, value in (extra_options or {}).items() if value is not None})
 
     payload = {
         "model": model_name,
@@ -9410,7 +9409,7 @@ def chat_with_ollama(
     tick = st.empty()
     content, thinking, data = [], [], {}
     generated, first_token_at = 0, None
-    last_report = time.monotonic()
+    last_report = last_text = time.monotonic()
     try:
         while True:
             try:
@@ -9446,6 +9445,11 @@ def chat_with_ollama(
             if on_progress and time.monotonic() - last_report >= LLM_PROGRESS_SECONDS:
                 last_report = time.monotonic()
                 on_progress(generated, last_report - first_token_at if first_token_at else None)
+            if on_text and generated and time.monotonic() - last_text >= LLM_TEXT_SECONDS:
+                last_text = time.monotonic()
+                on_text("".join(content), "".join(thinking))
+        if on_text:
+            on_text("".join(content), "".join(thinking))
     finally:
         # Also runs when Cancel stops the script: dropping the connection stops Ollama generating.
         stream.close()
@@ -9476,6 +9480,12 @@ def chat_with_ollama(
         "metric": "tokens",
         "processing_time": (total_duration / 1e9) if total_duration else None,
         "tokens_per_second": (output_tokens / (eval_duration / 1e9)) if eval_duration else None,
+        # Time to load the model and read the prompt, i.e. before the first token, and the reading speed.
+        "load_seconds": (data["load_duration"] / 1e9) if data.get("load_duration") else None,
+        "prompt_seconds": (data["prompt_eval_duration"] / 1e9) if data.get("prompt_eval_duration") else None,
+        "prompt_tokens_per_second": (prompt_tokens / (data["prompt_eval_duration"] / 1e9))
+        if data.get("prompt_eval_duration") else None,
+        "num_ctx": options["num_ctx"],
     }
     return answer, usage
 
@@ -10175,6 +10185,446 @@ def describe_nearest_vector_match(nearest_distance: float | None, distance_thres
 
 _migrated_tables = migrate_all_legacy_vectors()
 
+# --- Chat with LLM (?page=chat) -------------------------------------------------
+# A classic chat with any installed Ollama model, opened in the same tab from the sidebar. Each chat is saved as
+# llmware_data/chats/<id>.json (local only) once it has a message. A chat can also send About me, a prompt from
+# the library, and a snapshot of the notes in scope on the search page.
+CHAT_PAGE = "chat"
+CHAT_DIR = APP_DATA_DIR / "chats"
+CHAT_OPEN_KEY = "chat_open_id"  # the saved chat on screen; none means a new, unsaved one (CHAT_DRAFT_KEY)
+CHAT_DRAFT_KEY = "chat_draft"
+CHAT_MODEL_SETTING = "chat_model"  # app setting: the model new chats start with
+CHAT_NOTES_MAX_CHARS = 24000  # notes text attached to a chat, shared between the notes
+CHAT_DEFAULTS = {
+    "max_tokens": 4096,  # room for a reasoning model to think, then answer
+    "temperature": 0.7,
+    "num_ctx": 0,  # context window: 0 is Auto (sized to the chat, up to the model's limit)
+    "think": "auto",  # auto (the model's default), on or off, for models that can think
+    # None leaves these to the model's own defaults (its Modelfile), which suit it best unless you know otherwise.
+    "top_p": None, "top_k": None, "repeat_penalty": None, "seed": None,
+}
+CHAT_SAMPLING_OPTIONS = ("top_p", "top_k", "repeat_penalty", "seed")
+CHAT_CONTEXT_SIZES = (2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144)
+CHAT_THINK_CHOICES = {"auto": "Model default", "on": "On", "off": "Off"}
+CONTEXT_WARN_SHARE = 0.85  # warn once the last exchange filled this much of the context window
+CHAT_TITLE_CHARS = 60
+
+
+def open_chat_page() -> None:
+    st.query_params["page"] = CHAT_PAGE
+
+
+def leave_chat_page() -> None:
+    st.query_params.clear()
+
+
+def chat_path(chat_id: str) -> Path:
+    return CHAT_DIR / f"{chat_id}.json"
+
+
+def list_chats() -> list[dict]:
+    """Saved chats, most recently used first."""
+    chats = [read_json_file(path) for path in CHAT_DIR.glob("*.json")] if CHAT_DIR.is_dir() else []
+    return sorted((c for c in chats if c.get("id")), key=lambda c: c.get("updated", ""), reverse=True)
+
+
+def save_chat(chat: dict) -> None:
+    chat["updated"] = now_iso()
+    write_text_atomically(chat_path(chat["id"]), json.dumps(chat, indent=2, ensure_ascii=False))
+
+
+def new_chat_record() -> dict:
+    return {"id": uuid.uuid4().hex, "title": "New chat", "titled": False, "created": now_iso(), "updated": now_iso(),
+            "model": load_app_settings().get(CHAT_MODEL_SETTING) or DEFAULT_OLLAMA_MODEL, "about_me": False,
+            "prompt_id": "", "notes": None, "messages": [], **CHAT_DEFAULTS}
+
+
+def current_chat() -> dict:
+    """The chat on screen: the saved one opened, or a new one kept in the session until its first message."""
+    chat_id = st.session_state.get(CHAT_OPEN_KEY)
+    if chat_id and chat_path(chat_id).is_file():
+        return read_json_file(chat_path(chat_id))
+    st.session_state.pop(CHAT_OPEN_KEY, None)
+    return st.session_state.setdefault(CHAT_DRAFT_KEY, new_chat_record())
+
+
+def keep_chat(chat: dict) -> None:
+    """Save a chat that has messages; a new one stays in the session until then."""
+    if chat["messages"]:
+        save_chat(chat)
+        st.session_state[CHAT_OPEN_KEY] = chat["id"]
+        st.session_state.pop(CHAT_DRAFT_KEY, None)
+    else:
+        st.session_state[CHAT_DRAFT_KEY] = chat
+
+
+def start_new_chat() -> None:
+    st.session_state.pop(CHAT_OPEN_KEY, None)
+    st.session_state[CHAT_DRAFT_KEY] = new_chat_record()
+
+
+def open_saved_chat(chat_id: str) -> None:
+    st.session_state[CHAT_OPEN_KEY] = chat_id
+
+
+def change_chat_setting(field: str, widget_key: str) -> None:
+    chat = current_chat()
+    chat[field] = st.session_state.get(widget_key)
+    if field == "model":
+        save_app_settings({CHAT_MODEL_SETTING: chat["model"]})  # new chats start with the last model used
+    keep_chat(chat)
+
+
+def rename_chat(widget_key: str) -> None:
+    title = str(st.session_state.get(widget_key, "")).strip()
+    chat = current_chat()
+    if title:
+        chat.update(title=title[:CHAT_TITLE_CHARS * 2], titled=True)
+        keep_chat(chat)
+
+
+def delete_open_chat() -> None:
+    chat_id = st.session_state.pop(CHAT_OPEN_KEY, None)
+    if chat_id:
+        chat_path(chat_id).unlink(missing_ok=True)
+    st.session_state[CHAT_DRAFT_KEY] = new_chat_record()
+
+
+def in_scope_notes_context() -> tuple[int, str, list[str]]:
+    """(how many, their text, their names) for the notes kept in scope on the search page, or (0, '', [])."""
+    gathered = st.session_state.get(GATHERED_KEY)
+    if not gathered or not gathered.get("notes"):
+        return 0, "", []
+    kept = kept_gathered_notes(gathered)
+    blocks, _trimmed = share_context(gathered, kept, CHAT_NOTES_MAX_CHARS)
+    return len(kept), build_context_from_results(blocks, CHAT_NOTES_MAX_CHARS), [Path(source).name for _lib, source in kept]
+
+
+def attach_in_scope_notes() -> None:
+    count, text, names = in_scope_notes_context()
+    chat = current_chat()
+    chat["notes"] = {"count": count, "text": text, "names": names, "at": now_iso()} if count else None
+    keep_chat(chat)
+
+
+def detach_notes() -> None:
+    chat = current_chat()
+    chat["notes"] = None
+    keep_chat(chat)
+
+
+def chat_system_prompt(chat: dict) -> str:
+    library = load_prompt_library()
+    parts = []
+    profile = str(library["profile"].get("text", "")).strip()
+    if chat.get("about_me") and profile:
+        parts.append(f"About the person you're chatting with:\n{profile}")
+    prompt = find_prompt(library, chat.get("prompt_id"))
+    if prompt:
+        parts.append(prompt["text"])
+    if chat.get("notes"):
+        parts.append(f"Notes from my notes app, for reference ({plural(chat['notes']['count'], 'note')}):\n"
+                     f"{chat['notes']['text']}")
+    return "\n\n".join(parts)
+
+
+def split_inline_thinking(content: str) -> tuple[str, str]:
+    """(thinking, answer) for models that write their reasoning inline in <think> tags."""
+    match = re.match(r"\s*<think>(.*?)(</think>|$)(.*)", content, flags=re.DOTALL)
+    return (match.group(1).strip(), match.group(3).lstrip()) if match else ("", content)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def ollama_model_info(model: str) -> dict:
+    """{"context_length": the model's maximum context window or None, "thinking": whether it can think}."""
+    try:
+        conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=10)
+        conn.request("POST", "/api/show", body=json.dumps({"model": model}), headers={"Content-Type": "application/json"})
+        data = json.loads(conn.getresponse().read() or b"{}")
+        conn.close()
+    except (OSError, ValueError):
+        return {"context_length": None, "thinking": False}
+    lengths = [v for k, v in (data.get("model_info") or {}).items() if k.endswith(".context_length") and isinstance(v, int)]
+    return {"context_length": max(lengths) if lengths else None, "thinking": "thinking" in (data.get("capabilities") or [])}
+
+
+def chat_ollama_settings(chat: dict, messages: list[dict]) -> tuple[dict, bool | None]:
+    """(extra Ollama options, think) for this chat: an exact context window (Auto sizes it to the chat, capped at
+    the model's limit) and any sampling options set away from the model's defaults."""
+    limit = ollama_model_info(chat["model"])["context_length"]
+    max_tokens = int(chat.get("max_tokens", CHAT_DEFAULTS["max_tokens"]))
+    num_ctx = int(chat.get("num_ctx") or 0) or context_window_for(messages, max_tokens)
+    options = {"num_ctx": min(num_ctx, limit) if limit else num_ctx}
+    options.update({key: chat[key] for key in CHAT_SAMPLING_OPTIONS if chat.get(key) is not None})
+    think = {"on": True, "off": False}.get(chat.get("think") or "auto")
+    return options, think if ollama_model_info(chat["model"])["thinking"] else None
+
+
+def format_seconds(seconds: float | None) -> str:
+    return "?" if seconds is None else f"{seconds:.1f}s" if seconds < 60 else format_duration(seconds)
+
+
+def describe_reply_stats(message: dict) -> tuple[str, str]:
+    """(one short line, the full breakdown for its tooltip) from a reply's Ollama stats."""
+    line = [f"`{message.get('model', '?')}`"]
+    if message.get("tokens_per_second"):
+        line.append(f"**{message['tokens_per_second']:.1f} tokens/s**")
+    if message.get("output_tokens"):
+        line.append(f"{message['output_tokens']:,} tokens")
+    if message.get("total_seconds"):
+        line.append(format_seconds(message["total_seconds"]))
+    if message.get("num_ctx") and message.get("input_tokens") is not None:
+        line.append(f"context {message['input_tokens'] + (message.get('output_tokens') or 0):,} / {message['num_ctx']:,}")
+    before = sum(v for v in (message.get("load_seconds"), message.get("prompt_seconds")) if v)
+    detail = [
+        f"**Writing:** {message.get('output_tokens') or 0:,} tokens at {message.get('tokens_per_second') or 0:.1f} tokens/s"
+        + (" (thinking included)" if message.get("thinking") else ""),
+        f"**Reading the prompt:** {message.get('input_tokens') or 0:,} tokens in {format_seconds(message.get('prompt_seconds'))}"
+        + (f" ({message['prompt_tokens_per_second']:,.0f} tokens/s)" if message.get("prompt_tokens_per_second") else ""),
+        f"**Loading the model:** {format_seconds(message.get('load_seconds'))}",
+        f"**First token after:** {format_seconds(before) if before else '?'} · **Total:** {format_seconds(message.get('total_seconds'))}",
+        f"**Context window:** {message.get('num_ctx') or '?':,}" if message.get("num_ctx") else "**Context window:** ?",
+    ]
+    # Replies saved before stats were kept have none to break down.
+    return " · ".join(line), "  \n".join(detail) if message.get("output_tokens") else ""
+
+
+def render_chat_reply(message: dict) -> None:
+    """A saved assistant reply: its thinking (folded), the answer, a copy button and the model's speed."""
+    if message.get("thinking"):
+        seconds = message.get("thought_seconds")
+        label = "Thinking" if seconds is None else f"Thought for {seconds:.0f}s" if seconds >= 1 else "Thought briefly"
+        with st.expander(label, type="compact"):
+            st.markdown(message["thinking"])
+    st.markdown(message["content"])
+    line, detail = describe_reply_stats(message)
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        render_copy_buttons([("Copy", message["content"])], fit=True)
+        st.caption(line, width="content", help=detail or None)
+
+
+def generate_chat_reply(chat: dict) -> None:
+    """Stream the model's reply to the conversation so far into the page, then save it with the chat."""
+    system = chat_system_prompt(chat)
+    messages = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": m["role"], "content": m["content"]} for m in chat["messages"]
+    ]
+    with st.chat_message("assistant"):
+        think_slot, answer_slot = st.empty(), st.empty()
+        state = {"thinking": "", "content": "", "think_started": None, "think_ended": None}
+
+        def show(content: str, thinking: str) -> None:
+            inline_thinking, answer = split_inline_thinking(content)
+            thinking = (thinking + inline_thinking).strip()
+            if thinking and state["think_started"] is None:
+                state["think_started"] = time.monotonic()
+            if answer.strip() and state["think_started"] and state["think_ended"] is None:
+                state["think_ended"] = time.monotonic()
+            if thinking:
+                with think_slot.container():
+                    label = ":shimmer[Thinking…]" if not answer.strip() else "Thinking"
+                    with st.expander(label, type="compact"):
+                        st.markdown(thinking)
+            if answer.strip():
+                answer_slot.markdown(answer + " ▌")
+            state.update(thinking=thinking, content=answer)
+
+        options, think = chat_ollama_settings(chat, messages)
+        try:
+            reply, usage = chat_with_ollama(
+                messages, chat["model"], max_tokens=int(chat.get("max_tokens", CHAT_DEFAULTS["max_tokens"])),
+                temperature=float(chat.get("temperature", CHAT_DEFAULTS["temperature"])), on_text=show,
+                extra_options=options, think=think,
+            )
+        except RuntimeError as exc:
+            answer_slot.error(str(exc))
+            return
+    record_llm_speed(chat["model"], usage)
+    seconds = (state["think_ended"] or time.monotonic()) - state["think_started"] if state["think_started"] else None
+    chat["messages"].append({
+        "role": "assistant", "content": reply, "thinking": state["thinking"], "thought_seconds": seconds,
+        "model": chat["model"], "tokens_per_second": usage.get("tokens_per_second"), "at": now_iso(),
+        "input_tokens": usage.get("input"), "output_tokens": usage.get("output"),
+        "total_seconds": usage.get("processing_time"), "load_seconds": usage.get("load_seconds"),
+        "prompt_seconds": usage.get("prompt_seconds"), "prompt_tokens_per_second": usage.get("prompt_tokens_per_second"),
+        "num_ctx": usage.get("num_ctx"),
+    })
+    keep_chat(chat)
+    st.rerun()
+
+
+def render_chat_sidebar(chat: dict) -> None:
+    st.sidebar.button("Back to search", icon=":material/arrow_back:", on_click=leave_chat_page, width="stretch")
+    st.sidebar.button("New chat", icon=":material/add:", type="primary", on_click=start_new_chat, width="stretch",
+                      disabled=not chat["messages"])
+    chats = list_chats()
+    st.sidebar.caption("Chats" if chats else "Saved chats appear here after their first message.")
+    for saved in chats:
+        when = datetime.datetime.fromisoformat(saved["updated"]).strftime("%d %b %H:%M")
+        st.sidebar.button(
+            truncate_text(saved.get("title") or "Untitled", 42),
+            key=f"chat_open_{saved['id']}",
+            type="secondary" if saved["id"] == chat["id"] else "tertiary",
+            on_click=open_saved_chat,
+            args=(saved["id"],),
+            width="stretch",
+            help=f"{plural(len(saved.get('messages', [])), 'message')} · `{saved.get('model', '?')}` · {when}",
+        )
+
+
+def render_chat_settings(chat: dict) -> None:
+    """Model, About me, a prompt and attached notes for this chat, on one wrapping row, plus the model's tuning."""
+    ok, installed = discover_ollama_models()
+    models = list(installed if ok and installed else SUGGESTED_OLLAMA_MODELS)
+    if chat["model"] not in models:
+        models.insert(0, chat["model"])
+    library = load_prompt_library()
+    prompts = {p["id"]: agent_prompt_label(p) for p in library["prompts"]}
+    key = chat["id"]
+    fields = {"model": chat["model"], "about_me": chat.get("about_me", False), "prompt_id": chat.get("prompt_id", ""),
+              **{field: chat.get(field, default) for field, default in CHAT_DEFAULTS.items()
+                 if field not in CHAT_SAMPLING_OPTIONS}}  # these start from value= (they can be empty)
+    for field, value in fields.items():
+        st.session_state.setdefault(f"chat_{field}_{key}", value)
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        st.selectbox("Model", models, key=f"chat_model_{key}", on_change=change_chat_setting,
+                     args=("model", f"chat_model_{key}"), label_visibility="collapsed", width=220,
+                     help="Any model installed in Ollama. Change it mid-chat to have another model carry on.")
+        profile = str(library["profile"].get("text", "")).strip()
+        st.toggle("About me", key=f"chat_about_me_{key}", on_change=change_chat_setting,
+                  args=("about_me", f"chat_about_me_{key}"), disabled=not profile,
+                  help=profile or "Write About me in the Prompt library first.")
+        st.selectbox("Prompt", ["", *prompts], format_func=lambda pid: prompts.get(pid, "No prompt"),
+                     key=f"chat_prompt_id_{key}", on_change=change_chat_setting,
+                     args=("prompt_id", f"chat_prompt_id_{key}"), label_visibility="collapsed", width=240,
+                     help="A prompt from your library, sent as standing instructions with every message.")
+        count, _text, _names = in_scope_notes_context()
+        if chat.get("notes"):
+            st.button(f"Notes attached ({chat['notes']['count']})", icon=":material/attach_file:",
+                      key=f"chat_detach_{key}", on_click=detach_notes,
+                      help="Sent with every message:  \n" + "  \n".join(chat["notes"].get("names", [])[:30])
+                      + "  \n\nClick to remove them from this chat.")
+        else:
+            st.button(f"Attach notes in scope ({count})", icon=":material/attach_file:", key=f"chat_attach_{key}",
+                      on_click=attach_in_scope_notes, disabled=not count,
+                      help="Attach a copy of the notes kept in scope on the search page (up to "
+                      f"{CHAT_NOTES_MAX_CHARS:,} characters, shared between them). Gather them there first."
+                      if count else "Gather notes on the search page first (a search, Find notes or Filter search).")
+        with st.popover("Model options", icon=":material/tune:"):
+            render_chat_model_options(chat)
+    st.caption(describe_llm_speed(chat["model"]))
+    render_context_meter(chat)
+
+
+def setting_widget(widget, label: str, chat: dict, field: str, **kwargs):
+    """A chat setting's widget, saved with the chat when changed."""
+    key = f"chat_{field}_{chat['id']}"
+    return widget(label, key=key, on_change=change_chat_setting, args=(field, key), **kwargs)
+
+
+def reset_chat_model_options(chat_id: str) -> None:
+    chat = current_chat()
+    for field in ("num_ctx", "think", *CHAT_SAMPLING_OPTIONS):
+        chat[field] = CHAT_DEFAULTS[field]
+        st.session_state[f"chat_{field}_{chat_id}"] = CHAT_DEFAULTS[field]
+    keep_chat(chat)
+
+
+def render_chat_model_options(chat: dict) -> None:
+    """Max tokens, temperature, context window, thinking and sampling options, for this chat."""
+    info = ollama_model_info(chat["model"])
+    limit = info["context_length"]
+    setting_widget(st.number_input, "Max tokens", chat, "max_tokens", min_value=256, max_value=LLM_MAX_TOKENS_LIMIT,
+                   step=256, help="The longest reply, thinking included. Reasoning models need room to think.")
+    setting_widget(st.slider, "Temperature", chat, "temperature", min_value=0.0, max_value=1.5, step=0.1,
+                   help="Lower is more focused, higher more varied.")
+    sizes = [0, *(size for size in CHAT_CONTEXT_SIZES if not limit or size <= limit)]
+    if chat.get("num_ctx") and chat["num_ctx"] not in sizes:
+        sizes.append(chat["num_ctx"])
+    setting_widget(
+        st.selectbox, "Context window", chat, "num_ctx", options=sizes,
+        format_func=lambda size: f"Auto (fits the chat, up to {limit:,})" if size == 0 and limit else
+        "Auto (fits the chat)" if size == 0 else f"{size:,} tokens",
+        help="How much of the chat (and attached notes) the model can see at once, in tokens (about ¾ of a word "
+        "each). **Auto** sizes it to the chat, so it grows as the chat does, but each step up reloads the model, "
+        "making that reply slower to start. A **fixed** size avoids the reloads; a smaller one uses less memory. If "
+        "the chat outgrows the window, the model no longer sees the oldest messages."
+        + (f"\n\n`{chat['model']}` can take up to {limit:,} tokens." if limit else ""),
+    )
+    setting_widget(st.segmented_control, "Thinking", chat, "think", options=list(CHAT_THINK_CHOICES),
+                   format_func=CHAT_THINK_CHOICES.get, disabled=not info["thinking"],
+                   help="Whether a reasoning model thinks before answering. **Off** is much faster; **On** is better "
+                   "for hard questions." if info["thinking"] else f"`{chat['model']}` doesn't think before answering.")
+    st.caption("Sampling: empty means the model's own default, which usually suits it best.")
+    setting_widget(st.number_input, "Top P", chat, "top_p", value=chat.get("top_p"), min_value=0.0, max_value=1.0, step=0.05,
+                   placeholder="Model default", help="Only consider the most likely words that together make up this "
+                   "share of the probability (e.g. 0.9). Lower is more focused.")
+    setting_widget(st.number_input, "Top K", chat, "top_k", value=chat.get("top_k"), min_value=1, max_value=200, step=1,
+                   placeholder="Model default", help="Only consider this many of the most likely words (e.g. 40).")
+    setting_widget(st.number_input, "Repeat penalty", chat, "repeat_penalty", value=chat.get("repeat_penalty"), min_value=0.5,
+                   max_value=2.0, step=0.05, placeholder="Model default",
+                   help="Above 1 discourages repeating itself (e.g. 1.1).")
+    setting_widget(st.number_input, "Seed", chat, "seed", value=chat.get("seed"), min_value=0, step=1, placeholder="Random",
+                   help="The same seed, prompt and settings give the same reply: useful to compare models or options.")
+    st.button("Reset to defaults", icon=":material/restart_alt:", key=f"chat_reset_options_{chat['id']}",
+              on_click=reset_chat_model_options, args=(chat["id"],),
+              help="Context window Auto, thinking as the model does by default, and sampling left to the model.")
+
+
+def render_context_meter(chat: dict) -> None:
+    """How full the context window was at the last reply, with a warning before old messages drop out of view."""
+    last = next((m for m in reversed(chat["messages"]) if m["role"] == "assistant" and m.get("num_ctx")), None)
+    if not last or last.get("input_tokens") is None:
+        return
+    used = last["input_tokens"] + (last.get("output_tokens") or 0)
+    share = used / last["num_ctx"]
+    st.progress(min(share, 1.0), text=f"Context: {used:,} of {last['num_ctx']:,} tokens ({share:.0%})")
+    if share >= CONTEXT_WARN_SHARE:
+        st.warning("The context window is nearly full: as the chat grows, the model stops seeing its oldest "
+                   "messages. Choose a bigger **Context window** in **Model options**, or start a **New chat**.")
+
+
+def render_chat_title(chat: dict) -> None:
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        st.subheader(chat["title"], width="content")
+        if chat["messages"]:
+            with st.popover("Rename", icon=":material/edit:", type="tertiary"):
+                st.text_input("Title", value=chat["title"], key=f"chat_title_{chat['id']}", on_change=rename_chat,
+                              args=(f"chat_title_{chat['id']}",), max_chars=CHAT_TITLE_CHARS * 2)
+            with st.popover("Delete", icon=":material/delete:", type="tertiary"):
+                st.markdown("Delete this chat for good?")
+                st.button("Delete chat", type="primary", key=f"chat_delete_{chat['id']}", on_click=delete_open_chat)
+
+
+def render_chat_page() -> None:
+    """Chat with LLM: a classic chat with an installed Ollama model, with saved chats in the sidebar."""
+    chat = current_chat()
+    render_chat_sidebar(chat)
+    render_page_title("Chat with LLM")
+    render_chat_title(chat)
+    render_chat_settings(chat)
+    for message in chat["messages"]:
+        with st.chat_message(message["role"]):
+            if message["role"] == "assistant":
+                render_chat_reply(message)
+            else:
+                st.markdown(message["content"])
+    prompt = st.chat_input(f"Message {chat['model']}…", key="chat_input", submit_mode="disable")
+    if prompt and prompt.strip():
+        chat["messages"].append({"role": "user", "content": prompt.strip(), "at": now_iso()})
+        if not chat.get("titled"):
+            chat["title"] = truncate_text(" ".join(prompt.split()), CHAT_TITLE_CHARS)
+            chat["titled"] = True
+        keep_chat(chat)  # saved before the reply, so a cancelled or failed reply keeps the question
+        with st.chat_message("user"):
+            st.markdown(prompt.strip())
+        generate_chat_reply(chat)
+    elif chat["messages"] and chat["messages"][-1]["role"] == "user":
+        # The last reply was cancelled or failed: offer to ask again.
+        if st.button("Get a reply", icon=":material/refresh:", key="chat_retry"):
+            generate_chat_reply(chat)
+
+
 # ---------------------------------------------------------------------------
 # PAGE SETUP
 # ---------------------------------------------------------------------------
@@ -10184,6 +10634,7 @@ PAGE_TITLES = {
     "actions": "RAG - Actions",
     "configure": "RAG - Configure",
     "reference": "RAG - Reference document",
+    CHAT_PAGE: "RAG - Chat with LLM",
 }
 st.set_page_config(page_title=PAGE_TITLES.get(st.query_params.get("page"), "RAG Workspace Manager"),
                    layout="wide")
@@ -10191,6 +10642,9 @@ st.set_page_config(page_title=PAGE_TITLES.get(st.query_params.get("page"), "RAG 
 get_text_rescan_scheduler()
 if st.session_state.pop(LLM_CANCELLED_KEY, False):
     st.toast("Stopped the LLM. Change what you need and run it again.", icon=":material/stop_circle:")
+if st.query_params.get("page") == CHAT_PAGE:
+    render_chat_page()
+    st.stop()
 if st.query_params.get("page") == "prompts":
     render_prompt_library_page()
     st.stop()
@@ -10212,57 +10666,75 @@ if should_show_setup_wizard():
     st.stop()
 
 # ---------------------------------------------------------------------------
-# SIDEBAR — CORPUS ROOT
+# SIDEBAR — CHAT, AND CONFIGURE (NOTES LOCATION)
 # ---------------------------------------------------------------------------
 
-st.sidebar.header("Notes location")
-if st.sidebar.button("Browse…", key="browse_corpus_root", use_container_width=True):
-    current = load_corpus_root_path()
-    picked = browse_for_directory(str(current) if current else None)
-    if picked:
-        picked = picked.strip()
-        save_app_settings({"corpus_root_path": picked})
-        st.session_state["corpus_root_path_input"] = picked
-        st.rerun()
+st.sidebar.button(
+    "Chat with LLM",
+    icon=":material/chat:",
+    width="stretch",
+    on_click=open_chat_page,
+    help="A classic chat with any model installed in Ollama, with your chats saved. Opens in this tab; "
+    "**Back to search** returns here.",
+)
 
+# Configure: the notes location (rarely changed, so folded) and a link to the Configure page. It opens by itself
+# when the notes folder isn't set or can't be found.
 sync_corpus_root_widget_from_settings()
 _saved_corpus_root = load_corpus_root_path()
-st.sidebar.text_input(
-    "Corpus root folder",
-    value=str(_saved_corpus_root) if _saved_corpus_root else "",
-    key="corpus_root_path_input",
-    on_change=persist_corpus_root_path,
-    help="Notes export folder. Multi-Corpus: one subfolder per library. Single-Corpus: index the whole tree.",
-    placeholder="Select or enter your notes export folder…",
-)
-
-corpus_root_path = get_corpus_root_path()
-if not corpus_root_path:
-    st.sidebar.info("Set the corpus root folder above to load your libraries.")
+_root_ok = bool(get_corpus_root_path() and get_corpus_root_path().exists())
+with st.sidebar.expander("Configure", icon=":material/settings:", expanded=not _root_ok):
+    st.markdown("**Notes location**")
+    if st.button("Browse…", key="browse_corpus_root", width="stretch"):
+        current = load_corpus_root_path()
+        picked = browse_for_directory(str(current) if current else None)
+        if picked:
+            picked = picked.strip()
+            save_app_settings({"corpus_root_path": picked})
+            st.session_state["corpus_root_path_input"] = picked
+            st.rerun()
+    st.text_input(
+        "Corpus root folder",
+        value=str(_saved_corpus_root) if _saved_corpus_root else "",
+        key="corpus_root_path_input",
+        on_change=persist_corpus_root_path,
+        help="Notes export folder. Multi-Corpus: one subfolder per library. Single-Corpus: index the whole tree.",
+        placeholder="Select or enter your notes export folder…",
+    )
+    corpus_root_path = get_corpus_root_path()
+    if not corpus_root_path:
+        st.info("Set the corpus root folder above to load your libraries.")
+    elif not corpus_root_path.exists():
+        st.warning(f"Folder not found:\n`{corpus_root_path}`")
+    else:
+        st.caption(f"Saved in `{APP_SETTINGS_PATH.name}`")
+        sync_corpus_mode_from_settings()
+        st.radio(
+            "Corpus mode",
+            options=[CORPUS_MODE_MULTI, CORPUS_MODE_SINGLE],
+            format_func=lambda mode: "Multi-Corpus" if mode == CORPUS_MODE_MULTI else "Single-Corpus",
+            key="corpus_mode_toggle",
+            horizontal=True,
+            on_change=persist_corpus_mode,
+            help=(
+                "**Multi-Corpus** — each immediate subfolder is a separate searchable library. "
+                "**Single-Corpus** — one library for all notes under the root (flat or mixed layouts)."
+            ),
+        )
+        if is_single_corpus_mode():
+            st.caption("Single-Corpus indexes every supported file under the root, including subfolders.")
+        else:
+            st.caption("Multi-Corpus treats each top-level subfolder as its own library.")
+    st.link_button(
+        "Configure page",
+        CONFIGURE_PAGE_URL,
+        icon=":material/open_in_new:",
+        width="stretch",
+        help="Task executor settings (the connector and other links), the outbox, the task title marker and "
+        "settings export. Opens in a new tab.",
+    )
+if not corpus_root_path or not corpus_root_path.exists():
     st.stop()
-if not corpus_root_path.exists():
-    st.sidebar.warning(f"Folder not found:\n`{corpus_root_path}`")
-    st.stop()
-
-st.sidebar.caption(f"Saved in `{APP_SETTINGS_PATH.name}`")
-
-sync_corpus_mode_from_settings()
-st.sidebar.radio(
-    "Corpus mode",
-    options=[CORPUS_MODE_MULTI, CORPUS_MODE_SINGLE],
-    format_func=lambda mode: "Multi-Corpus" if mode == CORPUS_MODE_MULTI else "Single-Corpus",
-    key="corpus_mode_toggle",
-    horizontal=True,
-    on_change=persist_corpus_mode,
-    help=(
-        "**Multi-Corpus** — each immediate subfolder is a separate searchable library. "
-        "**Single-Corpus** — one library for all notes under the root (flat or mixed layouts)."
-    ),
-)
-if is_single_corpus_mode():
-    st.sidebar.caption("Single-Corpus indexes every supported file under the root, including subfolders.")
-else:
-    st.sidebar.caption("Multi-Corpus treats each top-level subfolder as its own library.")
 
 st.sidebar.divider()
 
