@@ -112,7 +112,8 @@ SUGGESTED_OLLAMA_MODELS = [
     "phi3:mini",
     "gemma2:2b",
 ]
-LLM_CONTEXT_MAX_CHARS = 12000
+LLM_CONTEXT_MAX_CHARS = 12000  # default notes budget for Ask (characters of notes sent to the LLM)
+NOTES_BUDGET_STEPS = (6000, 12000, 24000, 48000, 96000, 160000)  # Notes budget choices (saved per corpus)
 # Follow-up conversations resend the notes plus history, so give Ollama a larger window.
 FOLLOW_UP_NUM_CTX = 8192
 # Ollama's context window must hold the prompt and the whole answer. These sizes are used in steps, so
@@ -159,6 +160,11 @@ DEFAULT_APP_SETTINGS = {
     "last_selected_library": None,
     "auto_rescan_enabled": False,
     "auto_rescan_all_corpora": False,
+    "read_aloud": True,  # read the answer to a dictated question aloud
+    "dictate_hotkey_enabled": True,  # a key that starts dictating on the Chat and search pages
+    "dictate_hotkey": "`",
+    "dictate_hotkey_2": "",  # an optional second key, e.g. for another keyboard layout
+    "open_on_chat": False,  # open the app on Chat with LLM instead of the search page
 }
 
 CORPUS_MODE_MULTI = "multi"
@@ -178,6 +184,7 @@ DEFAULT_CORPUS_CONFIG = {
     "ollama_model": DEFAULT_OLLAMA_MODEL,
     "llm_max_tokens": 512,
     "llm_temperature": 0.3,
+    "llm_notes_chars": LLM_CONTEXT_MAX_CHARS,
     "hidden": False,
     "corpus_prompt": "",
     "corpus_prompt_enabled": False,
@@ -737,7 +744,7 @@ def saved_search_route() -> str:
     return "literal" if load_app_settings().get("exact_text_only", False) else "semantic"
 
 
-MAX_RESULTS_LIMITS = {"semantic": 50, "literal": 1000}  # passages (Semantic) or notes listed (Literal)
+MAX_RESULTS_LIMITS = {"semantic": 200, "literal": 200}  # passages (Semantic) or notes listed (Literal): the slider
 ASK_NOTES_LIMIT = 50  # notes Ask (filtered only) answers from, whatever Max results says: the LLM reads few anyway
 
 
@@ -746,8 +753,22 @@ def max_results_key(literal: bool) -> str:
     return "max_results_literal" if literal else "max_results"
 
 
+DEFAULT_MAX_RESULTS = 30
+
+
+def saved_max_results(key: str) -> int:
+    limit = MAX_RESULTS_LIMITS["literal" if key == max_results_key(True) else "semantic"]
+    return min(max(int(load_app_settings().get(key) or DEFAULT_MAX_RESULTS), 1), limit)
+
+
 def persist_max_results(key: str = "max_results") -> None:
-    save_app_settings({key: int(st.session_state.get(key, 15))})
+    """Save Max results. Left empty (cleared to type a new number, then a click elsewhere or a search), it keeps
+    the number it had: Streamlit would otherwise drop it to the minimum, 1, and that would be saved."""
+    value = st.session_state.get(key)
+    if value is None:
+        st.session_state[key] = saved_max_results(key)
+        return
+    save_app_settings({key: int(value)})
 
 
 def persist_search_route() -> None:
@@ -846,8 +867,13 @@ def get_search_filter_from_widgets() -> dict:
     }
 
 
-def persist_search_filter() -> None:
-    """Save the filter; once every field is empty there is no filtered set, so exclusions are reset."""
+def persist_search_filter(field: str | None = None) -> None:
+    """Save the filter; once every field is empty there is no filtered set, so exclusions are reset. A term added
+    in `field` keeps its folded box (and Narrow by terms) open: its title changes, which would fold it again."""
+    if field:
+        st.session_state["narrow_by_terms"] = True
+        if field != "all":
+            st.session_state[f"filter_fold_{field}"] = True
     current = get_search_filter_from_widgets()
     if not is_filter_active(current):
         clear_excluded_notes()
@@ -1087,15 +1113,69 @@ def clear_search_filter() -> None:
     """Clear Filter button: empty every filter field and drop note exclusions and gathered notes."""
     for field in SEARCH_FILTER_FIELDS:
         st.session_state[f"filter_{field}"] = []
+        if field != "all":
+            st.session_state[f"filter_fold_{field}"] = False  # cleared, so they fold away again
     save_app_settings({"search_filter": {field: [] for field in SEARCH_FILTER_FIELDS}})
     clear_excluded_notes()
     clear_gathered_notes()
 
 
+WHOLE_CORPUS_OPTION = "__single_corpus__"  # Select Library's first option: search the whole corpus at once
+
+
+def library_indexed_at(safe_lib: str) -> datetime.datetime | None:
+    """When a library's index last changed: its last rescan, or when its copies of the notes were last updated."""
+    times = []
+    rescanned = (load_text_rescan_status().get("libraries") or {}).get(safe_lib, {}).get("at")
+    if rescanned:
+        try:
+            times.append(datetime.datetime.fromisoformat(rescanned))
+        except ValueError:
+            pass
+    uploads = APP_DATA_DIR / "accounts" / "llmware" / safe_lib / "uploads"
+    if uploads.is_dir() and any(uploads.iterdir()):
+        times.append(datetime.datetime.fromtimestamp(uploads.stat().st_mtime))
+    return max((t.replace(tzinfo=None) for t in times), default=None)
+
+
+def short_indexed_at(safe_lib: str) -> str:
+    """When a library was last indexed, short: 'indexed 26-11-08:08:33', or 'not indexed yet'."""
+    when = library_indexed_at(safe_lib)
+    return f"indexed {when.strftime('%y-%m-%d:%H:%M')}" if when else "not indexed yet"
+
+
+def use_single_corpus() -> None:
+    """Search the whole corpus as one library (Corpus mode Single), e.g. to gather a shortlist from every note."""
+    st.session_state["corpus_mode_toggle"] = CORPUS_MODE_SINGLE
+    save_app_settings({"corpus_mode": CORPUS_MODE_SINGLE})
+
+
+def show_all_matches(total: int) -> None:
+    """Show all N: raise the Literal route's Max results to the number of matching notes and list them again."""
+    key = max_results_key(True)
+    st.session_state[key] = min(max(int(total), 1), MAX_RESULTS_LIMITS["literal"])
+    persist_max_results(key)
+    st.session_state["rerun_filter_search"] = True
+
+
+def pick_library(widget_key: str = "library_picker") -> None:
+    """Select Library (the sidebar's, or its copy in the Semantic search box): Single Corpus switches to searching
+    the whole corpus; a library switches back to it."""
+    choice = st.session_state.get(widget_key)
+    if choice == WHOLE_CORPUS_OPTION:
+        st.session_state["corpus_mode_toggle"] = CORPUS_MODE_SINGLE
+        save_app_settings({"corpus_mode": CORPUS_MODE_SINGLE})
+    elif choice:
+        st.session_state["corpus_mode_toggle"] = CORPUS_MODE_MULTI
+        st.session_state["selected_library"] = choice
+        save_app_settings({"corpus_mode": CORPUS_MODE_MULTI, "last_selected_library": choice})
+
+
 def switch_to_library(library: str) -> None:
     """Button callback: make `library` the selected library (runs before widgets are created)."""
     st.session_state["selected_library"] = library
-    save_app_settings({"last_selected_library": library})
+    st.session_state["corpus_mode_toggle"] = CORPUS_MODE_MULTI  # a library is searched on its own
+    save_app_settings({"last_selected_library": library, "corpus_mode": CORPUS_MODE_MULTI})
 
 # ---------------------------------------------------------------------------
 # HELPERS
@@ -1578,6 +1658,21 @@ DEFAULT_TASK_PROMPTS = (
 )
 
 
+# Added to the request when a dictated question's answer will be read aloud. A Prompt library entry, so its
+# wording can be changed there; deleting it stops the instruction being added.
+READ_ALOUD_PROMPT_ID = "read_aloud"
+READ_ALOUD_PROMPT = {
+    "name": "Read aloud (dictation)",
+    "text": "Prepare the answer in a way that Siri can read it as a dictation.",
+    "tags": ["read aloud"],
+}
+
+
+def read_aloud_prompt_record() -> dict:
+    return {**new_prompt_record(READ_ALOUD_PROMPT["name"], READ_ALOUD_PROMPT["text"], tags=READ_ALOUD_PROMPT["tags"]),
+            "id": READ_ALOUD_PROMPT_ID}
+
+
 def new_prompt_record(
     name: str,
     text: str,
@@ -1638,11 +1733,17 @@ def load_prompt_library() -> dict:
             prompt.setdefault("links", [])
             prompt.setdefault("references", [])  # reference documents sent whenever this prompt is used
             prompt.setdefault("salesforce", False)
+        if not library.get("read_aloud_seeded"):  # added once, so deleting it sticks
+            if not find_prompt(library, READ_ALOUD_PROMPT_ID):
+                library["prompts"].append(read_aloud_prompt_record())
+            library["read_aloud_seeded"] = True
+            save_prompt_library(library)
         return library
     return save_prompt_library(
         {
             "profile": {"text": "", "enabled": True},
-            "prompts": [
+            "read_aloud_seeded": True,
+            "prompts": [read_aloud_prompt_record()] + [
                 new_prompt_record(
                     p["name"],
                     p["text"],
@@ -5136,6 +5237,41 @@ def persist_prompt_section(section: str) -> None:
     save_app_settings({PROMPT_SECTIONS_SETTING: opened})
 
 
+def save_rag_prompt(setting: str, widget_key: str, default: str) -> None:
+    text = str(st.session_state.get(widget_key) or "").strip()
+    save_app_settings({setting: "" if text == default.strip() else text})  # the default is kept as empty
+
+
+def reset_rag_prompt(setting: str, widget_key: str, default: str) -> None:
+    save_app_settings({setting: ""})
+    st.session_state[widget_key] = default
+
+
+def render_rag_prompts_section() -> None:
+    """The prompts that send Chat messages about your notes to search: yours to change, or back to the default."""
+    rows = [
+        ("RAG check", RAG_CHECK_PROMPT_SETTING, NOTES_CHECK_PROMPT, "rag_check_prompt_text",
+         "Decides whether a Chat message needs your notes (when it has no phrase like *search my notes*)."),
+        ("RAG search", RAG_SEARCH_PROMPT_SETTING, DEFAULT_RAG_SEARCH_PROMPT, "rag_search_prompt_text",
+         "Splits the message into what to **find** (route, terms, topic, dates) and the **intent** the LLM then "
+         "does with the notes found. The dates you can use, today's date and your library names are added to it."),
+    ]
+    custom = sum(1 for _l, setting, *_ in rows if load_app_settings().get(setting))
+    with st.expander("RAG search from Chat" + (f" · {custom} customised" if custom else ""),
+                     icon=":material/travel_explore:", key="rag_prompts_open"):
+        st.caption(f"Used by the **RAG selector model** ({load_app_settings().get(RAG_SELECTOR_SETTING) or 'the chat\'s model'}) "
+                   "when a Chat message moves to the search page.")
+        for label, setting, default, key, about in rows:
+            if key not in st.session_state:
+                st.session_state[key] = rag_prompt(setting, default)
+            customised = bool(load_app_settings().get(setting))
+            st.markdown(f"**{label}**" + (" · customised" if customised else " · default"), help=about)
+            st.text_area(label, key=key, height=260 if setting == RAG_SEARCH_PROMPT_SETTING else 120,
+                         label_visibility="collapsed", on_change=save_rag_prompt, args=(setting, key, default))
+            st.button("Reset to default", key=f"{key}_reset", icon=":material/restart_alt:", disabled=not customised,
+                      on_click=reset_rag_prompt, args=(setting, key, default))
+
+
 def prompt_section(section: str, title: str, icon: str):
     """The Task prompts or Agent prompts section: collapsible, open until closed, remembered."""
     key = PROMPT_SECTION_KEYS[section]
@@ -5531,6 +5667,7 @@ def render_configure_page() -> None:
         if marker["text"]:
             st.caption(f"Example: **{marked_title('Follow up with Acme on the pilot', marker)}**")
 
+    render_voice_settings_section()
     render_settings_transfer_section()
     install_save_flash()
 
@@ -5646,6 +5783,7 @@ def render_prompt_library_page() -> None:
 
     render_reference_documents_section(library)
 
+    render_rag_prompts_section()
     with prompt_section("task", "Task prompts", ":material/checklist:"):
         st.caption(
             "Pick a task in the Ask panel to tell the LLM what to write from the notes. Tick **Global** to "
@@ -6031,14 +6169,15 @@ def render_ask_prompt_panel(library: dict, corpus_config: dict, safe_lib: str = 
         render_ask_reference_row(library, active)
 
 
-def render_prompt_library_sidebar(corpus_config: dict) -> None:
+def render_prompt_library_sidebar(corpus_config: dict, parent=None) -> None:
     """Sidebar button that opens the Prompt library page; hover it for a summary of what is sent to the LLM."""
+    parent = parent or st.sidebar
     library = load_prompt_library()
     profile = library["profile"]
     global_count = sum(1 for p in library["prompts"] if p.get("global"))
     task_count = len(library["prompts"]) - global_count
     agent_count = sum(1 for p in library["prompts"] if is_agent_prompt(p))
-    st.sidebar.link_button(
+    parent.link_button(
         "Prompt library",
         PROMPT_LIBRARY_PAGE_URL,
         icon=":material/library_books:",
@@ -6049,14 +6188,6 @@ def render_prompt_library_sidebar(corpus_config: dict) -> None:
             f"Global prompts: **{global_count}** · Task prompts: **{task_count}** (Agents: **{agent_count}**)  \n"
             "Opens in a new tab."
         ),
-    )
-    st.sidebar.link_button(
-        "Configure",
-        CONFIGURE_PAGE_URL,
-        icon=":material/settings:",
-        width="stretch",
-        help="Task executor settings (the connector and other links), the outbox and the task title marker. "
-        "Opens in a new tab.",
     )
 
 
@@ -6184,9 +6315,7 @@ def render_sidebar_job_summary(selected_lib: str, safe_lib: str) -> None:
     operation = status.get("operation", "Scan")
     completed_at = status.get("completed_at", "unknown")
 
-    st.markdown("**Corpus index**")
     st.progress(min(max(progress_pct, 0.0), 1.0), text=progress_text)
-    st.success(progress_text)
     st.caption(f"{operation} · {completed_at}")
 
     detail_parts = [
@@ -6451,6 +6580,7 @@ def build_discussion_messages(search_state: dict, max_tokens: int, temperature: 
             temperature,
             with_salesforce_context(search_state, corpus_prompt, discussion_results(search_state)),
             search_state.get("task_prompt", ""),
+            search_state.get("notes_chars"),
         ),
     }]
     if search_state.get("answer"):
@@ -6470,11 +6600,13 @@ def follow_up_with_ollama(
     temperature: float,
     corpus_prompt: str = "",
     sent_text: str | None = None,
+    on_progress=None,
 ) -> dict:
     """Answer a follow-up using the notes in use plus the conversation so far.
 
     `sent_text` is sent instead of `question` when they differ (e.g. a step's full prompt); it is kept
-    as the turn's `prompt` so later requests repeat what the model actually saw.
+    as the turn's `prompt` so later requests repeat what the model actually saw. `on_progress` gets the
+    tokens-per-second updates while it writes (see llm_progress).
     """
     messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
     user_turn = {"role": "user", "content": question}
@@ -6482,14 +6614,18 @@ def follow_up_with_ollama(
         user_turn["prompt"] = sent_text
     messages.append({"role": "user", "content": user_turn.get("prompt", question)})
 
-    reply, _usage = chat_with_ollama(
+    reply, usage = chat_with_ollama(
         messages,
         model_name,
         max_tokens=max_tokens,
         temperature=temperature,
         num_ctx=FOLLOW_UP_NUM_CTX,
+        on_progress=on_progress,
     )
-    return {"user": user_turn, "assistant": {"role": "assistant", "content": reply}}
+    assistant = {"role": "assistant", "content": reply}
+    if (usage or {}).get("tokens_per_second"):
+        assistant["tokens_per_second"] = round(usage["tokens_per_second"], 1)
+    return {"user": user_turn, "assistant": assistant}
 
 
 def add_discussion_turn(
@@ -6502,14 +6638,14 @@ def add_discussion_turn(
     sent_text: str | None = None,
 ) -> bool:
     """Ask the follow-up and add both turns to the discussion; False (with an error shown) if it failed."""
-    with st.spinner(f"Asking `{model_name}`…"):
-        try:
+    try:
+        with llm_progress(st.empty(), f"Asking `{model_name}`…") as report:
             turns = follow_up_with_ollama(
-                search_state, question, model_name, max_tokens, temperature, corpus_prompt, sent_text
+                search_state, question, model_name, max_tokens, temperature, corpus_prompt, sent_text, report
             )
-        except Exception as exc:
-            st.error(f"Follow-up failed: {exc}")
-            return False
+    except Exception as exc:
+        st.error(f"Follow-up failed: {exc}")
+        return False
     turns["assistant"]["model"] = model_name
     search_state["discussion"].extend([turns["user"], turns["assistant"]])
     return True
@@ -6522,6 +6658,8 @@ def persist_llm_tuning(safe_lib: str) -> None:
         updates["llm_max_tokens"] = int(st.session_state[f"llm_max_tokens_{safe_lib}"])
     if f"llm_temperature_{safe_lib}" in st.session_state:
         updates["llm_temperature"] = float(st.session_state[f"llm_temperature_{safe_lib}"])
+    if f"llm_notes_chars_{safe_lib}" in st.session_state:
+        updates["llm_notes_chars"] = int(st.session_state[f"llm_notes_chars_{safe_lib}"])
     if updates:
         save_corpus_config(safe_lib, updates)
 
@@ -6565,6 +6703,10 @@ def render_big_screen_reply(search_state: dict, index: int, turn: dict) -> None:
     st.markdown(link_opportunity_names(turn["content"]))
     render_copy_buttons([("Copy reply", link_opportunity_names(turn["content"])),
                          ("Copy all output", full_llm_output(search_state))])
+    model = turn.get("model") or search_state.get("model")
+    render_voice_tools("big_screen", index, turn["content"], narrated=bool(turn.get("narrated")),
+                       key=f"big_screen_voice_{index}", rerun=False, model=model, rewrite=True)
+    render_rewritten_narration("big_screen", turn, turn["content"], model, key=f"big_screen_voice_{index}")
     st.button(
         "↩ Back to the answer",
         key="big_screen_back",
@@ -6975,7 +7117,8 @@ def render_discussion_body(
             with st.chat_message(turn["role"]):
                 st.markdown(link_opportunity_names(turn["content"]))
                 if turn.get("model"):
-                    st.caption(f"`{turn['model']}`")
+                    st.caption(f"`{turn['model']}`" + (f" · {turn['tokens_per_second']:.1f} tokens/s"
+                                                        if turn.get("tokens_per_second") else ""))
                 # Every turn can be copied. When the model was sent more than is shown (a step's prompt, or
                 # Needs work with the rejected list), that full prompt can be copied too, to reuse in flows.
                 buttons = [("Copy", link_opportunity_names(turn["content"]) if turn["role"] == "assistant"
@@ -7003,16 +7146,47 @@ def render_discussion_body(
                                 args=(search_state, index),
                                 help="Show this reply in the main output area.",
                             )
+                if turn["role"] == "assistant" and not in_dialog and search_state.get("agent"):
+                    # Agent replies lead to drafts, so nothing is re-asked; Narrate rewrites the reply itself.
+                    voice_target, voice_key = f"followup:{key_prefix}", f"{key_prefix}_voice_{index}"
+                    render_voice_tools(voice_target, index, turn["content"], narrated=False, key=voice_key,
+                                       rerun=False, model=turn.get("model") or model_name, rewrite=True)
+                    render_rewritten_narration(voice_target, turn, turn["content"], turn.get("model") or model_name,
+                                               key=voice_key)
+                elif turn["role"] == "assistant" and not in_dialog:
+                    voice_target, voice_key = f"followup:{key_prefix}", f"{key_prefix}_voice_{index}"
+                    asked = index >= 1 and discussion[index - 1]["role"] == "user"
+                    asked_text = discussion[index - 1].get("prompt", discussion[index - 1]["content"]) if asked else None
+                    render_voice_tools(voice_target, index, turn["content"], narrated=bool(turn.get("narrated")),
+                                       key=voice_key, rerun=asked, model=turn.get("model") or model_name,
+                                       question=asked_text)
+                    request = take_rerun_request(voice_target, index)
+                    if request:
+                        make_follow_up_variant(search_state, index, request["narrate"], model_name, max_tokens,
+                                               temperature, corpus_prompt, voice_target, request.get("model"),
+                                               request.get("question"))
+                    render_answer_variant(voice_target, index, turn.get("variant"), key=voice_key,
+                                          markdown=link_opportunity_names)
+                    render_alternatives(voice_target, index, turn.get("alternatives"), key=voice_key,
+                                        markdown=link_opportunity_names)
 
     render_follow_up_context(search_state, key_prefix)
     if not in_dialog:
         st.html(sticky_follow_up_style(f"{key_prefix}_follow_up_dock"))
     # The side panel's dock: the follow-up box, and the Agent box the caller adds to it, stay in view together.
     dock = st.container() if in_dialog else st.container(key=f"{key_prefix}_follow_up_dock")
+    text_key = f"{key_prefix}_follow_up_text"
+    if st.session_state.pop(f"{key_prefix}_follow_up_clear", False):  # a dictated follow-up went through
+        st.session_state[text_key] = ""
+    dictated = ""
     with dock, st.container(border=True, key=f"{key_prefix}_follow_up_box"):
         # The toggle sits outside the form: a widget inside a form only takes effect when the form is sent.
         with st.container(horizontal=True, vertical_alignment="center"):
             st.markdown("Ask a follow-up", width="stretch")
+            if not in_dialog:
+                dictated = dictation_recorder(f"{key_prefix}_dictate", f"followup:{key_prefix}")
+                if dictated:  # shown in the box below (kept there if you stop it), and sent straight away
+                    st.session_state[text_key] = dictated
             if model_select:
                 select_key, options, safe_lib = model_select
                 model_name = st.selectbox(
@@ -7044,6 +7218,8 @@ def render_discussion_body(
                 label_visibility="collapsed",
             )
             submitted = st.form_submit_button("Send", type="primary", use_container_width=True)
+    if dictated:
+        submitted, follow_up = True, dictated
 
     # Inside the pop-out, rerun only the dialog so it stays open.
     rerun_scope = "fragment" if in_dialog else "app"
@@ -7054,9 +7230,42 @@ def render_discussion_body(
         st.rerun(scope=rerun_scope)
 
     if submitted and follow_up.strip():
-        if add_discussion_turn(search_state, follow_up.strip(), model_name, max_tokens, temperature, corpus_prompt):
+        sent_prompt = with_read_aloud(corpus_prompt, f"followup:{key_prefix}") if dictated else corpus_prompt
+        if add_discussion_turn(search_state, follow_up.strip(), model_name, max_tokens, temperature, sent_prompt):
+            if dictated:
+                st.session_state[f"{key_prefix}_follow_up_clear"] = True
+                discussion[-1]["narrated"] = sent_prompt != corpus_prompt
+                queue_read_aloud(f"followup:{key_prefix}", discussion[-1]["content"])
             st.rerun(scope=rerun_scope)
     return dock
+
+
+def make_follow_up_variant(search_state: dict, index: int, narrate: bool, model_name: str, max_tokens: int,
+                           temperature: float, corpus_prompt: str, target: str, other_model: str | None = None,
+                           question: str | None = None) -> None:
+    """Re-run the follow-up reply at `index` from the discussion as it was then (later turns left out), narrated
+    or as text, or with `other_model` given exactly what the original model had, or with `question` asked in
+    place of the original (Edit question)."""
+    discussion = search_state["discussion"]
+    turn, asked = discussion[index], discussion[index - 1]
+    earlier = {**search_state, "discussion": discussion[:index - 1]}
+    model = other_model or turn.get("model") or model_name
+    alternative = bool(other_model) or question is not None
+    sent = (question, None) if question is not None else (asked["content"], asked.get("prompt"))
+    try:
+        with llm_progress(st.empty(), rerun_label(narrate, model, bool(other_model), question is not None)) as report:
+            turns = follow_up_with_ollama(earlier, sent[0], model, max_tokens, temperature,
+                                          with_narration(corpus_prompt, narrate), sent[1], report)
+    except Exception as exc:
+        st.error(f"Re-run failed: {exc}")
+        return
+    variant = finish_variant(target, turns["assistant"]["content"], narrate, model, turns["assistant"],
+                             bool(other_model), question)
+    if alternative:
+        turn["alternatives"] = keep_alternative(turn.get("alternatives"), variant)
+    else:
+        turn["variant"] = variant
+    st.rerun()
 
 
 @st.dialog("Discussion", width="large", on_dismiss="rerun")
@@ -7096,7 +7305,27 @@ def render_library_counts(search_state: dict, key_prefix: str = "results") -> No
             expanded=True,
         ):
             if shown_notes < total_notes:
-                st.caption(f"Showing {shown_notes} of {total_notes} notes — raise **Max results** to see more.")
+                with st.container(horizontal=True, vertical_alignment="center"):
+                    st.warning(f"Showing **{shown_notes} of {total_notes}** matching notes: **Max results** is "
+                               f"{st.session_state.get(max_results_key(True), shown_notes)}.",
+                               icon=":material/filter_list:", width="stretch")
+                    most = MAX_RESULTS_LIMITS["literal"]
+                    current = int(st.session_state.get(max_results_key(True)) or 0)
+                    if current < most:  # (at the slider's top already: narrow the search instead)
+                        st.button(f"Show all {total_notes}" if total_notes <= most else f"Show {most} (the most)",
+                                  key=f"show_all_{key_prefix}", type="primary",
+                                  on_click=show_all_matches, args=(total_notes,),
+                                  help="Raise **Max results** to this many and list the matching notes again.")
+            name_col, button_col = st.columns([3, 1], vertical_alignment="center")
+            name_col.markdown(f"**Single Corpus** (every note) · {short_indexed_at(SINGLE_CORPUS_LIBRARY_NAME)}")
+            button_col.button(
+                "Use Single Corpus",
+                key=f"use_single_corpus_{key_prefix}",
+                on_click=use_single_corpus,
+                width="stretch",
+                help="Search every note as one library (Corpus mode Single), e.g. to build your shortlist from all "
+                     "of them at once, semantic searches included. Check when it was last indexed first.",
+            )
             for library, count in library_counts:
                 name_col, button_col = st.columns([3, 1], vertical_alignment="center")
                 name_col.markdown(f"**{library}** — {count} note(s)")
@@ -7796,6 +8025,34 @@ def render_agent_panel(
             st.button("Check again", icon=":material/refresh:", key="agent_check_sent")
 
 
+def make_ask_variant(search_state: dict, narrate: bool, max_tokens: int, temperature: float,
+                     other_model: str | None = None, question: str | None = None) -> None:
+    """Re-run the Ask answer from the same notes and prompts, narrated or as text, or with `other_model`, or
+    with `question` asked in place of the original (Edit question; the notes found aren't searched again)."""
+    model = other_model or search_state.get("model") or DEFAULT_OLLAMA_MODEL
+    alternative = bool(other_model) or question is not None
+    corpus_prompt = with_salesforce_context(search_state, search_state.get("prompt_context", ""),
+                                            search_state["results"])
+    try:
+        with st.spinner(rerun_label(narrate, model, bool(other_model), question is not None), show_time=True):
+            reply, usage = answer_with_ollama(
+                question=search_state["question"] if question is None else question,
+                results=search_state["results"], model_name=model,
+                max_tokens=max_tokens, temperature=temperature, corpus_prompt=with_narration(corpus_prompt, narrate),
+                task_prompt=search_state.get("task_prompt", ""),
+            )
+    except Exception as exc:
+        st.error(f"Re-run failed: {exc}")
+        return
+    record_llm_speed(model, usage)
+    variant = finish_variant("ask", reply, narrate, model, usage, bool(other_model), question)
+    if alternative:
+        search_state["answer_alternatives"] = keep_alternative(search_state.get("answer_alternatives"), variant)
+    else:
+        search_state["answer_variant"] = variant
+    st.rerun()
+
+
 def render_search_results(
     search_state: dict,
     library_folder: Path,
@@ -7851,11 +8108,37 @@ def render_search_results(
                 with st.expander("Answer"):
                     st.markdown(link_opportunity_names(search_state["answer"]))
                     render_copy_buttons([("Copy answer", link_opportunity_names(search_state["answer"]))])
+        elif search_state.get("answer_pending"):
+            st.info("The answer is being written: see **Searching your notes**. You can look around meanwhile.",
+                    icon=":material/progress_activity:")
         elif search_state["answer"]:
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.subheader("Answer", width="content")
                 render_copy_buttons([("Copy all output", full_llm_output(search_state))])
             st.markdown(link_opportunity_names(search_state["answer"]))
+            if search_state.get("agent"):  # an Agent's answer leads to its drafts: Narrate rewrites it, no re-ask
+                ask_model = search_state.get("model") or DEFAULT_OLLAMA_MODEL
+                ask_key = f"ask_voice_{search_state.get('id', '')}"
+                render_voice_tools("ask", None, search_state["answer"], narrated=False, key=ask_key, rerun=False,
+                                   model=ask_model, rewrite=True)
+                render_rewritten_narration("ask", search_state, search_state["answer"], ask_model, key=ask_key,
+                                           field="answer_narration")
+            else:
+                render_voice_tools("ask", None, search_state["answer"], narrated=bool(search_state.get("narrated")),
+                                   key=f"ask_voice_{search_state.get('id', '')}",
+                                   model=search_state.get("model") or DEFAULT_OLLAMA_MODEL,
+                                   question=search_state.get("question", ""))
+                request = take_rerun_request("ask", None)
+                if request:
+                    make_ask_variant(search_state, request["narrate"], max_tokens, temperature, request.get("model"),
+                                     request.get("question"))
+                render_rewritten_narration("ask", search_state, search_state["answer"],
+                                           search_state.get("model") or DEFAULT_OLLAMA_MODEL,
+                                           key=f"ask_voice_{search_state.get('id', '')}", field="answer_narration")
+                render_answer_variant("ask", None, search_state.get("answer_variant"),
+                                      key=f"ask_voice_{search_state.get('id', '')}", markdown=link_opportunity_names)
+                render_alternatives("ask", None, search_state.get("answer_alternatives"),
+                                    key=f"ask_voice_{search_state.get('id', '')}", markdown=link_opportunity_names)
             render_copy_buttons([
                 ("Copy all output", full_llm_output(search_state)),
                 ("Copy answer", link_opportunity_names(search_state["answer"])),
@@ -9197,6 +9480,21 @@ def discover_ollama_models(host: str = OLLAMA_HOST, port: int = OLLAMA_PORT) -> 
         return False, []
 
 
+def notes_budget_fit(model: str, max_tokens: int) -> int:
+    """Characters of notes the model's context window can hold beside the prompt and the whole answer (about 3
+    characters a token; Ollama's window here goes up to the largest OLLAMA_CONTEXT_SIZES)."""
+    limit = ollama_model_info(model)["context_length"] or OLLAMA_CONTEXT_SIZES[0]
+    window = min(limit, OLLAMA_CONTEXT_SIZES[-1])
+    return max(4000, (window - int(max_tokens) - 1500) * 3)
+
+
+def notes_budget(safe_lib: str, model: str, max_tokens: int) -> int:
+    """The Notes budget for this corpus (Ollama model details), capped to what `model` can hold."""
+    chosen = int(st.session_state.get(f"llm_notes_chars_{safe_lib}")
+                 or get_corpus_config(safe_lib).get("llm_notes_chars") or LLM_CONTEXT_MAX_CHARS)
+    return min(chosen, notes_budget_fit(model, max_tokens))
+
+
 def build_context_from_results(results: list, max_chars: int = LLM_CONTEXT_MAX_CHARS) -> str:
     """Pack retrieved note chunks into a prompt context block for the LLM."""
     parts: list[str] = []
@@ -9226,6 +9524,7 @@ def build_llm_prompt(
     temperature: float = 0.3,
     corpus_prompt: str = "",
     task_prompt: str = "",
+    notes_chars: int | None = None,
 ) -> str:
     """Build the question-plus-notes prompt sent as the first turn of an LLM conversation.
 
@@ -9234,7 +9533,7 @@ def build_llm_prompt(
     """
     from llmware.prompts import PromptCatalog
 
-    context = build_context_from_results(results)
+    context = build_context_from_results(results, notes_chars or LLM_CONTEXT_MAX_CHARS)
     if not context.strip():
         raise ValueError("No searchable text was available to send to the LLM.")
 
@@ -9266,9 +9565,10 @@ def answer_with_ollama(
     corpus_prompt: str = "",
     task_prompt: str = "",
     on_progress=None,
+    notes_chars: int | None = None,
 ) -> tuple[str, dict]:
     """Generate a natural-language answer from search results using a local Ollama model."""
-    full_prompt = build_llm_prompt(question, results, max_tokens, temperature, corpus_prompt, task_prompt)
+    full_prompt = build_llm_prompt(question, results, max_tokens, temperature, corpus_prompt, task_prompt, notes_chars)
     return chat_with_ollama(
         [{"role": "user", "content": full_prompt}],
         model_name,
@@ -9294,6 +9594,7 @@ LLM_CANCEL_STYLE = """<style>
   background-color: rgb(230, 120, 0) !important; border-color: rgb(230, 120, 0) !important;
 }
 </style>"""
+LLM_TEXT_SECONDS = 0.15  # how often a streamed reply is redrawn (on_text)
 _LLM_CANCEL_KEYS = itertools.count()  # one Cancel per LLM call; restarts each script run
 
 
@@ -9301,23 +9602,28 @@ def cancel_llm() -> None:
     st.session_state[LLM_CANCELLED_KEY] = True
 
 
-def show_llm_cancel_button():
+def show_llm_cancel_button(extra=None):
     """A floating orange Cancel Query for the LLM call about to run; returns its slot, to clear when the call ends.
 
-    Clicking it reruns the script, which stops the call at its next page update (see LLM_TICK_SECONDS).
+    Clicking it reruns the script, which stops the call at its next page update (see LLM_TICK_SECONDS). `extra()`
+    draws more beside it (Chat's model picker).
     """
     slot = st.empty()
     number = next(_LLM_CANCEL_KEYS)
-    with slot.container(key=f"llm_cancel_{number}"):
+    with slot.container(key=f"llm_cancel_{number}", horizontal=True, vertical_alignment="center", gap="small"):
         st.html(LLM_CANCEL_STYLE)
+        if extra:
+            extra()
+        dictated = bool(st.session_state.get(DICTATED_KEY))
         st.button(
-            "Cancel Query",
+            "Stop and edit" if dictated else "Cancel Query",
             # Unique per call, as one run can make several (Re-assess); not llm_cancel_*, which the style places.
             key=f"stop_llm_{number}",
             icon=":material/stop_circle:",
             type="primary",
             on_click=cancel_llm,
-            help="Stop the LLM now, e.g. to change the task or prompts and run it again.",
+            help="Stop now and put your dictated text back in its box to fix and send again." if dictated
+            else "Stop the LLM now, e.g. to change the task or prompts and run it again.",
         )
     return slot
 
@@ -9370,7 +9676,10 @@ def chat_with_ollama(
     num_ctx: int | None = None,
     response_format: dict | None = None,
     on_progress=None,
+    cancel_extra=None,
     think: bool | None = None,
+    on_text=None,
+    extra_options: dict | None = None,
 ) -> tuple[str, dict]:
     """Send a chat conversation to a local Ollama model and return (reply, usage).
 
@@ -9380,12 +9689,16 @@ def chat_with_ollama(
     is called every LLM_PROGRESS_SECONDS with the tokens generated so far and the seconds since the
     first one (None while the model is still reading the prompt).
     A floating Cancel shows while the call runs; clicking it stops the call and closes the connection.
+    `on_text(content, thinking)` gets the reply so far as it streams (every LLM_TEXT_SECONDS, and once at the end),
+    for pages that show it live, e.g. Chat with LLM. `extra_options` are more Ollama options (e.g. top_p, seed, or
+    an exact num_ctx), set over the ones above.
     """
     options = {
         "temperature": temperature,
         "num_predict": max_tokens,
         "num_ctx": context_window_for(messages, max_tokens, num_ctx),
     }
+    options.update({key: value for key, value in (extra_options or {}).items() if value is not None})
 
     payload = {
         "model": model_name,
@@ -9406,11 +9719,11 @@ def chat_with_ollama(
             f"Start Ollama or run `./start_app.sh`. Details: {exc}"
         ) from exc
 
-    cancel_slot = show_llm_cancel_button()
+    cancel_slot = show_llm_cancel_button(cancel_extra)
     tick = st.empty()
     content, thinking, data = [], [], {}
     generated, first_token_at = 0, None
-    last_report = time.monotonic()
+    last_report = last_text = time.monotonic()
     try:
         while True:
             try:
@@ -9446,6 +9759,11 @@ def chat_with_ollama(
             if on_progress and time.monotonic() - last_report >= LLM_PROGRESS_SECONDS:
                 last_report = time.monotonic()
                 on_progress(generated, last_report - first_token_at if first_token_at else None)
+            if on_text and generated and time.monotonic() - last_text >= LLM_TEXT_SECONDS:
+                last_text = time.monotonic()
+                on_text("".join(content), "".join(thinking))
+        if on_text:
+            on_text("".join(content), "".join(thinking))
     finally:
         # Also runs when Cancel stops the script: dropping the connection stops Ollama generating.
         stream.close()
@@ -9476,6 +9794,12 @@ def chat_with_ollama(
         "metric": "tokens",
         "processing_time": (total_duration / 1e9) if total_duration else None,
         "tokens_per_second": (output_tokens / (eval_duration / 1e9)) if eval_duration else None,
+        # Time to load the model and read the prompt, i.e. before the first token, and the reading speed.
+        "load_seconds": (data["load_duration"] / 1e9) if data.get("load_duration") else None,
+        "prompt_seconds": (data["prompt_eval_duration"] / 1e9) if data.get("prompt_eval_duration") else None,
+        "prompt_tokens_per_second": (prompt_tokens / (data["prompt_eval_duration"] / 1e9))
+        if data.get("prompt_eval_duration") else None,
+        "num_ctx": options["num_ctx"],
     }
     return answer, usage
 
@@ -10096,6 +10420,10 @@ def clear_all_search_page() -> None:
     st.session_state["question_text"] = ""
     persist_question()
     st.session_state["find_notes_query"] = ""
+    st.session_state["oneshot_text"] = ""  # the Oneshot search, and the bar describing the search it ran
+    st.session_state.pop(ONESHOT_PENDING_KEY, None)
+    if (st.session_state.get(NOTES_SEARCH_KEY) or {}).get("source") == "oneshot" and not st.session_state.get(NOTES_RUN_KEY):
+        st.session_state.pop(NOTES_SEARCH_KEY, None)
     st.session_state[ACTIVE_TASK_PROMPTS_KEY] = []
     st.session_state.pop("question_task_token", None)
     save_app_settings({SALESFORCE_CONTEXT_SETTING: False})
@@ -10175,6 +10503,2768 @@ def describe_nearest_vector_match(nearest_distance: float | None, distance_thres
 
 _migrated_tables = migrate_all_legacy_vectors()
 
+# --- Dictation: speech to text on this Mac ---------------------------------------
+# A mic records in the browser; Whisper (through transformers, already installed) transcribes it locally, so the
+# audio never leaves the machine. The model is downloaded once from Hugging Face, then works offline.
+WHISPER_MODEL = "openai/whisper-base"  # about 290 MB; multilingual
+DICTATED_KEY = "dictated_send"  # {"target", "text"} while a dictated message is being answered
+DICTATION_SEEN_KEY = "dictation_seen"  # {recorder key: hash of the recording already used}
+DICTATION_SILENCE_SECONDS = 3  # a pause this long after you've spoken ends the recording and sends it
+DICTATION_HELP = ("Click the mic and speak: after a 3-second pause it's sent (click again to send sooner). It's "
+                  "transcribed on this Mac (Whisper; the audio never leaves it); **Cancel** stops that and sends nothing. While it's answered, **Stop and edit** puts the text back to fix. The answer "
+                  "is read aloud (turn that off under **Configure**). The first time, the speech model is downloaded "
+                  "(about 290 MB) and loaded, which takes a minute.")
+
+
+@st.cache_resource(show_spinner=False)
+def transcription_service() -> dict:
+    """Shared by every session of this server: the speech model (loaded on first use, on a worker thread), the
+    workers that transcribe, and the jobs in progress ({token: {"future", "claimed"}}). Transcripts live here only
+    until they're used or cancelled; nothing is written to disk."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    return {"lock": threading.Lock(), "pipe": None, "pool": ThreadPoolExecutor(max_workers=2), "jobs": {}}
+
+
+def whisper_pipeline(service: dict):
+    """The speech-to-text model, loaded once per server (on the Mac's GPU when it has one)."""
+    with service["lock"]:
+        if service["pipe"] is None:
+            import torch
+            from transformers import pipeline
+
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            service["pipe"] = pipeline("automatic-speech-recognition", model=WHISPER_MODEL, device=device,
+                                       chunk_length_s=30)
+        return service["pipe"]
+
+
+def transcribe_wav(data: bytes, service: dict) -> str:
+    """The text of a WAV recording (16 kHz from the recorders below). Runs on a worker thread."""
+    import io
+    import wave
+
+    import numpy as np
+
+    with wave.open(io.BytesIO(data)) as wav:
+        frames, rate = wav.readframes(wav.getnframes()), wav.getframerate()
+        width, channels = wav.getsampwidth(), wav.getnchannels()
+    dtype, scale = {1: (np.uint8, 128.0), 2: (np.int16, 32768.0), 4: (np.int32, 2147483648.0)}[width]
+    audio = np.frombuffer(frames, dtype=dtype).astype(np.float32)
+    audio = (audio - 128.0) / scale if width == 1 else audio / scale
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    if not audio.size:
+        return ""
+    result = whisper_pipeline(service)({"raw": audio, "sampling_rate": rate}, generate_kwargs={"task": "transcribe"})
+    return str(result.get("text", "")).strip()
+
+
+TRANSCRIBING_KEY = "transcribing"  # {recorder key: job token} while a recording is transcribed
+TRANSCRIPTION_CANCELLED_KEY = "transcription_cancelled"
+TRANSCRIBE_TICK_SECONDS = 0.2
+TRANSCRIBE_PANEL_STYLE = """<style>
+.st-key-transcribe_panel {
+  position: fixed !important; bottom: 1.5rem; left: 50%; transform: translateX(-50%); z-index: 1000;
+  width: auto !important; max-width: min(90vw, 640px); padding: 0.6rem 0.9rem;
+  background: PANEL_BG; color: PANEL_FG; border: 1px solid rgba(255, 140, 0, 0.8);
+  border-radius: 0.75rem; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+.st-key-transcribe_panel .st-key-transcribe_cancel button {
+  background-color: rgb(255, 140, 0) !important; border-color: rgb(255, 140, 0) !important; color: #fff !important;
+}
+</style>"""
+
+
+def start_transcription(recording, token: str | None = None) -> str:
+    """Hand a recording to a worker; returns the job's token (`token`: a job made when listening started)."""
+    service = transcription_service()
+    token = token or uuid.uuid4().hex
+    job = service["jobs"].setdefault(token, {"future": None, "claimed": False, "at": time.time()})
+    job["future"] = service["pool"].submit(transcribe_wav, recording.getvalue(), service)
+    return token
+
+
+def cancel_transcription(token: str, recorder_key: str | None) -> None:
+    """Floating Cancel: forget the job (the worker's result is dropped) and send nothing."""
+    transcription_service()["jobs"].pop(token, None)
+    if recorder_key:
+        st.session_state.get(TRANSCRIBING_KEY, {}).pop(recorder_key, None)
+    st.session_state[TRANSCRIPTION_CANCELLED_KEY] = True
+
+
+def wait_for_transcription(token: str, recorder_key: str | None = None) -> str | None:
+    """Wait for a job with a floating Cancel. Returns the text, '' if nothing was heard, or None if it was
+    cancelled or failed."""
+    service = transcription_service()
+    job = service["jobs"].get(token)
+    if not job:
+        return None
+    panel = st.empty()
+    with panel.container(key="transcribe_panel"):
+        st.html(themed_panel_style(TRANSCRIBE_PANEL_STYLE))
+        st.markdown(":material/graphic_eq: " + ("Loading the speech model (first time only), then transcribing…"
+                                                if service["pipe"] is None else "Transcribing…"))
+        st.button("Cancel", key="transcribe_cancel", icon=":material/close:", on_click=cancel_transcription,
+                  args=(token, recorder_key), help="Stop now: nothing is sent.")
+    tick = st.empty()
+    try:
+        while not job["future"].done():
+            tick.empty()  # a page update, so a Cancel click takes effect here
+            time.sleep(TRANSCRIBE_TICK_SECONDS)
+    finally:
+        panel.empty()
+    return finish_transcription(token)
+
+
+def finish_transcription(token: str) -> str | None:
+    service = transcription_service()
+    job = service["jobs"].pop(token, None)
+    if not job:
+        return None
+    try:
+        return job["future"].result()
+    except Exception as exc:
+        st.error(f"Couldn't transcribe the recording: {format_exception_for_user(exc)}")
+        return None
+
+
+def render_chat_model_picker(widget_key: str, on_change=None, current: str | None = None, args: tuple = ()) -> None:
+    """The model Chat uses, in a floating panel: saved as the model new chats start with, so it sticks."""
+    models = installed_model_names()
+    current = current or load_app_settings().get(CHAT_MODEL_SETTING) or DEFAULT_OLLAMA_MODEL
+    if not models:
+        return
+    if current not in models:
+        models = [current, *models]
+    st.selectbox("Model", models, index=models.index(current), key=widget_key, label_visibility="collapsed",
+                 width=220, on_change=on_change or save_picked_chat_model, args=args if on_change else (widget_key,),
+                 help="The model Chat answers with. It's kept for next time.")
+
+
+def save_picked_chat_model(widget_key: str) -> None:
+    model = st.session_state.get(widget_key)
+    if model:
+        save_app_settings({CHAT_MODEL_SETTING: model})
+
+
+def is_new_recording(recorder_key: str, recording) -> bool:
+    """A recording stays in its recorder across reruns: use each one once."""
+    digest = hashlib.md5(recording.getvalue()).hexdigest()
+    seen = st.session_state.setdefault(DICTATION_SEEN_KEY, {})
+    if seen.get(recorder_key) == digest:
+        return False
+    seen[recorder_key] = digest
+    return True
+
+
+def transcribe_new(recorder_key: str, recording, target: str) -> str:
+    """The transcript of a recording not used yet ('' otherwise), noting it as a dictated send for `target`.
+    It's transcribed on a worker with a floating Cancel; a run interrupted meanwhile picks the wait up again."""
+    running = st.session_state.setdefault(TRANSCRIBING_KEY, {})
+    if recording and is_new_recording(recorder_key, recording):
+        running[recorder_key] = start_transcription(recording)
+    token = running.get(recorder_key)
+    if not token:
+        return ""
+    text = wait_for_transcription(token, recorder_key)
+    running.pop(recorder_key, None)
+    if text is None:
+        return ""
+    if not text:
+        st.toast("Didn't catch anything there. Try again, a little closer to the mic.", icon=":material/mic_off:")
+        return ""
+    st.session_state[DICTATED_KEY] = {"target": target, "text": text}
+    return text
+
+
+# The hands-free mic: records in the browser and sends by itself after a pause. Streamlit's own recorder waits
+# for its stop button, so this small component listens for the silence instead (Web Audio, in the page; the audio
+# goes only to this app). It sends 16 kHz mono WAV, the rate Whisper uses.
+HANDS_FREE_MIC_HTML = """
+<div class="mic" data-state="idle">
+  <button type="button" class="btn" aria-label="Dictate">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+    <span class="label">Dictate</span>
+  </button>
+  <div class="track"><div class="level"></div></div>
+</div>
+"""
+HANDS_FREE_MIC_CSS = """
+.mic { display: flex; flex-direction: column; gap: 3px; font-family: var(--st-font); }
+.btn {
+  display: flex; align-items: center; gap: 6px; width: 100%; min-height: 2.5rem; padding: 0 12px;
+  border: 1px solid var(--st-border-color); border-radius: var(--st-button-radius, 0.5rem);
+  background: var(--st-secondary-background-color); color: var(--st-text-color);
+  font: inherit; font-size: 0.875rem; cursor: pointer; text-align: left;
+}
+.btn:hover { border-color: var(--st-primary-color); }
+.btn svg { width: 18px; height: 18px; flex: none; fill: currentColor; }
+.label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.icon-only .label { display: none; }
+.icon-only .btn { justify-content: center; padding: 0; }
+.icon-only .btn svg { width: 20px; height: 20px; }
+.mic[data-state="recording"] .btn { border-color: var(--st-red-color); color: var(--st-red-text-color); }
+.mic[data-state="recording"] .btn svg { animation: pulse 1.2s ease-in-out infinite; }
+.mic[data-state="busy"] .btn { opacity: 0.7; cursor: progress; }
+.mic[data-state="error"] .btn { color: var(--st-red-text-color); }
+.track { height: 3px; border-radius: 2px; background: transparent; overflow: hidden; }
+.mic[data-state="recording"] .track { background: var(--st-border-color-light, var(--st-border-color)); }
+.level { height: 100%; width: 0; background: var(--st-red-color); transition: width 80ms linear; }
+@keyframes pulse { 50% { opacity: 0.35; } }
+"""
+HANDS_FREE_MIC_JS = """
+const MICS = new WeakMap()
+
+function mergeChunks(chunks) {
+  let length = 0
+  for (const c of chunks) length += c.length
+  const out = new Float32Array(length)
+  let offset = 0
+  for (const c of chunks) { out.set(c, offset); offset += c.length }
+  return out
+}
+
+function downsample(samples, fromRate, toRate) {
+  if (fromRate <= toRate) return samples
+  const ratio = fromRate / toRate
+  const out = new Float32Array(Math.floor(samples.length / ratio))
+  for (let i = 0; i < out.length; i++) {
+    const start = Math.floor(i * ratio), end = Math.min(samples.length, Math.floor((i + 1) * ratio))
+    let sum = 0
+    for (let j = start; j < end; j++) sum += samples[j]
+    out[i] = sum / Math.max(1, end - start)
+  }
+  return out
+}
+
+function wavBase64(samples, rate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2)
+  const view = new DataView(buffer)
+  const text = (offset, value) => { for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i)) }
+  text(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true); text(8, "WAVE"); text(12, "fmt ")
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true)
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true)
+  view.setUint16(34, 16, true); text(36, "data"); view.setUint32(40, samples.length * 2, true)
+  for (let i = 0; i < samples.length; i++) {
+    const v = Math.max(-1, Math.min(1, samples[i]))
+    view.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true)
+  }
+  const bytes = new Uint8Array(buffer)
+  let binary = ""
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
+  return btoa(binary)
+}
+
+export default function (component) {
+  const { data, parentElement, setTriggerValue } = component
+  const root = parentElement.querySelector(".mic")
+  const btn = parentElement.querySelector(".btn")
+  const label = parentElement.querySelector(".label")
+  const level = parentElement.querySelector(".level")
+  if (!root || !btn) return
+  let m = MICS.get(parentElement)
+  if (!m) { m = { recording: false }; MICS.set(parentElement, m) }
+  m.send = setTriggerValue  // the latest, for a recording that outlives a rerun
+  const silenceMs = ((data && data.silence_seconds) || 3) * 1000
+  const iconOnly = data && data.label === ""
+  const idleText = iconOnly ? "Dictate" : (data && data.label) || "Dictate"
+  root.classList.toggle("icon-only", !!iconOnly)
+  const show = (state, text) => { root.dataset.state = state; label.textContent = text; if (iconOnly) btn.title = text }
+  btn.title = (data && data.help) || ""
+  if (!m.recording) show("idle", m.note || idleText)
+  m.note = ""
+
+  const stop = (send) => {
+    if (!m.recording) return
+    m.recording = false
+    level.style.width = "0"
+    try { m.proc.onaudioprocess = null; m.proc.disconnect(); m.source.disconnect() } catch (e) {}
+    m.stream.getTracks().forEach((t) => t.stop())
+    m.ctx.close()
+    const samples = mergeChunks(m.chunks)
+    m.chunks = []
+    if (!send || samples.length < m.rate * 0.4) {
+      show("idle", idleText)
+      if (data && data.notify) m.send("stopped", Date.now())
+      return
+    }
+    // Drop most of the closing silence: it only slows transcription.
+    const keep = m.heard ? Math.max(0, samples.length - Math.floor(m.rate * Math.max(0, (performance.now() - m.lastLoud) / 1000 - 0.6))) : samples.length
+    show("busy", "Sent")
+    // Ready for the next one shortly (the page may not redraw the mic after the answer).
+    clearTimeout(m.reset)
+    m.reset = setTimeout(() => { if (!m.recording) show("idle", idleText) }, 3000)
+    m.send("recording", wavBase64(downsample(samples.subarray(0, keep), m.rate, 16000), 16000))
+  }
+
+  const start = async () => {
+    try {
+      m.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } })
+    } catch (e) {
+      show("error", "No microphone access")
+      return
+    }
+    m.ctx = new AudioContext()
+    m.source = m.ctx.createMediaStreamSource(m.stream)
+    m.proc = m.ctx.createScriptProcessor(4096, 1, 1)
+    Object.assign(m, { chunks: [], rate: m.ctx.sampleRate, heard: false, floor: null, recording: true,
+                       started: performance.now(), lastLoud: performance.now() })
+    m.proc.onaudioprocess = (event) => {
+      if (!m.recording) return
+      const input = event.inputBuffer.getChannelData(0)
+      m.chunks.push(new Float32Array(input))
+      let sum = 0
+      for (let i = 0; i < input.length; i++) sum += input[i] * input[i]
+      const rms = Math.sqrt(sum / input.length)
+      // Speech is well above the room's background level, which is followed slowly.
+      m.floor = m.floor === null ? rms : (rms < m.floor ? rms : m.floor * 0.995 + rms * 0.005)
+      const now = performance.now()
+      if (rms > Math.max(0.012, m.floor * 3)) { m.heard = true; m.lastLoud = now }
+      level.style.width = Math.min(100, rms * 600) + "%"
+      const quiet = now - m.lastLoud
+      if (!m.heard) {
+        label.textContent = "Listening… speak now"
+        if (now - m.started > 15000) { stop(false); show("idle", "Didn't hear anything") }
+      } else if (quiet >= silenceMs || now - m.started > 300000) {
+        stop(true)
+      } else {
+        label.textContent = quiet > 800 ? "Sending in " + Math.ceil((silenceMs - quiet) / 1000) + " s…" : "Listening… pause to send"
+      }
+    }
+    m.source.connect(m.proc)
+    m.proc.connect(m.ctx.destination)
+    show("recording", "Listening… speak now")
+    if (data && data.notify) m.send("started", Date.now())  // e.g. the hotkey's red bar, with Cancel
+  }
+
+  // The app's Cancel: stop listening and send nothing.
+  const cancel = (data && data.cancel) || 0
+  if (m.cancelSeen === undefined) m.cancelSeen = cancel
+  else if (cancel !== m.cancelSeen) { m.cancelSeen = cancel; if (m.recording) stop(false) }
+
+  btn.onclick = () => { if (m.recording) stop(true); else if (root.dataset.state !== "busy") start() }
+
+  // The dictate hotkey: one listener for the page; it presses the mic holding the key with the highest priority.
+  // Typing in a box types the character as usual.
+  const keys = window.__llmNotesDictateKeys || (window.__llmNotesDictateKeys = new Map())
+  const hotkeys = data && data.hotkey ? [].concat(data.hotkey) : []  // one key, or several (other keyboard layouts)
+  if (hotkeys.length) keys.set(parentElement, { keys: hotkeys, priority: data.hotkey_priority || 0, press: () => btn.onclick() })
+  else keys.delete(parentElement)
+  if (!window.__llmNotesDictateListener) {
+    window.__llmNotesDictateListener = (event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey || event.repeat) return
+      const target = event.composedPath ? event.composedPath()[0] : event.target
+      if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName || ""))) return
+      let best = null
+      for (const [element, entry] of keys) {
+        if (!element.isConnected) { keys.delete(element); continue }
+        if (entry.keys.includes(event.key) && (!best || entry.priority > best.priority)) best = entry
+      }
+      if (best) { event.preventDefault(); best.press() }
+    }
+    document.addEventListener("keydown", window.__llmNotesDictateListener, true)
+  }
+  return () => { keys.delete(parentElement); if (m.recording) stop(false) }
+}
+"""
+_hands_free_mic = st.components.v2.component(
+    "hands_free_mic", html=HANDS_FREE_MIC_HTML, css=HANDS_FREE_MIC_CSS, js=HANDS_FREE_MIC_JS,
+)
+
+
+DICTATE_HOTKEYS = {"`": "` backtick", "§": "§ section sign", "~": "~ tilde", "\\": "\\ backslash",
+                   "|": "| vertical bar", "F2": "F2", "F4": "F4", "F8": "F8", "F9": "F9"}
+
+
+def dictate_hotkey() -> str | None:
+    """The key that starts dictating, or None when the hotkey is off."""
+    settings = load_app_settings()
+    key = settings.get("dictate_hotkey") or "`"
+    return key if settings.get("dictate_hotkey_enabled", True) and key in DICTATE_HOTKEYS else None
+
+
+def dictate_hotkeys() -> list[str]:
+    """Every key that starts dictating (the hotkey and the optional second one), or [] when the hotkey is off."""
+    first = dictate_hotkey()
+    if not first:
+        return []
+    second = load_app_settings().get("dictate_hotkey_2") or ""
+    return [first] + ([second] if second in DICTATE_HOTKEYS and second != first else [])
+
+
+def hotkey_markdown(key: str) -> str:
+    """The key as inline code that Markdown leaves alone (a backtick needs double backticks around it)."""
+    return "`` ` ``" if key == "`" else f"`{key}`"
+
+
+def configured_hotkeys() -> list[str]:
+    """The keys chosen (whether or not the hotkey is on), for labels."""
+    settings = load_app_settings()
+    keys = [settings.get("dictate_hotkey") or "`", settings.get("dictate_hotkey_2") or ""]
+    return [k for i, k in enumerate(keys) if k in DICTATE_HOTKEYS and k not in keys[:i]]
+
+
+def hotkeys_markdown(keys: list[str]) -> str:
+    """[ ` ] or [ ` ] / [ § ]."""
+    return " / ".join(f"[ {hotkey_markdown(k)} ]" for k in keys)
+
+
+# Truncated dropdown text (a long library name, or Single Corpus with its date) shows in full on hover: one
+# page-wide listener adds a native tooltip to whatever is cut off under the pointer in a dropdown or its list.
+FULL_TEXT_TOOLTIPS_JS = """
+export default function () {
+  if (window.__llmNotesFullText) return
+  window.__llmNotesFullText = true
+  // Oneshot search: Enter sends it (as Cmd/Ctrl+Enter does, which saves the text first); Shift+Enter adds a line.
+  document.addEventListener("keydown", (event) => {
+    const box = event.target
+    if (!(box.matches && box.matches(".st-key-oneshot_text textarea"))) return
+    if (event.key !== "Enter" || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    if (!box.value.trim()) return
+    box.dispatchEvent(new KeyboardEvent("keydown", {key: "Enter", code: "Enter", keyCode: 13, which: 13,
+                                                     ctrlKey: true, metaKey: true, bubbles: true, cancelable: true}))
+  }, true)
+  // Oneshot search grows with its text where the browser can't size it by CSS (field-sizing).
+  if (!CSS.supports("field-sizing", "content")) {
+    const fit = (box) => { box.style.height = "auto"; box.style.height = Math.min(box.scrollHeight + 2, innerHeight * 0.4) + "px" }
+    document.addEventListener("input", (event) => {
+      if (event.target.matches && event.target.matches(".st-key-oneshot_text textarea")) fit(event.target)
+    }, true)
+  }
+  document.addEventListener("mouseover", (event) => {
+    const root = event.target.closest && event.target.closest('[data-testid="stSelectbox"], [role="option"]')
+    if (!root) return
+    // The chosen value is in the dropdown's text box; a list option is plain text.
+    const input = root.querySelector && root.querySelector("input")
+    if (input && input.value && input.scrollWidth > input.clientWidth + 1) { input.title = input.value; return }
+    for (let el = event.target; el && el !== root.parentElement; el = el.parentElement) {
+      if (el.scrollWidth > el.clientWidth + 1 && el.textContent.trim()) { el.title = el.textContent.trim(); return }
+    }
+  }, true)
+}
+"""
+_full_text_tooltips = st.components.v2.component("full_text_tooltips", html="<span></span>", js=FULL_TEXT_TOOLTIPS_JS)
+
+
+def install_full_text_tooltips() -> None:
+    """Once per page: hovering cut-off text in a dropdown shows all of it."""
+    with st.sidebar:
+        _full_text_tooltips(key="full_text_tooltips")
+
+
+def dictation_recorder(recorder_key: str, target: str, *, label: str = "Dictate", width: int | str = 210,
+                       hotkey_priority: int = 0, to_chat: bool = False) -> str:
+    """The hands-free mic; returns the transcript of a recording it just sent, else ''. With `hotkey_priority`,
+    the dictate hotkey presses it (the highest priority on the page wins: the follow-up box over the Ask box)."""
+    import base64
+    import io
+
+    hotkeys = dictate_hotkeys() if hotkey_priority else []
+    shown = " / ".join(f"[ {k} ]" for k in hotkeys)
+    result = _hands_free_mic(
+        key=recorder_key, width=width,
+        data={"silence_seconds": DICTATION_SILENCE_SECONDS,
+              "label": f"{label} (hotkey {shown})" if hotkeys else label,
+              "help": DICTATION_HELP.replace("**", "")
+              + (f" Hotkey: {shown} (press it again to send now)." if hotkeys else ""),
+              "hotkey": hotkeys, "hotkey_priority": hotkey_priority,
+              "notify": to_chat, "cancel": st.session_state.get(HOTKEY_CANCELS_KEY, 0) if to_chat else 0},
+        on_recording_change=lambda: None,
+        on_started_change=hotkey_listening_started if to_chat else None,
+        on_stopped_change=hotkey_listening_stopped if to_chat else None,
+    )
+    encoded = getattr(result, "recording", None)
+    recording = None
+    if encoded:
+        try:
+            recording = io.BytesIO(base64.b64decode(encoded))
+        except ValueError:
+            recording = None
+    if to_chat:  # straight to Chat, which transcribes it and sends it (or a new tab, if one took it)
+        if recording and is_new_recording(recorder_key, recording):
+            listening = st.session_state.pop(HOTKEY_LISTEN_KEY, None) or {}
+            token = start_transcription(recording, listening.get("token"))
+            if transcription_service()["jobs"][token]["claimed"]:
+                st.toast("Carrying on in the new tab.", icon=":material/open_in_new:")
+            else:
+                st.session_state[HOTKEY_JOB_KEY] = token
+                open_chat_page()
+                st.rerun()
+        return ""
+    return transcribe_new(recorder_key, recording, target)
+
+
+def restore_after_stop(dictated: dict) -> None:
+    """After Stop and edit on a dictated message, leave its text in its box to fix and send again. The Ask and
+    follow-up boxes still hold it; a chat message is taken back out of the chat into the chat box."""
+    if dictated.get("target") != "chat":
+        return
+    chat = current_chat()
+    if chat["messages"] and chat["messages"][-1]["role"] == "user" \
+            and chat["messages"][-1]["content"] == dictated["text"]:
+        chat["messages"].pop()
+        if is_in_confidence(chat):
+            st.session_state[CHAT_DRAFT_KEY] = chat
+        elif chat["messages"]:
+            save_chat(chat)
+        else:  # it was the first message: the chat goes back to being a new, unsaved one
+            chat_path(chat["id"]).unlink(missing_ok=True)
+            st.session_state.pop(CHAT_OPEN_KEY, None)
+            chat.update(title="New chat", titled=False)
+            st.session_state[CHAT_DRAFT_KEY] = chat
+    st.session_state["chat_input"] = dictated["text"]
+
+
+# --- Read aloud: the answer to a dictated question, spoken on this Mac ----------
+# macOS's own voice (`say`, the one set in System Settings > Accessibility > Spoken Content) makes an audio file
+# that plays under the answer once; its player can pause, rewind or replay it. Nothing leaves the machine.
+READ_ALOUD_KEY = "read_aloud_answer"  # {"target", "text"}: the latest answer to a dictated question
+
+
+def wants_read_aloud() -> bool:
+    return bool(load_app_settings().get("read_aloud", True)) and shutil.which("say") is not None
+
+
+def persist_read_aloud(widget_key: str) -> None:
+    save_app_settings({"read_aloud": bool(st.session_state.get(widget_key))})
+    if not st.session_state.get(widget_key):
+        st.session_state.pop(READ_ALOUD_KEY, None)
+
+
+def render_read_aloud_toggle(widget_key: str) -> None:
+    if shutil.which("say") is None:
+        return
+    st.toggle("Read answers aloud when I dictate", value=bool(load_app_settings().get("read_aloud", True)),
+              key=widget_key, on_change=persist_read_aloud, args=(widget_key,),
+              help="When you dictate a question, the answer is read out in the Mac's voice (set in System Settings "
+                   "> Accessibility > Spoken Content). It's made on this Mac; nothing is sent anywhere. The "
+                   "**Read aloud (dictation)** prompt in the Prompt library is added to the request, so the answer "
+                   "is written to be heard: edit its wording there.")
+
+
+def persist_app_toggle(setting: str, widget_key: str) -> None:
+    save_app_settings({setting: bool(st.session_state.get(widget_key))})
+
+
+def render_dictate_hotkey_toggle(widget_key: str) -> None:
+    keys = hotkeys_markdown(configured_hotkeys())
+    st.toggle(f"Dictate hotkey {keys}",
+              value=bool(load_app_settings().get("dictate_hotkey_enabled", True)), key=widget_key,
+              on_change=persist_app_toggle, args=("dictate_hotkey_enabled", widget_key),
+              help=f"Press {keys} to start dictating, and again to send at once (or just pause). "
+                   "In Chat it dictates a message to the chat. On any other page it dictates a message and takes "
+                   "you to a new chat with it (**Back** returns you); while it's transcribed you can pick the model, "
+                   "**Cancel**, or **Open in a new tab**. While you're typing in a box the key types as usual: click "
+                   f"outside the box first. Change the key, or add a second one for another keyboard layout, on the "
+                   f"[Configure]({CONFIGURE_PAGE_URL}) page.")
+
+
+def render_open_on_chat_toggle(widget_key: str) -> None:
+    st.toggle("Open on Chat", value=bool(load_app_settings().get("open_on_chat", False)), key=widget_key,
+              on_change=persist_app_toggle, args=("open_on_chat", widget_key),
+              help="Open the app on Chat with LLM, to use it as your main page. **Back to search** still takes you "
+                   "to the search page.")
+
+
+def save_dictate_hotkey() -> None:
+    save_app_settings({"dictate_hotkey": st.session_state.get("dictate_hotkey_choice") or "`"})
+
+
+def save_dictate_hotkey_2() -> None:
+    save_app_settings({"dictate_hotkey_2": st.session_state.get("dictate_hotkey_2_choice") or ""})
+
+
+def render_voice_settings_section() -> None:
+    """Configure: the dictate hotkey and its key, read-aloud, and which page the app opens on."""
+    key = load_app_settings().get("dictate_hotkey") or "`"
+    second = load_app_settings().get("dictate_hotkey_2") or ""
+    with st.expander("Dictation and Chat · hotkey " + (hotkeys_markdown(dictate_hotkeys()) if dictate_hotkey() else "off"),
+                     expanded=True, key="configure_voice_open", icon=":material/keyboard:"):
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            st.selectbox("Dictate hotkey", list(DICTATE_HOTKEYS), index=list(DICTATE_HOTKEYS).index(key)
+                         if key in DICTATE_HOTKEYS else 0, format_func=DICTATE_HOTKEYS.get,
+                         key="dictate_hotkey_choice", on_change=save_dictate_hotkey, width=220,
+                         help="A key you don't otherwise type. On some keyboards ` and ~ are accent keys that wait "
+                              "for the next letter: pick another one if pressing it does nothing.")
+            second_options = ["", *DICTATE_HOTKEYS]
+            st.selectbox("Second hotkey", second_options,
+                         index=second_options.index(second) if second in second_options else 0,
+                         format_func=lambda k: DICTATE_HOTKEYS.get(k, "None"), key="dictate_hotkey_2_choice",
+                         on_change=save_dictate_hotkey_2, width=220,
+                         help="Optional: another key that does the same, e.g. for a second keyboard layout where the "
+                              "first key is somewhere else (or types something else).")
+            render_dictate_hotkey_toggle("dictate_hotkey_toggle_configure")
+        render_read_aloud_toggle("read_aloud_toggle_configure")
+        render_open_on_chat_toggle("open_on_chat_toggle_configure")
+
+
+def speakable_text(markdown_text: str) -> str:
+    """The answer as plain sentences: no thinking, code, link targets or Markdown symbols."""
+    _thinking, text = split_inline_thinking(markdown_text or "")
+    text = re.sub(r"```.*?(```|$)", "\n(code block)\n", text, flags=re.DOTALL)
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)  # [text](url) reads as its text
+    text = re.sub(r"https?://\S+", "(link)", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$", "", text, flags=re.MULTILINE)  # table rules
+    text = re.sub(r"^\s{0,3}(#{1,6}|>|[-*+]|\d+[.)])\s+", "", text, flags=re.MULTILINE)  # headings, bullets
+    text = text.replace("|", ", ")
+    text = re.sub(r"\*\*|__|~~|[*`]|(?<!\w)_|_(?!\w)", "", text)
+    lines = [re.sub(r"\s+,", ",", re.sub(r"\s+", " ", line)).strip(" ,") for line in text.splitlines()]
+    # Each line ends a sentence, so headings and bullet points get a pause.
+    return " ".join(line if line[-1] in ".!?:;" else line + "." for line in lines if line)
+
+
+def speak_to_audio(text: str) -> bytes:
+    """`text` spoken by macOS's voice, as AAC audio (.m4a). The text goes to `say` through a pipe, never a file;
+    the audio is in a temporary file only while it's made."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "answer.m4a"
+        subprocess.run(["say", "-o", str(out), "--file-format=m4af", "--data-format=aac"], input=text.encode("utf-8"),
+                       check=True, capture_output=True, timeout=600)
+        return out.read_bytes()
+
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def spoken_audio(text: str) -> bytes:
+    return speak_to_audio(text)
+
+
+def read_aloud_instruction(target: str) -> str:
+    """The Prompt library's Read aloud (dictation) text, when a question just dictated for `target` will have its
+    answer read aloud; '' otherwise (or once that prompt is deleted)."""
+    dictated = st.session_state.get(DICTATED_KEY) or {}
+    if dictated.get("target") != target or not wants_read_aloud():
+        return ""
+    prompt = find_prompt(load_prompt_library(), READ_ALOUD_PROMPT_ID)
+    return str((prompt or {}).get("text", "")).strip()
+
+
+def with_read_aloud(prompt_text: str, target: str) -> str:
+    """`prompt_text` plus the read-aloud instruction when it applies."""
+    instruction = read_aloud_instruction(target)
+    return f"{prompt_text}\n\n{instruction}".strip() if instruction else prompt_text
+
+
+def queue_read_aloud(target: str, answer: str) -> None:
+    """Read `answer` aloud where it's shown, if it answers a question just dictated for `target`."""
+    dictated = st.session_state.get(DICTATED_KEY) or {}
+    if dictated.get("target") == target and (answer or "").strip() and wants_read_aloud():
+        st.session_state[READ_ALOUD_KEY] = {"target": target, "text": answer}
+
+
+def render_read_aloud(target: str, answer: str, *, remember: bool = True, width: int | str = "stretch") -> None:
+    """The spoken answer's player, under the answer it reads. It plays by itself once, when it first appears."""
+    queued = st.session_state.get(READ_ALOUD_KEY)
+    if not queued or queued["target"] != target or queued["text"] != answer:
+        return
+    speech = speakable_text(answer)
+    if not speech:
+        return
+    try:
+        with st.spinner("Getting the answer ready to read aloud…"):
+            audio = spoken_audio(speech) if remember else speak_to_audio(speech)  # in confidence: not cached
+    except Exception as exc:
+        st.session_state.pop(READ_ALOUD_KEY, None)
+        st.caption(f"Couldn't read the answer aloud: {format_exception_for_user(exc)}")
+        return
+    st.audio(audio, format="audio/mp4", autoplay=True, alt="The answer, read aloud", width=width)
+
+
+# --- Narrate, or re-run as text -------------------------------------------------
+# Under a text answer, Narrate asks again with the Read aloud (dictation) prompt and reads that answer out; under a
+# narrated one (a dictated question's), Re-run as text asks again without it. The new version goes indented under
+# the original, which stays, and only the conversation up to that answer is sent: later messages are left out.
+# A version is kept with its answer (in the chat's file for a saved chat; only in the session otherwise).
+RERUN_REQUEST_KEY = "voice_rerun_request"  # {"target", "index", "narrate", "model", "question"}: run where it was
+
+
+def narration_instruction() -> str:
+    """The Prompt library's Read aloud (dictation) text, or its default if that prompt was deleted."""
+    prompt = find_prompt(load_prompt_library(), READ_ALOUD_PROMPT_ID)
+    return str((prompt or {}).get("text") or READ_ALOUD_PROMPT["text"]).strip()
+
+
+def with_narration(prompt_text: str, narrate: bool) -> str:
+    return f"{prompt_text}\n\n{narration_instruction()}".strip() if narrate else prompt_text
+
+
+def request_rerun(target: str, index: int | None, narrate: bool, model: str | None = None,
+                  question: str | None = None) -> None:
+    st.session_state[RERUN_REQUEST_KEY] = {"target": target, "index": index, "narrate": narrate, "model": model,
+                                           "question": question}
+
+
+def request_model_rerun(target: str, index: int | None, narrate: bool, menu_key: str) -> None:
+    """Try another model: the model picked from the menu re-runs the answer from the same context."""
+    model = st.session_state.get(menu_key)
+    if model:
+        request_rerun(target, index, narrate, model)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def installed_model_names() -> list[str]:
+    """Installed Ollama models for Try another model (checked at most every 30 s)."""
+    return discover_ollama_models()[1]
+
+
+def keep_alternative(alternatives: list | None, variant: dict) -> list:
+    """Add another model's (or an edited question's) version of an answer; the same model with the same question
+    again replaces its version."""
+    same = (variant["model"], variant.get("edited_prompt"))
+    return [alt for alt in alternatives or [] if (alt.get("model"), alt.get("edited_prompt")) != same] + [variant]
+
+
+def take_rerun_request(target: str, index: int | None) -> dict | None:
+    """The re-run asked for on this answer, if any (taken, so it runs once)."""
+    request = st.session_state.get(RERUN_REQUEST_KEY)
+    if request and request["target"] == target and request["index"] == index:
+        return st.session_state.pop(RERUN_REQUEST_KEY)
+    return None
+
+
+def play_answer(target: str, text: str) -> None:
+    st.session_state[READ_ALOUD_KEY] = {"target": target, "text": text}
+
+
+def render_voice_tools(target: str, index: int | None, text: str, *, narrated: bool, key: str, rerun: bool = True,
+                       remember: bool = True, model: str | None = None, question: str | None = None,
+                       rewrite: bool = False) -> None:
+    """One row under an answer. A text answer: Narrate and Read as is. A narrated one: its player (or Play) with
+    Re-run as text beside it. With `model` (the one that wrote it), Try another model re-runs it with another
+    installed model, and with `question` (what it was asked), Edit question re-runs an edited copy of it.
+    `rerun=False` for output with nothing to re-ask (an indented version, an Agent reply): with `rewrite`, its
+    Narrate rewrites the text itself for listening (see render_rewritten_narration)."""
+    can_speak = shutil.which("say") is not None
+    queued = st.session_state.get(READ_ALOUD_KEY) or {}
+    playing = can_speak and queued.get("target") == target and queued.get("text") == text
+    editing_key = f"{key}_editing"
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        if playing:
+            render_read_aloud(target, text, remember=remember, width=340)
+        elif can_speak:
+            st.button("Play" if narrated else "Read as is", key=f"{key}_play", type="tertiary",
+                      icon=":material/play_arrow:" if narrated else ":material/volume_up:",
+                      on_click=play_answer, args=(target, text),
+                      help="Read this answer out as it is, in the Mac's voice.")
+        if rerun and narrated:
+            st.button("Re-run as text", key=f"{key}_as_text", type="tertiary", icon=":material/notes:",
+                      on_click=request_rerun, args=(target, index, False),
+                      help="Ask again without the narration prompt, for a plain text answer. It goes below, indented; "
+                           "this one stays. Only the conversation up to here is sent.")
+        elif rerun and can_speak:
+            st.button("Narrate", key=f"{key}_narrate", type="tertiary", icon=":material/record_voice_over:",
+                      on_click=request_rerun, args=(target, index, True),
+                      help="Ask again with the **Read aloud (dictation)** prompt from the Prompt library, and read "
+                           "that answer out. It goes below, indented; this one stays. Only the conversation up to "
+                           "here is sent.")
+        elif rewrite and not narrated and can_speak and model:
+            st.button("Narrate", key=f"{key}_rewrite", type="tertiary", icon=":material/record_voice_over:",
+                      on_click=request_rewrite, args=(key,),
+                      help=f"Have `{model}` rewrite this text for listening, using the **Read aloud (dictation)** "
+                           "prompt from the Prompt library, and read that out. It goes just below; this stays.")
+        others = [name for name in installed_model_names() if name != model] if rerun and model else []
+        if others:
+            st.menu_button("Try another model", others, key=f"{key}_other_model", type="tertiary",
+                           icon=":material/swap_horiz:", on_click=request_model_rerun,
+                           args=(target, index, narrated, f"{key}_other_model"),
+                           help="Ask the same thing again with another installed model, sending it exactly what "
+                                f"`{model}` had: the same prompt, notes and conversation up to here (nothing after). "
+                                "Its answer goes below, indented; this one stays.")
+        if rerun and model and question is not None:
+            st.button("Edit question", key=f"{key}_edit", type="tertiary", icon=":material/edit_note:",
+                      on_click=toggle_flag, args=(editing_key,),
+                      help="Change the question that led to this answer and run it again, like editing a notebook "
+                           "cell: only the conversation up to here is sent, with your edited question in place of "
+                           "the original. Its answer goes below, indented; this one stays.")
+    if rerun and model and question is not None and st.session_state.get(editing_key):
+        render_question_editor(target, index, question, model, narrated, key)
+
+
+def toggle_flag(flag_key: str) -> None:
+    st.session_state[flag_key] = not st.session_state.get(flag_key)
+
+
+def render_question_editor(target: str, index: int | None, question: str, model: str, narrated: bool,
+                           key: str) -> None:
+    """Edit question: the question as it was sent, to change and run again with any installed model."""
+    models = installed_model_names() or [model]
+    if model not in models:
+        models = [model, *models]
+    with st.form(f"{key}_edit_form", border=True):
+        st.text_area("Edited question", value=question, key=f"{key}_edit_text", height=120,
+                     help="Sent in place of the original question, after the same conversation up to that point.")
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+            st.selectbox("Model", models, index=models.index(model), key=f"{key}_edit_model", width=240)
+            st.form_submit_button("Re-run", type="primary", icon=":material/play_arrow:",
+                                  on_click=submit_edited_question, args=(target, index, narrated, key))
+            st.form_submit_button("Cancel", on_click=toggle_flag, args=(f"{key}_editing",))
+
+
+def submit_edited_question(target: str, index: int | None, narrated: bool, key: str) -> None:
+    edited = str(st.session_state.get(f"{key}_edit_text") or "").strip()
+    if edited:
+        st.session_state[f"{key}_editing"] = False
+        request_rerun(target, index, narrated, st.session_state.get(f"{key}_edit_model"), edited)
+
+
+REWRITE_REQUEST_KEY = "voice_rewrite_request"  # the voice-tools key whose output Narrate should rewrite
+
+
+def request_rewrite(key: str) -> None:
+    st.session_state[REWRITE_REQUEST_KEY] = key
+
+
+def listening_rewrite_messages(text: str) -> list[dict]:
+    """Ask a model to rewrite `text` for listening, with the Read aloud (dictation) prompt."""
+    return [{"role": "system", "content": f"{narration_instruction()}\n\nRewrite the text the user sends so it can be "
+                                          "read aloud. Keep its meaning and every fact; only change how it's put. "
+                                          "Reply with the rewritten text alone."},
+            {"role": "user", "content": text}]
+
+
+def rewrite_for_listening(text: str, model: str, on_progress=None) -> tuple[str, dict]:
+    """Narrate for output with no question to re-ask: the model rewrites the text itself, using the narration prompt."""
+    return chat_with_ollama(listening_rewrite_messages(text), model, max_tokens=max(1024, len(text) // 2),
+                            temperature=0.3, on_progress=on_progress)
+
+
+def render_rewritten_narration(target: str, holder: dict, text: str, model: str | None, *, key: str,
+                               save=None, field: str = "narration", remember: bool = True) -> None:
+    """Narrate on output with nothing to re-ask: the rewrite `holder[field]` (made here when asked), under the text.
+    `save()` keeps it (a saved chat); without it, it lasts as long as `holder` does in the session."""
+    if model and st.session_state.get(REWRITE_REQUEST_KEY) == key:
+        st.session_state.pop(REWRITE_REQUEST_KEY)
+        try:
+            with llm_progress(st.empty(), f"`{model}` is rewriting it for listening…") as report:
+                reply, usage = rewrite_for_listening(text, model, report)
+        except Exception as exc:
+            st.error(f"Narrate failed: {exc}")
+            return
+        holder[field] = {**finish_variant(target, reply, True, model, usage), "rewritten": True}
+        if save:
+            save()
+        st.rerun()
+    narration = holder.get(field)
+    if not narration:
+        return
+    with st.container(border=True):
+        speed = f" · {narration['tokens_per_second']:.1f} tokens/s" if narration.get("tokens_per_second") else ""
+        st.caption(f":material/record_voice_over: Rewritten for listening · `{narration.get('model', '?')}`{speed}")
+        st.markdown(narration["content"])
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            render_copy_buttons([("Copy", narration["content"])], fit=True)
+        render_voice_tools(target, None, narration["content"], narrated=True, key=f"{key}_rewritten", rerun=False,
+                           remember=remember)
+
+
+def render_answer_variant(target: str, index: int | None, variant: dict | None, *, key: str, remember: bool = True,
+                          markdown=None, save=None) -> None:
+    """A narrated, text, other-model or edited-question version of an answer, indented under it. Its Narrate
+    rewrites it for listening; `save()` keeps that (a saved chat)."""
+    if not variant:
+        return
+    _gutter, body = st.columns([1, 24])
+    with body, st.container(border=True):
+        if variant.get("edited_prompt") is not None:
+            kind = "Edited prompt" + (" (narrated)" if variant.get("narrated") else "")
+        elif variant.get("other_model"):
+            kind = "Another model" + (" (narrated)" if variant.get("narrated") else "")
+        else:
+            kind = "Narrated version" if variant.get("narrated") else "Text version"
+        speed = f" · {variant['tokens_per_second']:.1f} tokens/s" if variant.get("tokens_per_second") else ""
+        st.caption(f":material/subdirectory_arrow_right: {kind} · `{variant.get('model', '?')}`{speed}")
+        if variant.get("edited_prompt") is not None:
+            st.caption(f"**Asked:** {variant['edited_prompt']}")
+        st.markdown(markdown(variant["content"]) if markdown else variant["content"])
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            render_copy_buttons([("Copy", variant["content"])], fit=True)
+        render_voice_tools(target, index, variant["content"], narrated=bool(variant.get("narrated")),
+                           key=f"{key}_variant", rerun=False, remember=remember, model=variant.get("model"),
+                           rewrite=True)
+        render_rewritten_narration(target, variant, variant["content"], variant.get("model"), key=f"{key}_variant",
+                                   save=save, remember=remember)
+
+
+def finish_variant(target: str, reply: str, narrate: bool, model: str, usage: dict | None,
+                   other_model: bool = False, edited_prompt: str | None = None) -> dict:
+    """The version to keep, read out at once when it's narrated (`other_model`: from Try another model;
+    `edited_prompt`: from Edit question)."""
+    _thinking, text = split_inline_thinking(reply or "")
+    variant = {"content": text.strip(), "narrated": narrate, "model": model, "at": now_iso(),
+               "tokens_per_second": (usage or {}).get("tokens_per_second"), "other_model": other_model}
+    if edited_prompt is not None:
+        variant["edited_prompt"] = edited_prompt
+    if narrate and variant["content"] and shutil.which("say"):
+        play_answer(target, variant["content"])
+    return variant
+
+
+def rerun_label(narrate: bool, model: str, other_model: bool = False, edited: bool = False) -> str:
+    if edited:
+        return f"Asking `{model}` the edited question…"
+    if other_model:
+        return f"Asking `{model}` the same thing…"
+    return f"{'Narrating' if narrate else 'Re-running as text'} with `{model}`…"
+
+
+def render_alternatives(target: str, index: int | None, alternatives: list | None, *, key: str,
+                        remember: bool = True, markdown=None, save=None) -> None:
+    """Other models' and edited questions' versions of an answer, each indented under it."""
+    for number, alt in enumerate(alternatives or []):
+        render_answer_variant(target, index, alt, key=f"{key}_alt_{number}", remember=remember, markdown=markdown,
+                              save=save)
+
+
+# --- Chat with LLM (?page=chat) -------------------------------------------------
+# A classic chat with any installed Ollama model, opened in the same tab from the sidebar. Each chat is saved as
+# llmware_data/chats/<id>.json (local only) once it has a message. A chat can also send About me, a prompt from
+# the library, and a snapshot of the notes in scope on the search page.
+CHAT_PAGE = "chat"
+CHAT_DIR = APP_DATA_DIR / "chats"
+CHAT_OPEN_KEY = "chat_open_id"  # the saved chat on screen; none means a new, unsaved one (CHAT_DRAFT_KEY)
+CHAT_DRAFT_KEY = "chat_draft"
+CHAT_MODEL_SETTING = "chat_model"  # app setting: the model new chats start with
+CHAT_NOTES_MAX_CHARS = 24000  # notes text attached to a chat, shared between the notes
+CHAT_DEFAULTS = {
+    "max_tokens": 4096,  # room for a reasoning model to think, then answer
+    "temperature": 0.7,
+    "num_ctx": 0,  # context window: 0 is Auto (sized to the chat, up to the model's limit)
+    "think": "auto",  # auto (the model's default), on or off, for models that can think
+    # None leaves these to the model's own defaults (its Modelfile), which suit it best unless you know otherwise.
+    "top_p": None, "top_k": None, "repeat_penalty": None, "seed": None,
+}
+CHAT_SAMPLING_OPTIONS = ("top_p", "top_k", "repeat_penalty", "seed")
+CHAT_CONTEXT_SIZES = (2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144)
+CHAT_THINK_CHOICES = {"auto": "Model default", "on": "On", "off": "Off"}
+CONTEXT_WARN_SHARE = 0.85  # warn once the last exchange filled this much of the context window
+CHAT_TITLE_CHARS = 60
+# An in-confidence chat lives only in this browser tab's session: it's never written to disk, listed, cached or
+# timed, and it's forgotten when you start or open another chat, leave Chat, or close the tab.
+IN_CONFIDENCE_TITLE = "In-confidence chat"
+
+
+CHAT_RETURN_KEY = "chat_return_to"  # the page (its query parameters) Chat was opened from, for Back
+HOTKEY_JOB_KEY = "hotkey_chat_job"  # the transcription of a message dictated with the hotkey on another page
+HOTKEY_CHAT_FOR_KEY = "hotkey_chat_for"  # the job a new chat was started for (once per job)
+TAB_ID_KEY = "tab_id"
+
+
+def open_chat_page() -> None:
+    st.session_state[CHAT_RETURN_KEY] = {k: v for k, v in st.query_params.to_dict().items() if k != "page"
+                                         or v != CHAT_PAGE}
+    st.query_params["page"] = CHAT_PAGE
+
+
+def leave_chat_page() -> None:
+    forget_in_confidence_chat()
+    back = st.session_state.pop(CHAT_RETURN_KEY, None) or {}
+    st.query_params.from_dict(back)
+
+
+def back_label() -> str:
+    page = (st.session_state.get(CHAT_RETURN_KEY) or {}).get("page")
+    return f"Back to {PAGE_TITLES[page].removeprefix('RAG - ')}" if page in PAGE_TITLES else "Back to search"
+
+
+HOTKEY_LISTEN_KEY = "hotkey_listening"  # {"token"} while the hotkey listens on a page other than Chat
+HOTKEY_CANCELS_KEY = "hotkey_cancels"  # counts Cancel clicks; the mic stops when it changes
+HOTKEY_BAR_STYLE = """<style>
+.st-key-hotkey_bar {
+  position: fixed !important; top: 3.75rem; left: 50%; transform: translateX(-50%); z-index: 1001;
+  width: auto !important; max-width: 94vw; padding: 0.45rem 0.9rem; border-radius: 0.6rem;
+  background: rgb(200, 30, 30); color: #fff; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+.st-key-hotkey_bar p, .st-key-hotkey_bar a, .st-key-hotkey_bar button { color: #fff !important; }
+.st-key-hotkey_bar button, .st-key-hotkey_bar a { border-color: rgba(255, 255, 255, 0.7) !important; background: transparent !important; }
+</style>"""
+
+
+def hotkey_listening_started() -> None:
+    """The hotkey's mic started listening: show the red bar, and make the job a new tab can wait for."""
+    token = uuid.uuid4().hex
+    transcription_service()["jobs"][token] = {"future": None, "claimed": False, "at": time.time()}
+    st.session_state[HOTKEY_LISTEN_KEY] = {"token": token}
+
+
+def hotkey_listening_stopped() -> None:
+    """It stopped without sending (nothing heard, or Cancel): drop the bar and the waiting job."""
+    listening = st.session_state.pop(HOTKEY_LISTEN_KEY, None)
+    if listening:
+        transcription_service()["jobs"].pop(listening["token"], None)
+
+
+def cancel_hotkey_listening() -> None:
+    """Cancel in the red bar: stop listening and send nothing."""
+    st.session_state[HOTKEY_CANCELS_KEY] = st.session_state.get(HOTKEY_CANCELS_KEY, 0) + 1
+    hotkey_listening_stopped()
+    st.session_state[TRANSCRIPTION_CANCELLED_KEY] = True
+
+
+def render_hotkey_bar() -> None:
+    """While the hotkey listens: a red bar at the top with the model it'll chat with, Cancel and Open in a new tab."""
+    listening = st.session_state.get(HOTKEY_LISTEN_KEY)
+    if not listening:
+        return
+    job = transcription_service()["jobs"].get(listening["token"]) or {}
+    with st.container(key="hotkey_bar", horizontal=True, vertical_alignment="center", gap="small"):
+        st.html(HOTKEY_BAR_STYLE)
+        st.markdown(":material/mic: **Chatting by hotkey** with", width="content")
+        render_chat_model_picker("hotkey_bar_model")
+        render_about_me_toggle("hotkey_bar_about_me", hotkey_about_me(), pick_hotkey_about_me,
+                               "Send About me (Prompt library) with the chat this starts. On by default; your choice "
+                               "is kept for next time.")
+        st.markdown("· listening, pause to send" if not job.get("claimed")
+                    else "· listening; it goes to the new tab when you pause", width="content")
+        st.button("Cancel", key="hotkey_bar_cancel", icon=":material/close:", on_click=cancel_hotkey_listening,
+                  help="Stop listening and send nothing.")
+        if not job.get("claimed"):
+            st.link_button("Open in a new tab", f"?page={CHAT_PAGE}&hotkey_job={listening['token']}",
+                           icon=":material/open_in_new:",
+                           help="Chat in a new tab when you pause: it gets your message, and this tab stays here.")
+
+
+def render_dictate_to_chat() -> None:
+    """Every page but Chat: the hotkey (or this mic) dictates a message, then goes to a new chat with it sent.
+    Back in Chat returns here. While it listens, a red bar shows the model, Cancel and Open in a new tab."""
+    with st.sidebar:
+        dictation_recorder("dictate_to_chat", "chat", label="Dictate to Chat", width="stretch", hotkey_priority=1,
+                           to_chat=True)
+    render_hotkey_bar()
+
+
+def is_in_confidence(chat: dict | None) -> bool:
+    return bool(chat and chat.get("in_confidence"))
+
+
+def forget_in_confidence_chat() -> None:
+    """Drop an in-confidence chat, and anything of it the session still holds."""
+    if is_in_confidence(st.session_state.get(CHAT_DRAFT_KEY)):
+        st.session_state.pop(CHAT_DRAFT_KEY, None)
+        st.session_state.pop("chat_input", None)
+        if (st.session_state.get(READ_ALOUD_KEY) or {}).get("target") == "chat":
+            st.session_state.pop(READ_ALOUD_KEY, None)
+
+
+def start_in_confidence_chat() -> None:
+    forget_in_confidence_chat()
+    st.session_state.pop(CHAT_OPEN_KEY, None)
+    st.session_state[CHAT_DRAFT_KEY] = {**new_chat_record(), "in_confidence": True, "title": IN_CONFIDENCE_TITLE,
+                                          "titled": True}
+
+
+def chat_path(chat_id: str) -> Path:
+    return CHAT_DIR / f"{chat_id}.json"
+
+
+def list_chats() -> list[dict]:
+    """Saved chats, most recently used first."""
+    chats = [read_json_file(path) for path in CHAT_DIR.glob("*.json")] if CHAT_DIR.is_dir() else []
+    return sorted((c for c in chats if c.get("id")), key=lambda c: c.get("updated", ""), reverse=True)
+
+
+def save_chat(chat: dict) -> None:
+    chat["updated"] = now_iso()
+    write_text_atomically(chat_path(chat["id"]), json.dumps(chat, indent=2, ensure_ascii=False))
+
+
+def new_chat_record() -> dict:
+    return {"id": uuid.uuid4().hex, "title": "New chat", "titled": False, "created": now_iso(), "updated": now_iso(),
+            "model": load_app_settings().get(CHAT_MODEL_SETTING) or DEFAULT_OLLAMA_MODEL, "about_me": False,
+            "prompt_id": "", "notes": None, "messages": [], **CHAT_DEFAULTS}
+
+
+def current_chat() -> dict:
+    """The chat on screen: the saved one opened, or a new one kept in the session until its first message."""
+    chat_id = st.session_state.get(CHAT_OPEN_KEY)
+    if chat_id and chat_path(chat_id).is_file():
+        return read_json_file(chat_path(chat_id))
+    st.session_state.pop(CHAT_OPEN_KEY, None)
+    return st.session_state.setdefault(CHAT_DRAFT_KEY, new_chat_record())
+
+
+def keep_chat(chat: dict) -> None:
+    """Save a chat that has messages; a new one stays in the session until then, and an in-confidence one always."""
+    if chat["messages"] and not is_in_confidence(chat):
+        save_chat(chat)
+        st.session_state[CHAT_OPEN_KEY] = chat["id"]
+        st.session_state.pop(CHAT_DRAFT_KEY, None)
+    else:
+        st.session_state[CHAT_DRAFT_KEY] = chat
+
+
+def start_new_chat() -> None:
+    forget_in_confidence_chat()
+    st.session_state.pop(CHAT_OPEN_KEY, None)
+    st.session_state[CHAT_DRAFT_KEY] = new_chat_record()
+
+
+def open_saved_chat(chat_id: str) -> None:
+    forget_in_confidence_chat()
+    st.session_state[CHAT_OPEN_KEY] = chat_id
+
+
+REPLY_AGAIN_KEY = "chat_reply_again"  # {"dictated"}: a reply stopped to switch model, to ask again
+
+
+def switch_reply_model() -> None:
+    """A model picked while a reply is written: stop that reply and ask the new model, from the same chat."""
+    model = st.session_state.get("reply_model")
+    chat = current_chat()
+    if not model or model == chat["model"]:
+        return
+    chat["model"] = model
+    st.session_state[f"chat_model_{chat['id']}"] = model  # the picker above the chat
+    save_app_settings({CHAT_MODEL_SETTING: model})
+    keep_chat(chat)
+    st.session_state[REPLY_AGAIN_KEY] = {"dictated": st.session_state.get(DICTATED_KEY)}
+
+
+def change_chat_setting(field: str, widget_key: str) -> None:
+    chat = current_chat()
+    chat[field] = st.session_state.get(widget_key)
+    if field == "model":
+        save_app_settings({CHAT_MODEL_SETTING: chat["model"]})  # new chats start with the last model used
+    msgs = chat["messages"]
+    if field == "about_me" and len(msgs) >= 2 and msgs[-1]["role"] == "assistant" \
+            and not msgs[-1].get("notes_search") and msgs[-2]["role"] == "user":
+        # Re-run the last message with (or without) About me: its reply is replaced.
+        msgs.pop()
+        asked = msgs[-1]
+        st.session_state[REPLY_AGAIN_KEY] = {"dictated": {"target": "chat", "text": asked["content"]}
+                                             if asked.get("dictated") else None}
+    keep_chat(chat)
+
+
+def rename_chat(widget_key: str) -> None:
+    title = str(st.session_state.get(widget_key, "")).strip()
+    chat = current_chat()
+    if title:
+        chat.update(title=title[:CHAT_TITLE_CHARS * 2], titled=True)
+        keep_chat(chat)
+
+
+def delete_open_chat() -> None:
+    forget_in_confidence_chat()
+    chat_id = st.session_state.pop(CHAT_OPEN_KEY, None)
+    if chat_id:
+        chat_path(chat_id).unlink(missing_ok=True)
+    st.session_state[CHAT_DRAFT_KEY] = new_chat_record()
+
+
+def delete_saved_chat(chat_id: str) -> None:
+    """The x beside a chat in the list: delete its file; if it's the one open, start a new chat in its place."""
+    if st.session_state.get(CHAT_OPEN_KEY) == chat_id:
+        delete_open_chat()
+    else:
+        chat_path(chat_id).unlink(missing_ok=True)
+
+
+def in_scope_notes_context() -> tuple[int, str, list[str]]:
+    """(how many, their text, their names) for the notes kept in scope on the search page, or (0, '', [])."""
+    gathered = st.session_state.get(GATHERED_KEY)
+    if not gathered or not gathered.get("notes"):
+        return 0, "", []
+    kept = kept_gathered_notes(gathered)
+    blocks, _trimmed = share_context(gathered, kept, CHAT_NOTES_MAX_CHARS)
+    return len(kept), build_context_from_results(blocks, CHAT_NOTES_MAX_CHARS), [Path(source).name for _lib, source in kept]
+
+
+def attach_in_scope_notes() -> None:
+    count, text, names = in_scope_notes_context()
+    chat = current_chat()
+    chat["notes"] = {"count": count, "text": text, "names": names, "at": now_iso()} if count else None
+    keep_chat(chat)
+
+
+def detach_notes() -> None:
+    chat = current_chat()
+    chat["notes"] = None
+    keep_chat(chat)
+
+
+def chat_system_prompt(chat: dict) -> str:
+    library = load_prompt_library()
+    parts = []
+    profile = str(library["profile"].get("text", "")).strip()
+    if chat.get("about_me") and profile:
+        parts.append(f"About the person you're chatting with:\n{profile}")
+    prompt = find_prompt(library, chat.get("prompt_id"))
+    if prompt:
+        parts.append(prompt["text"])
+    if chat.get("notes"):
+        parts.append(f"Notes from my notes app, for reference ({plural(chat['notes']['count'], 'note')}):\n"
+                     f"{chat['notes']['text']}")
+    return "\n\n".join(parts)
+
+
+def split_inline_thinking(content: str) -> tuple[str, str]:
+    """(thinking, answer) for models that write their reasoning inline in <think> tags."""
+    match = re.match(r"\s*<think>(.*?)(</think>|$)(.*)", content, flags=re.DOTALL)
+    return (match.group(1).strip(), match.group(3).lstrip()) if match else ("", content)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def ollama_model_info(model: str) -> dict:
+    """{"context_length": the model's maximum context window or None, "thinking": whether it can think}."""
+    try:
+        conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=10)
+        conn.request("POST", "/api/show", body=json.dumps({"model": model}), headers={"Content-Type": "application/json"})
+        data = json.loads(conn.getresponse().read() or b"{}")
+        conn.close()
+    except (OSError, ValueError):
+        return {"context_length": None, "thinking": False}
+    lengths = [v for k, v in (data.get("model_info") or {}).items() if k.endswith(".context_length") and isinstance(v, int)]
+    return {"context_length": max(lengths) if lengths else None, "thinking": "thinking" in (data.get("capabilities") or [])}
+
+
+def chat_ollama_settings(chat: dict, messages: list[dict]) -> tuple[dict, bool | None]:
+    """(extra Ollama options, think) for this chat: an exact context window (Auto sizes it to the chat, capped at
+    the model's limit) and any sampling options set away from the model's defaults."""
+    limit = ollama_model_info(chat["model"])["context_length"]
+    max_tokens = int(chat.get("max_tokens", CHAT_DEFAULTS["max_tokens"]))
+    num_ctx = int(chat.get("num_ctx") or 0) or context_window_for(messages, max_tokens)
+    options = {"num_ctx": min(num_ctx, limit) if limit else num_ctx}
+    options.update({key: chat[key] for key in CHAT_SAMPLING_OPTIONS if chat.get(key) is not None})
+    think = {"on": True, "off": False}.get(chat.get("think") or "auto")
+    return options, think if ollama_model_info(chat["model"])["thinking"] else None
+
+
+def format_seconds(seconds: float | None) -> str:
+    return "?" if seconds is None else f"{seconds:.1f}s" if seconds < 60 else format_duration(seconds)
+
+
+def describe_reply_stats(message: dict) -> tuple[str, str]:
+    """(one short line, the full breakdown for its tooltip) from a reply's Ollama stats."""
+    line = [f"`{message.get('model', '?')}`"]
+    if message.get("tokens_per_second"):
+        line.append(f"**{message['tokens_per_second']:.1f} tokens/s**")
+    if message.get("output_tokens"):
+        line.append(f"{message['output_tokens']:,} tokens")
+    if message.get("total_seconds"):
+        line.append(format_seconds(message["total_seconds"]))
+    if message.get("num_ctx") and message.get("input_tokens") is not None:
+        line.append(f"context {message['input_tokens'] + (message.get('output_tokens') or 0):,} / {message['num_ctx']:,}")
+    before = sum(v for v in (message.get("load_seconds"), message.get("prompt_seconds")) if v)
+    detail = [
+        f"**Writing:** {message.get('output_tokens') or 0:,} tokens at {message.get('tokens_per_second') or 0:.1f} tokens/s"
+        + (" (thinking included)" if message.get("thinking") else ""),
+        f"**Reading the prompt:** {message.get('input_tokens') or 0:,} tokens in {format_seconds(message.get('prompt_seconds'))}"
+        + (f" ({message['prompt_tokens_per_second']:,.0f} tokens/s)" if message.get("prompt_tokens_per_second") else ""),
+        f"**Loading the model:** {format_seconds(message.get('load_seconds'))}",
+        f"**First token after:** {format_seconds(before) if before else '?'} · **Total:** {format_seconds(message.get('total_seconds'))}",
+        f"**Context window:** {message.get('num_ctx') or '?':,}" if message.get("num_ctx") else "**Context window:** ?",
+    ]
+    # Replies saved before stats were kept have none to break down.
+    return " · ".join(line), "  \n".join(detail) if message.get("output_tokens") else ""
+
+
+def render_chat_reply(message: dict) -> None:
+    """A saved assistant reply: its thinking (folded), the answer, a copy button and the model's speed."""
+    if message.get("thinking"):
+        seconds = message.get("thought_seconds")
+        label = "Thinking" if seconds is None else f"Thought for {seconds:.0f}s" if seconds >= 1 else "Thought briefly"
+        with st.expander(label, type="compact"):
+            st.markdown(message["thinking"])
+    st.markdown(message["content"])
+    line, detail = describe_reply_stats(message)
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        render_copy_buttons([("Copy", message["content"])], fit=True)
+        st.caption(line, width="content", help=detail or None)
+
+
+def generate_chat_reply(chat: dict) -> None:
+    """Stream the model's reply to the conversation so far into the page, then save it with the chat."""
+    narrated = bool(read_aloud_instruction("chat"))  # a dictated message, to be read aloud
+    system = with_read_aloud(chat_system_prompt(chat), "chat")
+    messages = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": m["role"], "content": m["content"]} for m in chat["messages"]
+    ]
+    with st.chat_message("assistant"):
+        think_slot, answer_slot = st.empty(), st.empty()
+        state = {"thinking": "", "content": "", "think_started": None, "think_ended": None}
+
+        def show(content: str, thinking: str) -> None:
+            inline_thinking, answer = split_inline_thinking(content)
+            thinking = (thinking + inline_thinking).strip()
+            if thinking and state["think_started"] is None:
+                state["think_started"] = time.monotonic()
+            if answer.strip() and state["think_started"] and state["think_ended"] is None:
+                state["think_ended"] = time.monotonic()
+            if thinking:
+                with think_slot.container():
+                    label = ":shimmer[Thinking…]" if not answer.strip() else "Thinking"
+                    with st.expander(label, type="compact"):
+                        st.markdown(thinking)
+            if answer.strip():
+                answer_slot.markdown(answer + " ▌")
+            state.update(thinking=thinking, content=answer)
+
+        options, think = chat_ollama_settings(chat, messages)
+        try:
+            reply, usage = chat_with_ollama(
+                messages, chat["model"], max_tokens=int(chat.get("max_tokens", CHAT_DEFAULTS["max_tokens"])),
+                temperature=float(chat.get("temperature", CHAT_DEFAULTS["temperature"])), on_text=show,
+                extra_options=options, think=think,
+                cancel_extra=lambda: render_reply_controls(chat),
+            )
+        except RuntimeError as exc:
+            answer_slot.error(str(exc))
+            return
+    if not is_in_confidence(chat):  # in confidence, not even when it was used is kept
+        record_llm_speed(chat["model"], usage)
+    seconds = (state["think_ended"] or time.monotonic()) - state["think_started"] if state["think_started"] else None
+    chat["messages"].append({
+        "role": "assistant", "content": reply, "thinking": state["thinking"], "thought_seconds": seconds,
+        "model": chat["model"], "tokens_per_second": usage.get("tokens_per_second"), "at": now_iso(),
+        "input_tokens": usage.get("input"), "output_tokens": usage.get("output"),
+        "total_seconds": usage.get("processing_time"), "load_seconds": usage.get("load_seconds"),
+        "prompt_seconds": usage.get("prompt_seconds"), "prompt_tokens_per_second": usage.get("prompt_tokens_per_second"),
+        "num_ctx": usage.get("num_ctx"), "narrated": narrated,
+    })
+    queue_read_aloud("chat", reply)
+    keep_chat(chat)
+    st.rerun()
+
+
+def render_chat_sidebar(chat: dict) -> None:
+    st.sidebar.button(back_label(), icon=":material/arrow_back:", on_click=leave_chat_page, width="stretch")
+    st.sidebar.button("New chat", icon=":material/add:", type="primary", on_click=start_new_chat, width="stretch",
+                      disabled=not chat["messages"] and not is_in_confidence(chat))
+    st.sidebar.button("In-confidence chat", icon=":material/lock:", on_click=start_in_confidence_chat,
+                      width="stretch", disabled=is_in_confidence(chat) and not chat["messages"],
+                      help="A chat that isn't saved or logged: nothing you type or dictate, and no reply, is written "
+                           "to disk, listed here or kept after you leave it.")
+    chats = list_chats()
+    st.sidebar.caption("Chats" if chats else "Saved chats appear here after their first message.")
+    for saved in chats:
+        when = datetime.datetime.fromisoformat(saved["updated"]).strftime("%d %b %H:%M")
+        title_col, remove_col = st.sidebar.columns([7, 1], vertical_alignment="center", gap="xxsmall")
+        with title_col:
+            st.button(
+                truncate_text(saved.get("title") or "Untitled", 38),
+                key=f"chat_open_{saved['id']}",
+                type="secondary" if saved["id"] == chat["id"] else "tertiary",
+                on_click=open_saved_chat,
+                args=(saved["id"],),
+                width="stretch",
+                help=f"{plural(len(saved.get('messages', [])), 'message')} · `{saved.get('model', '?')}` · {when}",
+            )
+        with remove_col:
+            st.button("", icon=":material/close:", key=f"chat_remove_{saved['id']}", type="tertiary",
+                      on_click=delete_saved_chat, args=(saved["id"],), width="content",
+                      help="Delete this chat for good")
+    with st.sidebar:
+        st.divider()
+        render_read_aloud_toggle("read_aloud_toggle_chat")
+        render_dictate_hotkey_toggle("dictate_hotkey_toggle_chat")
+        render_open_on_chat_toggle("open_on_chat_toggle_chat")
+        st.toggle("Send dictated notes questions to search", value=notes_search_enabled(), key="notes_search_toggle",
+                  on_change=persist_app_toggle, args=(NOTES_SEARCH_SETTING, "notes_search_toggle"),
+                  help="A **dictated** message (mic or hotkey) that asks about your notes (e.g. *search my notes for "
+                       "the Acme pilot last week*) moves to the search page: the model reads the library, route, "
+                       "filter terms and dates out of it, fills them in and runs the search. Each dictated message "
+                       "gets a quick check by the **RAG selector model** first. Typed messages always stay in Chat "
+                       "(use **Oneshot search** on the search page for your notes). If it guesses wrong, **Send to "
+                       "non-note search** in the pop-up sends it back here. Never in an in-confidence chat.")
+
+
+def make_chat_variant(chat: dict, index: int, narrate: bool, other_model: str | None = None,
+                      question: str | None = None) -> None:
+    """Re-run the reply at `index` from the chat as it was then (later messages left out), narrated or as text,
+    or with `other_model` given exactly what the original model had, or with the message before it changed to
+    `question` (Edit question)."""
+    message = chat["messages"][index]
+    system = with_narration(chat_system_prompt(chat), narrate)
+    messages = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": m["role"], "content": m["content"]} for m in chat["messages"][:index]
+    ]
+    if question is not None:
+        messages[-1] = {"role": "user", "content": question}
+    model = other_model or message.get("model") or chat["model"]
+    alternative = bool(other_model) or question is not None
+    options, think = chat_ollama_settings({**chat, "model": model}, messages)
+    try:
+        with st.spinner(rerun_label(narrate, model, bool(other_model), question is not None), show_time=True):
+            reply, usage = chat_with_ollama(
+                messages, model, max_tokens=int(chat.get("max_tokens", CHAT_DEFAULTS["max_tokens"])),
+                temperature=float(chat.get("temperature", CHAT_DEFAULTS["temperature"])), extra_options=options,
+                think=think,
+            )
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
+    if not is_in_confidence(chat):
+        record_llm_speed(model, usage)
+    variant = finish_variant("chat", reply, narrate, model, usage, bool(other_model), question)
+    if alternative:
+        message["alternatives"] = keep_alternative(message.get("alternatives"), variant)
+    else:
+        message["variant"] = variant
+    keep_chat(chat)
+    st.rerun()
+
+
+def render_chat_settings(chat: dict) -> None:
+    """Model, About me, a prompt and attached notes for this chat, on one wrapping row, plus the model's tuning."""
+    ok, installed = discover_ollama_models()
+    models = list(installed if ok and installed else SUGGESTED_OLLAMA_MODELS)
+    if chat["model"] not in models:
+        models.insert(0, chat["model"])
+    library = load_prompt_library()
+    prompts = {p["id"]: agent_prompt_label(p) for p in library["prompts"]}
+    key = chat["id"]
+    fields = {"model": chat["model"], "about_me": chat.get("about_me", False), "prompt_id": chat.get("prompt_id", ""),
+              **{field: chat.get(field, default) for field, default in CHAT_DEFAULTS.items()
+                 if field not in CHAT_SAMPLING_OPTIONS}}  # these start from value= (they can be empty)
+    for field, value in fields.items():
+        st.session_state.setdefault(f"chat_{field}_{key}", value)
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        st.selectbox("Model", models, key=f"chat_model_{key}", on_change=change_chat_setting,
+                     args=("model", f"chat_model_{key}"), label_visibility="collapsed", width=220,
+                     help="Any model installed in Ollama. Change it mid-chat to have another model carry on.")
+        profile = str(library["profile"].get("text", "")).strip()
+        st.toggle("About me", key=f"chat_about_me_{key}", on_change=change_chat_setting,
+                  args=("about_me", f"chat_about_me_{key}"), disabled=not profile,
+                  help=(profile + "\n\nChanging it asks the last message again, with or without About me (its "
+                        "reply is replaced).") if profile else "Write About me in the Prompt library first.")
+        st.selectbox("Prompt", ["", *prompts], format_func=lambda pid: prompts.get(pid, "No prompt"),
+                     key=f"chat_prompt_id_{key}", on_change=change_chat_setting,
+                     args=("prompt_id", f"chat_prompt_id_{key}"), label_visibility="collapsed", width=240,
+                     help="A prompt from your library, sent as standing instructions with every message.")
+        count, _text, _names = in_scope_notes_context()
+        if chat.get("notes"):
+            st.button(f"Notes attached ({chat['notes']['count']})", icon=":material/attach_file:",
+                      key=f"chat_detach_{key}", on_click=detach_notes,
+                      help="Sent with every message:  \n" + "  \n".join(chat["notes"].get("names", [])[:30])
+                      + "  \n\nClick to remove them from this chat.")
+        else:
+            st.button(f"Attach notes in scope ({count})", icon=":material/attach_file:", key=f"chat_attach_{key}",
+                      on_click=attach_in_scope_notes, disabled=not count,
+                      help="Attach a copy of the notes kept in scope on the search page (up to "
+                      f"{CHAT_NOTES_MAX_CHARS:,} characters, shared between them). Gather them there first."
+                      if count else "Gather notes on the search page first (a search, Find notes or Filter search).")
+        with st.popover("Model options", icon=":material/tune:"):
+            render_chat_model_options(chat)
+    st.caption(describe_llm_speed(chat["model"]))
+    render_context_meter(chat)
+
+
+def setting_widget(widget, label: str, chat: dict, field: str, **kwargs):
+    """A chat setting's widget, saved with the chat when changed."""
+    key = f"chat_{field}_{chat['id']}"
+    return widget(label, key=key, on_change=change_chat_setting, args=(field, key), **kwargs)
+
+
+def reset_chat_model_options(chat_id: str) -> None:
+    chat = current_chat()
+    for field in ("num_ctx", "think", *CHAT_SAMPLING_OPTIONS):
+        chat[field] = CHAT_DEFAULTS[field]
+        st.session_state[f"chat_{field}_{chat_id}"] = CHAT_DEFAULTS[field]
+    keep_chat(chat)
+
+
+def render_chat_model_options(chat: dict) -> None:
+    """Max tokens, temperature, context window, thinking and sampling options, for this chat."""
+    info = ollama_model_info(chat["model"])
+    limit = info["context_length"]
+    setting_widget(st.number_input, "Max tokens", chat, "max_tokens", min_value=256, max_value=LLM_MAX_TOKENS_LIMIT,
+                   step=256, help="The longest reply, thinking included. Reasoning models need room to think.")
+    setting_widget(st.slider, "Temperature", chat, "temperature", min_value=0.0, max_value=1.5, step=0.1,
+                   help="Lower is more focused, higher more varied.")
+    sizes = [0, *(size for size in CHAT_CONTEXT_SIZES if not limit or size <= limit)]
+    if chat.get("num_ctx") and chat["num_ctx"] not in sizes:
+        sizes.append(chat["num_ctx"])
+    setting_widget(
+        st.selectbox, "Context window", chat, "num_ctx", options=sizes,
+        format_func=lambda size: f"Auto (fits the chat, up to {limit:,})" if size == 0 and limit else
+        "Auto (fits the chat)" if size == 0 else f"{size:,} tokens",
+        help="How much of the chat (and attached notes) the model can see at once, in tokens (about ¾ of a word "
+        "each). **Auto** sizes it to the chat, so it grows as the chat does, but each step up reloads the model, "
+        "making that reply slower to start. A **fixed** size avoids the reloads; a smaller one uses less memory. If "
+        "the chat outgrows the window, the model no longer sees the oldest messages."
+        + (f"\n\n`{chat['model']}` can take up to {limit:,} tokens." if limit else ""),
+    )
+    setting_widget(st.segmented_control, "Thinking", chat, "think", options=list(CHAT_THINK_CHOICES),
+                   format_func=CHAT_THINK_CHOICES.get, disabled=not info["thinking"],
+                   help="Whether a reasoning model thinks before answering. **Off** is much faster; **On** is better "
+                   "for hard questions." if info["thinking"] else f"`{chat['model']}` doesn't think before answering.")
+    st.caption("Sampling: empty means the model's own default, which usually suits it best.")
+    setting_widget(st.number_input, "Top P", chat, "top_p", value=chat.get("top_p"), min_value=0.0, max_value=1.0, step=0.05,
+                   placeholder="Model default", help="Only consider the most likely words that together make up this "
+                   "share of the probability (e.g. 0.9). Lower is more focused.")
+    setting_widget(st.number_input, "Top K", chat, "top_k", value=chat.get("top_k"), min_value=1, max_value=200, step=1,
+                   placeholder="Model default", help="Only consider this many of the most likely words (e.g. 40).")
+    setting_widget(st.number_input, "Repeat penalty", chat, "repeat_penalty", value=chat.get("repeat_penalty"), min_value=0.5,
+                   max_value=2.0, step=0.05, placeholder="Model default",
+                   help="Above 1 discourages repeating itself (e.g. 1.1).")
+    setting_widget(st.number_input, "Seed", chat, "seed", value=chat.get("seed"), min_value=0, step=1, placeholder="Random",
+                   help="The same seed, prompt and settings give the same reply: useful to compare models or options.")
+    st.button("Reset to defaults", icon=":material/restart_alt:", key=f"chat_reset_options_{chat['id']}",
+              on_click=reset_chat_model_options, args=(chat["id"],),
+              help="Context window Auto, thinking as the model does by default, and sampling left to the model.")
+
+
+def render_context_meter(chat: dict) -> None:
+    """How full the context window was at the last reply, with a warning before old messages drop out of view."""
+    last = next((m for m in reversed(chat["messages"]) if m["role"] == "assistant" and m.get("num_ctx")), None)
+    if not last or last.get("input_tokens") is None:
+        return
+    used = last["input_tokens"] + (last.get("output_tokens") or 0)
+    share = used / last["num_ctx"]
+    st.progress(min(share, 1.0), text=f"Context: {used:,} of {last['num_ctx']:,} tokens ({share:.0%})")
+    if share >= CONTEXT_WARN_SHARE:
+        st.warning("The context window is nearly full: as the chat grows, the model stops seeing its oldest "
+                   "messages. Choose a bigger **Context window** in **Model options**, or start a **New chat**.")
+
+
+def render_chat_title(chat: dict) -> None:
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        st.subheader(chat["title"], width="content")
+        if chat["messages"]:
+            with st.popover("Rename", icon=":material/edit:", type="tertiary"):
+                st.text_input("Title", value=chat["title"], key=f"chat_title_{chat['id']}", on_change=rename_chat,
+                              args=(f"chat_title_{chat['id']}",), max_chars=CHAT_TITLE_CHARS * 2)
+            with st.popover("Delete", icon=":material/delete:", type="tertiary"):
+                st.markdown("Delete this chat for good?")
+                st.button("Delete chat", type="primary", key=f"chat_delete_{chat['id']}", on_click=delete_open_chat)
+
+
+def arrive_with_hotkey_job() -> None:
+    """Arriving in Chat with a hotkey message being transcribed (from another page, or from Open in a new tab):
+    start a new chat for it, once."""
+    tab = st.session_state.setdefault(TAB_ID_KEY, uuid.uuid4().hex)
+    token = st.query_params.get("hotkey_job")
+    if token:  # this new tab takes the job over from the tab that opened it
+        del st.query_params["hotkey_job"]
+        job = transcription_service()["jobs"].get(token)
+        if job:
+            job["claimed"] = tab
+            st.session_state[HOTKEY_JOB_KEY] = token
+        else:
+            st.toast("That dictation was already sent or cancelled.", icon=":material/info:")
+    token = st.session_state.get(HOTKEY_JOB_KEY)
+    if token and st.session_state.get(HOTKEY_CHAT_FOR_KEY) != token:
+        st.session_state[HOTKEY_CHAT_FOR_KEY] = token
+        start_new_chat()
+        current_chat()["about_me"] = hotkey_about_me()  # the new chat (kept in the session until it's sent)
+
+
+def cancel_hotkey_job(token: str) -> None:
+    """Cancel: forget the transcription, send nothing, and go back to the page it was dictated on."""
+    transcription_service()["jobs"].pop(token, None)
+    st.session_state.pop(HOTKEY_JOB_KEY, None)
+    st.session_state[TRANSCRIPTION_CANCELLED_KEY] = True
+    leave_chat_page()
+
+
+HOTKEY_ABOUT_ME_SETTING = "hotkey_about_me"  # app setting: a hotkey chat sends About me (default on)
+
+
+def about_me_text() -> str:
+    return str(load_prompt_library()["profile"].get("text", "")).strip()
+
+
+def hotkey_about_me() -> bool:
+    """A chat started by the hotkey sends About me: on unless you switched it off (and you've written it)."""
+    return bool(load_app_settings().get(HOTKEY_ABOUT_ME_SETTING, True)) and bool(about_me_text())
+
+
+def render_about_me_toggle(widget_key: str, value: bool, on_change, help_text: str) -> None:
+    """About me, in a floating panel: shown as `value` (set before the widget, so it follows the chat)."""
+    profile = about_me_text()
+    st.session_state[widget_key] = bool(value and profile)
+    st.toggle("About me", key=widget_key, on_change=on_change, args=(widget_key,), disabled=not profile,
+              help=help_text if profile else "Write About me in the Prompt library first.")
+
+
+def set_chat_about_me(chat: dict, on: bool) -> None:
+    chat["about_me"] = on
+    st.session_state[f"chat_about_me_{chat['id']}"] = on  # the toggle above the chat
+    keep_chat(chat)
+
+
+def pick_hotkey_about_me(widget_key: str) -> None:
+    """The red bar's About me: for the chat this dictation starts, and kept for next time."""
+    save_app_settings({HOTKEY_ABOUT_ME_SETTING: bool(st.session_state.get(widget_key))})
+
+
+def pick_transcribe_about_me(widget_key: str) -> None:
+    """While the hotkey message is transcribed: this new chat's About me, and kept for next time."""
+    on = bool(st.session_state.get(widget_key))
+    save_app_settings({HOTKEY_ABOUT_ME_SETTING: on})
+    set_chat_about_me(current_chat(), on)
+
+
+def switch_reply_about_me(widget_key: str) -> None:
+    """About me changed while a reply is written: stop it and ask again, with or without About me."""
+    on = bool(st.session_state.get(widget_key))
+    chat = current_chat()
+    if on == bool(chat.get("about_me")):
+        return
+    set_chat_about_me(chat, on)
+    st.session_state[REPLY_AGAIN_KEY] = {"dictated": st.session_state.get(DICTATED_KEY)}
+
+
+def render_reply_controls(chat: dict) -> None:
+    """Beside Cancel while a reply is written: the model and About me (changing either asks again)."""
+    render_chat_model_picker("reply_model", switch_reply_model, chat["model"])
+    render_about_me_toggle("reply_about_me", bool(chat.get("about_me")), switch_reply_about_me,
+                           "Send About me with this chat. Changing it stops this reply and asks again.")
+
+
+def pick_hotkey_chat_model(widget_key: str) -> None:
+    """The model picked while a hotkey message is transcribed: this new chat's, and kept for next time."""
+    model = st.session_state.get(widget_key)
+    if not model:
+        return
+    save_app_settings({CHAT_MODEL_SETTING: model})
+    chat = current_chat()
+    chat["model"] = model
+    st.session_state[f"chat_model_{chat['id']}"] = model
+    keep_chat(chat)
+
+
+def finish_hotkey_job() -> str:
+    """In Chat: wait for the hotkey message's transcription (floating panel: model and Cancel), then return it to
+    send at once, marked as dictated. A tab opened from the red bar waits for the speech to finish first."""
+    token = st.session_state.get(HOTKEY_JOB_KEY)
+    if not token:
+        return ""
+    service = transcription_service()
+    job = service["jobs"].get(token)
+    if not job:
+        st.session_state.pop(HOTKEY_JOB_KEY, None)
+        return ""
+    panel = st.empty()
+    with panel.container(key="transcribe_panel"):
+        st.html(themed_panel_style(TRANSCRIBE_PANEL_STYLE))
+        status_slot = st.empty()
+        with st.container(horizontal=True, gap="small", vertical_alignment="center"):
+            render_chat_model_picker("transcribe_model", pick_hotkey_chat_model, current_chat()["model"],
+                                     args=("transcribe_model",))
+            render_about_me_toggle("transcribe_about_me", bool(current_chat().get("about_me")),
+                                   pick_transcribe_about_me,
+                                   "Send About me (Prompt library) with this chat. On by default for the hotkey; "
+                                   "your choice is kept for next time.")
+            st.button("Cancel", key="transcribe_cancel", icon=":material/close:", on_click=cancel_hotkey_job,
+                      args=(token,), help="Stop now: nothing is sent, and you go back to where you were.")
+    tick = st.empty()
+    shown = None
+    try:
+        while True:
+            job = service["jobs"].get(token)
+            if not job:  # cancelled in the other tab, or nothing heard there
+                st.session_state.pop(HOTKEY_JOB_KEY, None)
+                st.toast("The dictation was cancelled.", icon=":material/close:")
+                return ""
+            if job["future"] is not None and job["future"].done():
+                break
+            status = ("Listening in the other tab: pause there to send…" if job["future"] is None
+                      else "Loading the speech model (first time only), then transcribing your message…"
+                      if service["pipe"] is None else "Transcribing your message…")
+            if status != shown:
+                status_slot.markdown(f":material/graphic_eq: {status}")
+                shown = status
+            tick.empty()  # a page update, so a click takes effect here
+            time.sleep(TRANSCRIBE_TICK_SECONDS)
+    finally:
+        panel.empty()
+    st.session_state.pop(HOTKEY_JOB_KEY, None)
+    text = finish_transcription(token)
+    if text == "":
+        st.toast("Didn't catch anything there. Try again, a little closer to the mic.", icon=":material/mic_off:")
+    if not text:
+        return ""
+    st.session_state[DICTATED_KEY] = {"target": "chat", "text": text}
+    return text
+
+
+# --- Editing a sent message: before its reply is in, in place (the reply is stopped and asked again); once it's
+# in, as an indented Edited prompt version under the reply (Edit question).
+CHAT_EDITING_KEY = "chat_editing_message"  # {"chat", "index"}: a sent message being fixed in place
+
+
+def edit_chat_message(chat_id: str, index: int, answered: bool) -> None:
+    if answered:
+        st.session_state[f"chat_voice_{chat_id}_{index + 1}_editing"] = True
+    else:  # this click also stopped the reply being written
+        st.session_state[CHAT_EDITING_KEY] = {"chat": chat_id, "index": index}
+
+
+def cancel_message_edit() -> None:
+    st.session_state.pop(CHAT_EDITING_KEY, None)
+
+
+def save_edited_message(chat_id: str, index: int) -> None:
+    """Send the fixed message in place of the original, and ask for its reply."""
+    text = str(st.session_state.get(f"chat_edit_text_{chat_id}_{index}") or "").strip()
+    st.session_state.pop(CHAT_EDITING_KEY, None)
+    chat = current_chat()
+    if not text or chat["id"] != chat_id or index != len(chat["messages"]) - 1:
+        return
+    message = chat["messages"][index]
+    message.update(content=text, edited=True)
+    if index == 0 and chat.get("titled") and chat.get("title") != IN_CONFIDENCE_TITLE:
+        chat["title"] = truncate_text(" ".join(text.split()), CHAT_TITLE_CHARS)
+    keep_chat(chat)
+    st.session_state[REPLY_AGAIN_KEY] = {"dictated": {"target": "chat", "text": text} if message.get("dictated")
+                                         else None}
+
+
+def render_user_message(chat: dict, index: int) -> None:
+    """Your message, with Edit; or, while you fix it in place, the editor."""
+    message = chat["messages"][index]
+    editing = st.session_state.get(CHAT_EDITING_KEY) or {}
+    if editing.get("chat") == chat["id"] and editing.get("index") == index:
+        with st.form(f"chat_edit_form_{chat['id']}_{index}", border=False):
+            st.text_area("Your message", value=message["content"], key=f"chat_edit_text_{chat['id']}_{index}",
+                         label_visibility="collapsed")
+            with st.container(horizontal=True, gap="small"):
+                st.form_submit_button("Send", type="primary", icon=":material/send:", on_click=save_edited_message,
+                                      args=(chat["id"], index))
+                st.form_submit_button("Cancel", on_click=cancel_message_edit)
+        return
+    st.markdown(message["content"])
+    answered = index + 1 < len(chat["messages"]) and chat["messages"][index + 1]["role"] == "assistant"
+    last = index == len(chat["messages"]) - 1
+    with st.container(horizontal=True, gap="small"):
+        if answered or last:
+            st.button("Edit", key=f"chat_edit_{chat['id']}_{index}", type="tertiary", icon=":material/edit:",
+                      on_click=edit_chat_message, args=(chat["id"], index, answered),
+                      help="Fix this message. Its reply is asked again with the new wording, indented under the "
+                           "reply as *Edited prompt*." if answered else
+                      "Fix this message: the reply being written is stopped, and asked again when you send it.")
+        if not is_in_confidence(chat):
+            st.button("Push to notes as question", key=f"chat_push_{chat['id']}_{index}", type="tertiary",
+                      icon=":material/travel_explore:", on_click=push_to_notes, args=(chat["id"], index),
+                      help="Meant for your notes? Run this message as a **Oneshot search** on the search page (no "
+                           "check first): it's put in the Oneshot box, the notes are found, and asked your question. "
+                           "**Back to chat** returns here.")
+
+
+def push_to_notes(chat_id: str, index: int) -> None:
+    """Push to notes as question: a Chat message the notes check missed, run as a Oneshot search (no check)."""
+    chat = current_chat()
+    if chat["id"] != chat_id or index >= len(chat["messages"]) or is_in_confidence(chat):
+        return
+    message = chat["messages"][index]
+    chat["messages"].append({"role": "assistant", "content": "Pushed to your notes as a question (Oneshot search).",
+                             "notes_search": True, "model": chat["model"], "at": now_iso()})
+    keep_chat(chat)
+    st.session_state[ONESHOT_PENDING_KEY] = {"text": message["content"], "dictated": bool(message.get("dictated")),
+                                             "chat": chat["id"]}
+    st.session_state.pop(CHAT_EDITING_KEY, None)
+    st.query_params.clear()  # the search page
+
+
+# --- Notes searches from Chat ---------------------------------------------------
+# A Chat message that asks about your notes ("search my notes for…", "what did we agree with Acme last week?")
+# moves to the search page: the local model reads the filters out of it, they're filled in, and the search runs.
+NOTES_SEARCH_SETTING = "chat_notes_search"  # app setting: send notes questions from Chat to search (default on)
+NOTES_SEARCH_KEY = "notes_search_from_chat"  # the plan read from a Chat message, applied once on the search page
+AUTO_SEARCH_KEY = "auto_search"  # "search", "filter" or "find": the search page presses it once
+NOTES_SEARCH_PHRASES = re.compile(  # a dictated message that's clearly about your notes: no need to ask the model
+    r"\b(search|find|look|check|scan|dig|go)\b[^.?!]{0,40}\b(my|our)\s+(notes|corpus|librar(y|ies))\b"
+    r"|\b(in|from|across|through)\s+(my|our)\s+notes\b"
+    r"|\b(search|find|list|show|summari[sz]e)\s+(the\s+|all\s+|any\s+|my\s+|our\s+)?notes\b"
+    r"|\bmy\s+notes\b"
+    r"|\b(did|have|had)\s+(i|we)\s+(mention|write|wr[io]te|note|say|said|discuss|agree|decide)\w*"
+    r"|\bwhat\s+(i|we)\s+(wrote|said|noted|mentioned|agreed|decided|discussed)\b"
+    r"|\bwhat\s+do\s+(i|we)\s+(know|have)\s+(about|on)\b"
+    r"|^\s*(please\s+)?(search|look\s+up)\b"
+    r"|\brag\b",
+    re.IGNORECASE,
+)
+# Carrying on the chat ('make that shorter', 'translate this'): never a notes search, so no need to ask the model.
+CHAT_FOLLOW_UP = re.compile(
+    r"^\s*(please\s+)?(make|turn|translate|rewrite|reword|shorten|expand|simplify|summari[sz]e|explain|continue|redo|"
+    r"try)\b[^.?!]{0,40}\b(that|this|it|above|again|more|shorter|longer)\b",
+    re.IGNORECASE,
+)
+NOTES_CHECK_PROMPT = """You route messages in a notes app. The user's own notes (their meetings, tasks, decisions, people they work with, customers, projects, and what they or their team said, wrote, noted or did) can be searched. Decide whether answering the message needs those notes.
+
+needs_notes true:
+- asks about what the user or their team said, wrote, noted, mentioned, agreed, decided or did, or about a specific meeting, call, colleague, customer, project, deal, action, owner, date or deadline of theirs ('who owns the actions from Monday's call?', 'check what Sam said about the budget')
+- asks to search, find, look up, check, list or summarise something, a topic, or their notes ('search for side car', 'look up the heat pump', 'what do I know about side cars', 'where did I mention the pilot?', 'when is the Acme renewal due?')
+
+needs_notes false:
+- general knowledge, explanations, how-to for tools or software ('how do I use git rebase?'), maths, recipes, chit-chat
+- writing, drafting or translating text (an email, a post, a message), unless it asks to use what's in their notes
+- carrying on the chat itself: changing, shortening or translating a previous reply ('make that shorter', 'translate this')"""
+NOTES_CHECK_SCHEMA = {"type": "object", "properties": {"needs_notes": {"type": "boolean"}}, "required": ["needs_notes"]}
+RAG_CHECK_PROMPT_SETTING = "rag_check_prompt"  # app settings: your own wording (empty = the default below)
+RAG_SEARCH_PROMPT_SETTING = "rag_search_prompt"
+DEFAULT_RAG_SEARCH_PROMPT = """The user wants their own notes (meetings, tasks, people, customers, decisions) searched in an app that works in two steps: first it FINDS notes, then an LLM reads every note found and does the user's INTENT with them. Split the message into the two.
+Where a plural is provided, search for the singular, for example 'side-cars' would be 'side-car'
+
+FIND - which notes:
+- route: 'literal' when the topic's words or names will be written in the notes (names, products, codes, rare words); 'semantic' for a broad theme the notes may describe in other words.
+- must_include, any_of, exclude: filter terms. Each term is matched literally, ignoring case, anywhere in a note's text or file name ('side' also matches 'sideline'). must_include: every term must appear; use the key words of the topic, one word each unless the user quoted a phrase. any_of: only alternatives the user gave ('pilot or trial'). exclude: only what the user said to leave out. Never use words that describe the request (notes, projects, decisions, meetings, corpus, RAG, search, find, about) or words of the intent ('missed deadlines' is for the LLM, not a filter). 1 to 3 terms; each extra must_include term narrows the results.
+- Spellings: a word that can be written as one word, two words or hyphenated ('heat pump', 'heatpump', 'heat-pump'; 'follow up', 'follow-up', 'followup') goes in any_of with every spelling, so a note using any of them is found; leave its words out of must_include.
+- about: the topic in a few plain, common nouns, as a note would describe it ('home heating', not only a product name like 'ThermaCore'). It's used to find notes by meaning (straight away on a semantic route, or if the terms find none), and a meaning search matches common nouns far better than names, codes or unusual spellings; keep those for the literal terms.
+- dates: only when the message names a relative period (today, this week, last month...).
+- date_terms: calendar dates the message names, written as notes date them: a month as 2024-12, a day as 2024-12-05, a year as 2024. 'from December 2024' -> [2024-12].
+
+INTENT - what to do with the notes found: the question or task for the LLM, in the user's words. Empty when the user only wants the notes found or listed.
+
+Examples:
+'search my notes for mentions of the side car and find details about missed deadlines' -> route literal, any_of [side car, side-car, sidecar], about 'side car', intent 'find details about missed deadlines'.
+'search notes in whole corpus about the side car' -> route literal, any_of [side car, side-car, sidecar], about 'side car', intent ''.
+'find notes that mention pilot or trial but not draft' -> route literal, any_of [pilot, trial], exclude [draft], about 'pilot or trial', intent ''.
+'what did we agree with Acme last week?' -> route literal, must_include [Acme], dates [last_week], about 'Acme', intent 'what did we agree with Acme last week?'.
+'summarise our discussions about hiring' -> route semantic, about 'hiring', intent 'summarise our discussions about hiring'.
+'find notes about the heat pump install and list the costs' -> route literal, any_of [heat pump, heatpump, heat-pump], about 'home heating install', intent 'list the costs'."""
+
+
+def rag_prompt(setting: str, default: str) -> str:
+    """Your wording for a RAG prompt from the Prompt library, or the default."""
+    return str(load_app_settings().get(setting) or "").strip() or default
+NOTES_SEARCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "route": {"type": "string", "enum": ["semantic", "literal"]},
+        "about": {"type": "string"},
+        "intent": {"type": "string"},
+        "must_include": {"type": "array", "items": {"type": "string"}},
+        "any_of": {"type": "array", "items": {"type": "string"}},
+        "exclude": {"type": "array", "items": {"type": "string"}},
+        "dates": {"type": "array", "items": {"type": "string", "enum": list(QUICK_DATE_LABELS)}},
+        "date_terms": {"type": "array", "items": {"type": "string"}},
+        "library": {"type": "string"},
+    },
+    "required": ["route", "about", "intent", "must_include", "any_of", "exclude", "dates",
+                 "library"],
+}
+
+
+RAG_SELECTOR_SETTING = "rag_selector_model"  # app setting: the model that spots notes questions and reads their
+# filters; empty means the chat's own model
+REQUEST_WORDS = {  # words that describe the request, not what's written in a note: never filter terms
+    "note", "notes", "rag", "corpus", "library", "libraries", "search", "searches", "find", "look", "list", "show",
+    "my", "our", "the", "a", "an", "about", "on", "for", "in", "of", "whole", "all", "everything", "any", "some",
+    "project", "projects", "decision", "decisions", "meeting", "meetings", "record", "records", "mention",
+    "mentions", "mentioning", "containing", "contains", "info", "information", "stuff", "things",
+    # periods: the dates field covers them
+    "this", "last", "next", "week", "weeks", "month", "months", "today", "yesterday", "tomorrow", "recent",
+    "recently", "ago", "from", "where", "was", "were", "discussed", "notebook", "notebooks", "folder",
+    "or", "and", "but", "not", "with", "without", "that", "which", "who", "what", "to", "by", "at", "is", "are",
+    "use", "using", "semantic", "semantically", "meaning", "similar", "related",
+}
+SEMANTIC_ASKED = re.compile(r"\b(semantic\w*|by meaning|by its meaning|similar to|related to|anything like)\b",
+                            re.IGNORECASE)
+DATE_WORDS = re.compile(r"\b(today|yesterday|week|month)\b", re.IGNORECASE)
+
+
+def rag_selector_model(chat_model: str) -> str:
+    return load_app_settings().get(RAG_SELECTOR_SETTING) or chat_model
+
+
+def render_rag_selector_model(widget_key: str) -> None:
+    """Configure: the model that decides whether a Chat message is a notes search, and reads its filters."""
+    saved = load_app_settings().get(RAG_SELECTOR_SETTING) or ""
+    options = ["", *installed_model_names()]
+    if saved not in options:
+        options.append(saved)
+    st.selectbox("RAG selector model", options, index=options.index(saved), key=widget_key,
+                 format_func=lambda m: m or "Same as the chat's model",
+                 on_change=lambda: save_app_settings({RAG_SELECTOR_SETTING: st.session_state.get(widget_key) or ""}),
+                 help="Decides whether a Chat message needs your notes, and reads the library, route, filter terms and "
+                      "dates out of it. A small, fast model (e.g. llama3.2:3b) keeps Chat quick even when you chat "
+                      "with a big one.")
+
+
+def notes_search_enabled() -> bool:
+    return bool(load_app_settings().get(NOTES_SEARCH_SETTING, True))
+
+
+def notes_libraries() -> list[str]:
+    """The libraries a notes search can name (visible library folders)."""
+    root = load_corpus_root_path()
+    if not root or not root.is_dir():
+        return []
+    names = sorted(d.name for d in root.iterdir() if d.is_dir())
+    return filter_libraries_for_display(names) or names
+
+
+def ollama_json(model: str, messages: list[dict], schema: dict, timeout: int = 120) -> dict | None:
+    """One quick, non-streamed Ollama call that must answer in `schema`'s JSON; None if it can't."""
+    import requests
+
+    try:
+        response = requests.post(
+            f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/chat",
+            json={"model": model, "messages": messages, "stream": False, "format": schema,
+                  "options": {"temperature": 0}},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        content = (response.json().get("message") or {}).get("content") or ""
+        return json.loads(split_inline_thinking(content)[1] or "{}")
+    except Exception:
+        return None
+
+
+def read_notes_search(text: str, model: str, force: bool = False) -> dict | None:
+    """If a Chat message is about your notes, the search it asks for (cleaned up), else None. A clear phrase
+    ("search my notes") always counts; otherwise the model decides."""
+    if not force and not NOTES_SEARCH_PHRASES.search(text):  # no clear phrase: a quick yes/no from the model first
+        if CHAT_FOLLOW_UP.search(text):
+            return None
+        verdict = ollama_json(model, [{"role": "system", "content": rag_prompt(RAG_CHECK_PROMPT_SETTING,
+                                                                               NOTES_CHECK_PROMPT)},
+                                      {"role": "user", "content": text}], NOTES_CHECK_SCHEMA, timeout=60)
+        if not (verdict or {}).get("needs_notes"):
+            return None
+    libraries = notes_libraries()
+    today = datetime.date.today()
+    system = (
+        rag_prompt(RAG_SEARCH_PROMPT_SETTING, DEFAULT_RAG_SEARCH_PROMPT)
+        + f"\n\nDates you can use: {', '.join(QUICK_DATE_LABELS)} (today is {today:%A %d %B %Y})."
+        + "\nlibrary: one of [" + ", ".join(libraries) + "] only if the message names it, else '' (also for "
+        "'whole corpus' or 'all notes')."
+    )
+    data = ollama_json(model, [{"role": "system", "content": system}, {"role": "user", "content": text}],
+                       NOTES_SEARCH_SCHEMA)
+    data = data or {}
+    terms = tidy_notes_terms(data, text)
+
+    def library_named() -> str | None:
+        named = str(data.get("library") or "").strip().lower()
+        return next((name for name in libraries if name.lower() == named and name.lower() in text.lower()), None)
+
+    intent = str(data.get("intent") or "").strip()
+    about = str(data.get("about") or "").strip()
+    # Words only the intent uses ('missed deadlines') aren't filter terms: the LLM looks for them in the notes found.
+    intent_only = {w.lower() for w in re.findall(r"\w+", intent)} - {w.lower() for w in re.findall(r"\w+", about)}
+    for field in ("all", "any"):
+        kept = [t for t in terms[field] if not {w.lower() for w in t.split()} <= intent_only]
+        if kept or field == "any":
+            terms[field] = kept
+    # Calendar dates the message names: "December 2024" is 2024-12, matched literally like the quick dates.
+    calendar = [t for t in dict.fromkeys(str(d).strip() for d in data.get("date_terms") or [])
+                if re.fullmatch(r"(19|20)\d\d(-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?)?", t)
+                and t[:4] in text]
+    month_names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    for month, year in re.findall(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s+((?:19|20)\d\d)\b",
+                                  text, re.IGNORECASE):  # "December 2024" written out: the app reads it too
+        calendar.append(f"{year}-{month_names.index(month.lower()) + 1:02d}")
+    calendar = [t for t in dict.fromkeys(calendar) if not any(o != t and o.startswith(t) for o in calendar)][:4]
+    if calendar:  # the month name or year as a word is now covered by the date
+        months = {m.lower() for m in ("January February March April May June July August September October November "
+                                      "December Jan Feb Mar Apr Jun Jul Aug Sep Sept Oct Nov Dec").split()}
+        for field in ("all", "any"):
+            terms[field] = [t for t in terms[field] if t.lower() not in months and t not in {c[:4] for c in calendar}]
+        terms["all" if len(calendar) == 1 else "any"] += calendar
+    # Only a period the message names (small models copy the prompt's example otherwise).
+    dates = [d for d in dict.fromkeys(data.get("dates") or []) if d in QUICK_DATE_LABELS] if DATE_WORDS.search(text) else []
+    if len(dates) == 1:
+        terms["all"] += quick_date_terms(dates[0], today, "all")
+    elif dates:
+        terms["any"] += [t for d in dates for t in quick_date_terms(d, today, "any")]
+    asks = bool(re.match(r"\s*(what|who|whom|when|why|how|which|where|did|do|does|is|are|was|were|has|have|can|could|"
+                         r"should|summari[sz]e|tell)\b", text, re.IGNORECASE))
+    if asks and not intent:  # a question asked straight out is the intent, in your words
+        intent = text.strip()
+    about = about or " ".join(terms["all"] + terms["any"]) or intent or text.strip()
+    words = [t for t in terms["all"] + terms["any"] if not QUICK_DATE_TERM.match(str(t))]
+    topic = [w for w in re.findall(r"[\w'-]+", about) if w.lower() not in REQUEST_WORDS]
+    if SEMANTIC_ASKED.search(text):  # you asked for meaning: no exact-words step, and the topic isn't a filter word
+        topic_words = {w.lower() for w in topic}
+        topic_key = spelling_key(" ".join(topic))
+        for field in ("all", "any"):
+            terms[field] = [t for t in terms[field] if t.lower() not in topic_words and spelling_key(t) != topic_key
+                            and not {p.lower() for p in re.split(r"[\s-]+", t)} <= topic_words]
+        return {"kind": "answer" if intent else "list", "route": "semantic", "question": intent, "intent": intent,
+                "about": " ".join(topic) or about, "filter": terms, "library": library_named(), "message": text}
+    if not words and 1 <= len(topic) <= 3:  # a short topic: find its words first, by meaning only if none match
+        terms["all"] = clean_filter_terms(topic + terms["all"])
+        words = topic
+        data["route"] = "literal"
+    if data.get("route") == "literal" or words:
+        # On a literal search the topic's own words (a short topic) must appear too: "where pricing was discussed".
+        extra = [w for w in topic if w.lower() not in {t.lower() for t in terms["all"] + terms["any"]}] \
+            if len(topic) <= 3 and not terms["any"] and not intent_only.issuperset(w.lower() for w in topic) else []
+        terms["all"] = clean_filter_terms(terms["all"] + extra)
+    exact = re.search(r"\b(mention\w*|contain\w*|with the words?|exact\w*|literal\w*)\b", text, re.IGNORECASE)
+    # Literal needs words to match (dates alone narrow a semantic search); "mentions X" means those exact words.
+    route = "literal" if words and (data.get("route") == "literal" or exact) else "semantic"
+    library = library_named()
+    return {"kind": "answer" if intent else "list", "route": route, "question": intent, "intent": intent,
+            "about": about, "filter": terms, "library": library, "message": text}
+
+
+def compound_spellings(term: str) -> list[str]:
+    """'heat pump', 'heat-pump' or 'heat pumps' -> ['heat pump', 'heat-pump', 'heatpump'] (singular: the
+    literal match is a substring, so 'heat pump' also finds 'heat pumps'). Other terms: just themselves."""
+    parts = [p for p in re.split(r"[\s-]+", str(term).strip()) if p]
+    if not 2 <= len(parts) <= 3 or not all(p.isalpha() for p in parts):
+        return [str(term).strip()]
+    last = parts[-1]
+    if len(last) > 3 and last.lower().endswith("s") and not last.lower().endswith(("ss", "us", "is")):
+        parts[-1] = last[:-1]
+    return [" ".join(parts), "-".join(parts), "".join(parts)]
+
+
+def spelling_key(term: str) -> str:
+    """One key for every spelling of a word: 'Side-cars', 'side car' and 'sidecar' -> 'sidecar'."""
+    return compound_spellings(term)[-1].lower()
+
+
+def tidy_notes_terms(data: dict, text: str) -> dict:
+    """The model's filter terms, tidied: words describing the request dropped ('side car notes' -> 'side car'), an
+    unquoted phrase in Must include split into its words, and Any of alternatives that only repeat Must include
+    dropped. Small models pad terms; the literal filter needs the words actually written in the notes."""
+    quoted = {q.lower() for q in re.findall(r"[\"“”']([^\"“”']{2,60})[\"“”']", text)}
+
+    def strip(term: str) -> str:
+        words = [w for w in re.split(r"\s+", str(term).strip()) if w and w.lower() not in REQUEST_WORDS]
+        return " ".join(words)
+
+    must: list[str] = []
+    for term in data.get("must_include") or []:
+        cleaned = strip(term)
+        if not cleaned:
+            continue
+        must += [cleaned] if cleaned.lower() in quoted or " " not in cleaned else cleaned.split()
+    must = clean_filter_terms(must)[:5]
+    raw_any = [t for t in clean_filter_terms(strip(t) for t in data.get("any_of") or []) if t]
+    # A word with several spellings ('heat pump' / 'heatpump' / 'heat-pump'): all of them, as alternatives.
+    # Hyphenated in the message, or spelled more than one way by the model: its words leave Must include.
+    hyphenated = {spelling_key(w) for w in re.findall(r"\b[A-Za-z]+(?:-[A-Za-z]+){1,2}\b", text)}
+    keys = [spelling_key(t) for t in raw_any]
+    compounds = {k for k in keys if keys.count(k) > 1 or k in hyphenated}
+    compounds |= {spelling_key(t) for t in must if spelling_key(t) in hyphenated}
+    must_lower = {t.lower() for t in must}
+    compounds |= {spelling_key(t) for t in raw_any if len(compound_spellings(t)) > 1  # 'side-car' beside side, car
+                  and {p.lower() for p in re.split(r"[\s-]+", t)} <= must_lower}
+    spelled: list[str] = []
+    if compounds and all(spelling_key(t) in compounds for t in raw_any):  # only spellings in Any of (one OR group)
+        parts_of = {k: {p.lower() for t in raw_any + must if spelling_key(t) == k for p in re.split(r"[\s-]+", t)}
+                    for k in compounds}
+        for key in compounds:
+            source = next(t for t in raw_any + must if spelling_key(t) == key and re.search(r"[\s-]", t))
+            spelled += compound_spellings(source)
+        covered = set(compounds) | {p for parts in parts_of.values() for p in parts}
+        must = [t for t in must if spelling_key(t) not in covered and t.lower() not in covered]
+        raw_any = []
+    must_words = {w.lower() for t in must for w in t.split()}
+    any_of = clean_filter_terms(spelled + [t for t in raw_any if not {w.lower() for w in t.split()} <= must_words])[:8]
+    # Exclude only what you said to leave out (small models put the intent's words here: 'list the costs').
+    negated = re.search(r"\b(not|without|except|excluding|exclude|ignore|ignoring|leave out|other than|no)\b", text,
+                        re.IGNORECASE)
+    none = [t for t in clean_filter_terms(strip(t) for t in data.get("exclude") or [])
+            if t and negated and t.lower() in text.lower()][:8]
+    return {"all": must, "any": any_of, "none": none}
+
+
+def describe_notes_search(plan: dict) -> str:
+    """'Find: Literal · Single Corpus · `side car` OR `side-car` OR `sidecar` → Ask: “find details about missed deadlines”'."""
+    where = plan["library"] or "Single Corpus"
+    terms = describe_search_filter(plan["filter"]) if is_filter_active(plan["filter"]) else ""
+    find = f"Find: {plan['route'].capitalize()} · {where} · " + (
+        terms if plan["route"] == "literal" else f"“{truncate_text(plan['about'], 50)}”" + (f" within {terms}" if terms else ""))
+    return find + (f" → Ask: “{truncate_text(plan['intent'], 80)}”" if plan.get("intent") else " → list the notes")
+
+
+def apply_notes_search(plan: dict) -> None:
+    """On the search page, before its widgets: choose the library, route and filter, start afresh (no notes in
+    scope, no exclusions, no answer) and queue the first step: find the notes."""
+    if plan["library"] or library_indexed_at(SINGLE_CORPUS_LIBRARY_NAME) is None and notes_libraries():
+        library = plan["library"] or load_last_selected_library() or notes_libraries()[0]
+        st.session_state["corpus_mode_toggle"] = CORPUS_MODE_MULTI
+        st.session_state["selected_library"] = library
+        save_app_settings({"corpus_mode": CORPUS_MODE_MULTI, "last_selected_library": library})
+        plan["library"] = library
+    else:
+        st.session_state["corpus_mode_toggle"] = CORPUS_MODE_SINGLE
+        save_app_settings({"corpus_mode": CORPUS_MODE_SINGLE})
+    st.session_state["search_route"] = plan["route"]
+    save_app_settings({"exact_text_only": plan["route"] == "literal"})
+    for field in SEARCH_FILTER_FIELDS:
+        st.session_state[f"filter_{field}"] = list(plan["filter"].get(field, []))
+        st.session_state[f"searched_dates_{field}"] = []
+    persist_search_filter()
+    st.session_state["question_text"] = plan.get("intent") or ""
+    persist_question()
+    st.session_state["find_notes_query"] = plan["about"]
+    if plan.get("source") == "oneshot" and plan.get("message"):  # shown in the Oneshot box, as if typed there
+        st.session_state["oneshot_text"] = plan["message"]
+    clear_gathered_notes()
+    clear_excluded_notes()
+    st.session_state.pop(LAST_SEARCH_KEY, None)
+    first = "filter" if plan["route"] == "literal" else "find"
+    st.session_state[AUTO_SEARCH_KEY] = first
+    if plan.get("source") == "oneshot" and not plan.get("dictated"):  # its own choice, off unless you turned it on
+        read = bool(load_app_settings().get(ONESHOT_READ_SETTING, False)) and shutil.which("say") is not None
+    else:
+        read = bool(plan.get("dictated")) and bool(load_app_settings().get(NOTES_READ_SETTING, True)) \
+            and shutil.which("say") is not None
+    st.session_state["notes_run_read"] = read
+    st.session_state[NOTES_RUN_KEY] = {
+        "read": read, "plan": plan, "stage": "finding", "auto": first, "step_done": False, "at": time.time(), "own": time.time(),
+        "log": [f"Finding notes ({plan['route'].capitalize()}, {plan['library'] or 'Single Corpus'})"],
+        "warnings": [], "chip": False,
+    }
+
+
+NOTES_RUN_KEY = "notes_run"  # the run a Chat message started: stage, log, warnings, its answer job
+NOTES_READ_SETTING = "notes_read_answer"  # app setting: read a dictated question's answer aloud (default on)
+ONESHOT_READ_SETTING = "oneshot_read_answer"  # app setting: read a Oneshot search's answer aloud (default off)
+ONESHOT_PENDING_KEY = "oneshot_pending"  # the Oneshot text to read into a search at the top of the next run
+NOTES_RUN_RETRY_SECONDS = 4  # a step a click interrupted is pressed again after this long
+
+
+@st.cache_resource(show_spinner=False)
+def background_answers() -> dict:
+    """Answers written on worker threads, by token, so clicking around the page doesn't stop them."""
+    return {}
+
+
+def stream_answer(job: dict, messages: list[dict], model: str, max_tokens: int, temperature: float) -> None:
+    """Worker thread: stream an Ollama answer into `job` (text, tokens, then answer and usage, or error)."""
+    import requests
+
+    options = {"num_predict": max_tokens, "temperature": temperature,
+               "num_ctx": context_window_for(messages, max_tokens)}
+    started = time.monotonic()
+    first = None
+    try:
+        with requests.post(f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/chat", stream=True, timeout=(10, 900),
+                           json={"model": model, "messages": messages, "stream": True, "options": options}) as response:
+            response.raise_for_status()
+            data = {}
+            for line in response.iter_lines():
+                if job["cancel"].is_set():
+                    job["error"] = "Stopped."
+                    return
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                message = chunk.get("message") or {}
+                piece = message.get("content") or ""
+                if message.get("thinking"):
+                    job["thinking"] = job.get("thinking", 0) + 1
+                if piece:
+                    first = first or time.monotonic()
+                    job["text"] += piece
+                    job["tokens"] += 1
+                    job["rate"] = job["tokens"] / max(time.monotonic() - first, 0.001)
+                if chunk.get("done"):
+                    data = chunk
+                    break
+        answer = re.sub(r"<think>.*?</think>", "", job["text"], flags=re.DOTALL).strip()
+        if not answer and job.get("thinking"):
+            raise RuntimeError(f"`{model}` used its whole token budget thinking (**Max tokens** {max_tokens:,}) and "
+                               "gave no answer: raise Max tokens (Ollama model details, in the Ask box) and ask again.")
+        if not answer:
+            raise RuntimeError(f"`{model}` returned an empty answer.")
+        out, prompt = int(data.get("eval_count") or 0), int(data.get("prompt_eval_count") or 0)
+        job["usage"] = {
+            "input": prompt, "output": out, "total": prompt + out, "metric": "tokens",
+            "processing_time": (data["total_duration"] / 1e9) if data.get("total_duration") else time.monotonic() - started,
+            "tokens_per_second": (out / (data["eval_duration"] / 1e9)) if data.get("eval_duration") else None,
+            "num_ctx": options["num_ctx"], "done_reason": data.get("done_reason"),
+        }
+        job["answer"] = answer
+    except Exception as exc:
+        job["error"] = str(exc) if not job["cancel"].is_set() else "Stopped."
+    finally:
+        job["done"] = True
+
+
+def start_background_answer(search_state: dict, question: str, results: list, model: str, max_tokens: int,
+                            temperature: float, corpus_prompt: str, task_prompt: str,
+                            notes_chars: int | None = None) -> None:
+    """The run's answer, written on a worker thread; the page shows it when it's done."""
+    full_prompt = build_llm_prompt(question, results, max_tokens, temperature, corpus_prompt, task_prompt, notes_chars)
+    token = uuid.uuid4().hex
+    job = {"text": "", "tokens": 0, "rate": None, "done": False, "answer": None, "usage": None, "error": None,
+           "cancel": threading.Event(), "model": model, "max_tokens": max_tokens,
+           "narrated": bool(read_aloud_instruction("ask")),
+           "read_aloud": (st.session_state.get(DICTATED_KEY) or {}).get("target") == "ask" and wants_read_aloud()}
+    background_answers()[token] = job
+    threading.Thread(target=stream_answer, args=(job, [{"role": "user", "content": full_prompt}], model, max_tokens,
+                                                 temperature), daemon=True).start()
+    search_state["answer_pending"] = token
+
+
+def start_listening_rewrite(run: dict, answer: str, model: str) -> None:
+    """The run's second step: rewrite the answer for listening on a worker thread (as Narrate does)."""
+    token = uuid.uuid4().hex
+    job = {"text": "", "tokens": 0, "rate": None, "done": False, "answer": None, "usage": None, "error": None,
+           "cancel": threading.Event(), "model": model, "max_tokens": max(1024, len(answer) // 2)}
+    background_answers()[token] = job
+    threading.Thread(target=stream_answer, args=(job, listening_rewrite_messages(answer), model, job["max_tokens"],
+                                                 0.3), daemon=True).start()
+    run["narrate_job"] = token
+    run["log"].append("Rewriting the answer for listening")
+
+
+def set_notes_run_read() -> None:
+    """Read the answer to me: for this run, and remembered for dictated questions."""
+    run = st.session_state.get(NOTES_RUN_KEY)
+    read = bool(st.session_state.get("notes_run_read"))
+    if run:
+        run["read"] = read
+        if run["plan"].get("source") == "oneshot" and not run["plan"].get("dictated"):
+            save_app_settings({ONESHOT_READ_SETTING: read})
+        elif run["plan"].get("dictated"):
+            save_app_settings({NOTES_READ_SETTING: read})
+
+
+def notes_run_answering() -> bool:
+    run = st.session_state.get(NOTES_RUN_KEY) or {}
+    return run.get("stage") == "answering"
+
+
+def notes_run_step_done(found: int | None = None) -> None:
+    """End of a search the run pressed: the panel moves on from here."""
+    run = st.session_state.get(NOTES_RUN_KEY)
+    if run and not st.session_state.get(AUTO_SEARCH_KEY):
+        run["step_done"] = True
+        run["own"] = time.time()  # the page's own rerun after a search isn't you clicking
+
+
+def stop_notes_run(note: str | None = None) -> None:
+    """Cancel: stop the answer being written, and any step still to press."""
+    run = st.session_state.pop(NOTES_RUN_KEY, None)
+    st.session_state.pop(AUTO_SEARCH_KEY, None)
+    rewrite = background_answers().pop((run or {}).get("narrate_job"), None)
+    if rewrite:
+        rewrite["cancel"].set()
+    last = st.session_state.get(LAST_SEARCH_KEY) or {}
+    token = last.pop("answer_pending", None)
+    job = background_answers().pop(token, None) if token else None
+    if job:
+        job["cancel"].set()
+        last["answer_error"] = "Stopped before the answer was finished."
+    if run and note:
+        st.toast(note, icon=":material/stop_circle:")
+
+
+def apply_notes_run_step() -> None:
+    """Top of the search page, before its widgets: carry out the step the panel queued (fields to set, the button
+    to press), and notice when you've clicked on the page yourself (the panel shrinks to a chip)."""
+    run = st.session_state.get(NOTES_RUN_KEY)
+    if not run:
+        return
+    if time.time() - (run.pop("own", 0) or 0) > 1.5:  # not the app's own rerun just now: you clicked on the page
+        run["chip"] = True
+    step = run.pop("next", None)
+    if step:
+        for key, value in step.get("state", {}).items():
+            if st.session_state.get(key) != value:  # only what changes (no widget-default warnings)
+                st.session_state[key] = value
+        if "search_route" in step.get("state", {}):
+            save_app_settings({"exact_text_only": step["state"]["search_route"] == "literal"})
+        if "question_text" in step.get("state", {}):
+            persist_question()
+        st.session_state[AUTO_SEARCH_KEY] = step["auto"]
+        run.update(auto=step["auto"], step_done=False, at=time.time())
+
+
+def queue_notes_run_step(run: dict, auto: str, state: dict, stage: str, log: str, dictated: bool = False) -> None:
+    run.update(stage=stage, own=time.time(), next={"auto": auto, "state": state, "dictated": dictated})
+    run["log"].append(log)
+    st.rerun()
+
+
+def advance_notes_run(run: dict, safe_lib: str) -> None:
+    """Move the run on: found notes → ask the intent; none by exact words → try by meaning; none at all → say so."""
+    plan = run["plan"]
+    if run["stage"] in ("finding", "retrying", "answering") and not run["step_done"]:  # (not narrating)
+        if not st.session_state.get(AUTO_SEARCH_KEY) and not run.get("next") \
+                and time.time() - run["at"] > NOTES_RUN_RETRY_SECONDS and not st.session_state.get(LAST_SEARCH_KEY, {}).get("answer_pending"):
+            run["retries"] = run.get("retries", 0) + 1
+            if run["retries"] > 2:  # pressed but never finished: carry on as if it found nothing
+                run["step_done"] = True
+            else:
+                queue_notes_run_step(run, run["auto"], {}, run["stage"], "Interrupted by a click: carrying on")
+        return
+    if run["stage"] in ("finding", "retrying"):
+        gathered = gathered_notes(safe_lib)
+        count = len(kept_gathered_notes(gathered)) if gathered else 0
+        if count:
+            run["log"].append(f"Found {count} note{'' if count == 1 else 's'}: all kept in scope")
+            if not plan.get("intent"):
+                run.update(stage="done", finished=time.time())
+                return
+            config = get_corpus_config(safe_lib)
+            budget = notes_budget(safe_lib, config.get("ollama_model") or DEFAULT_OLLAMA_MODEL,
+                                  int(config.get("llm_max_tokens") or 512))
+            share = budget // count
+            if count > 1 and share < 800:
+                run["warnings"].append(
+                    f"{count} notes share the LLM's {budget:,}-character notes budget, about {share:,} characters "
+                    "each, so long notes are trimmed. Narrow the search (more exact words, a date), or raise "
+                    "**Notes budget** in **Ollama model details**, for fuller answers.")
+            queue_notes_run_step(run, "scope", {"question_text": plan["intent"], "use_llm_answer": True},
+                                 "answering", f"Asking: “{truncate_text(plan['intent'], 70)}”", plan.get("dictated"))
+        elif run["stage"] == "finding" and plan["route"] == "literal":
+            queue_notes_run_step(run, "find", {"search_route": "semantic", "find_notes_query": plan["about"]},
+                                 "retrying", f"No notes with those exact words: trying by meaning, “{plan['about']}”")
+        else:
+            run.update(stage="empty")
+            run["log"].append("No notes found")
+        return
+    if run["stage"] == "answering":
+        last = st.session_state.get(LAST_SEARCH_KEY) or {}
+        token = last.get("answer_pending")
+        job = background_answers().get(token) if token else None
+        if job is None:  # answered without the background (or already finished)
+            run.update(stage="done", finished=time.time())
+            return
+        if not job["done"]:
+            return
+        background_answers().pop(token, None)
+        last.pop("answer_pending", None)
+        if job["error"]:
+            last["answer_error"] = job["error"]
+            run["warnings"].append(job["error"] if "token budget" in job["error"] else f"The answer failed: {job['error']}")
+        else:
+            last.update(answer=job["answer"], usage=job["usage"], narrated=job["narrated"])
+            record_llm_speed(job["model"], job["usage"])
+            if job["read_aloud"]:
+                play_answer("ask", job["answer"])
+            if (job["usage"] or {}).get("done_reason") == "length":
+                run["warnings"].append(f"The answer reached **Max tokens** ({job['max_tokens']:,}) and was cut short: "
+                                       "raise Max tokens (Ollama model details, in the Ask box) and ask again.")
+        if last.get("notice") and "trimmed" in last["notice"]:
+            run["warnings"].append(last["notice"])
+        run["log"].append("Answered" if not job["error"] else "Stopped" if job["error"] == "Stopped." else "The answer failed")
+        if run.get("read") and not job["error"]:  # second step: the write-up, rewritten for listening
+            start_listening_rewrite(run, job["answer"], job["model"])
+            run.update(stage="narrating", own=time.time())
+        else:
+            run.update(stage="done", finished=time.time(), own=time.time())
+        st.rerun()
+    if run["stage"] == "narrating":
+        job = background_answers().get(run.get("narrate_job"))
+        if job is None:
+            run.update(stage="done", finished=time.time())
+            return
+        if not job["done"]:
+            return
+        background_answers().pop(run["narrate_job"], None)
+        last = st.session_state.get(LAST_SEARCH_KEY) or {}
+        if job["error"]:
+            run["warnings"].append(f"Couldn't rewrite it for listening: {job['error']}")
+        else:
+            last["answer_narration"] = {"content": job["answer"], "narrated": True, "model": job["model"],
+                                        "at": now_iso(), "rewritten": True,
+                                        "tokens_per_second": (job["usage"] or {}).get("tokens_per_second")}
+            if run.get("read"):
+                play_answer("ask", job["answer"])
+            run["log"].append("Rewritten for listening, and read out")
+        run.update(stage="done", finished=time.time(), own=time.time())
+        st.rerun()
+
+
+def notes_run_status(run: dict) -> str:
+    stage = run["stage"]
+    if stage == "answering":
+        token = (st.session_state.get(LAST_SEARCH_KEY) or {}).get("answer_pending")
+        job = background_answers().get(token) if token else None
+        if job:
+            rate = f" · {job['rate']:.1f} tokens/s" if job.get("rate") else ""
+            return (f"Writing the answer with `{job['model']}` · {job['tokens']:,} tokens{rate}" if job["tokens"]
+                    else f"`{job['model']}` is reading the notes…")
+        return "Asking the LLM…"
+    if stage == "narrating":
+        job = background_answers().get(run.get("narrate_job"))
+        return (f"Rewriting it for listening with `{job['model']}` · {job['tokens']:,} tokens"
+                if job and job["tokens"] else "Rewriting the answer for listening…")
+    return {"finding": "Finding notes…", "retrying": "Finding notes by meaning…", "empty": "No notes found",
+            "done": "Done"}.get(stage, "")
+
+
+NOTES_RUN_STYLE = """<style>
+.st-key-notes_run_panel {
+  position: fixed !important; top: 7rem; left: 50%; transform: translateX(-50%); z-index: 999;
+  width: min(92vw, 620px) !important; padding: 0.9rem 1.1rem; border-radius: 0.8rem;
+  background: PANEL_BG; color: PANEL_FG; border: 2px solid rgb(28, 131, 225);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+.st-key-notes_run_chip {
+  position: fixed !important; bottom: 1.2rem; right: 1.2rem; z-index: 999; width: auto !important;
+  padding: 0.35rem 0.7rem; border-radius: 2rem; background: rgb(28, 131, 225); color: #fff;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+.st-key-notes_run_chip p, .st-key-notes_run_chip button { color: #fff !important; }
+.st-key-notes_run_chip button { background: transparent !important; border-color: rgba(255, 255, 255, 0.7) !important; }
+</style>"""
+
+
+def themed_panel_style(style: str) -> str:
+    """A floating panel's style in the page's light or dark theme (a solid background, so the page doesn't show
+    through)."""
+    dark = getattr(getattr(st.context, "theme", None), "type", None) == "dark"
+    return style.replace("PANEL_BG", "#1a1c24" if dark else "#ffffff").replace("PANEL_FG", "#fafafa" if dark else "#31333f")
+
+
+def set_notes_run_chip(chip: bool) -> None:
+    run = st.session_state.get(NOTES_RUN_KEY)
+    if run:
+        run["chip"] = chip
+
+
+def close_notes_run() -> None:
+    st.session_state.pop(NOTES_RUN_KEY, None)
+
+
+def retry_notes_search(text: str, dictated: bool = False) -> None:
+    """No notes found: read the edited (or newly spoken) message again and run it."""
+    old = (st.session_state.get(NOTES_RUN_KEY) or {}).get("plan") or st.session_state.get(NOTES_SEARCH_KEY) or {}
+    model = rag_selector_model(load_app_settings().get(CHAT_MODEL_SETTING) or DEFAULT_OLLAMA_MODEL)
+    oneshot = old.get("source") == "oneshot"
+    plan = read_notes_search(text, model, force=oneshot) if text.strip() else None
+    st.session_state.pop(NOTES_RUN_KEY, None)
+    if not plan:
+        st.toast("That doesn't read as a notes search. Try naming what to find.", icon=":material/help:")
+        return
+    if oneshot:
+        st.session_state["oneshot_text"] = text
+    st.session_state[NOTES_SEARCH_KEY] = {**plan, "chat": old.get("chat"), "dictated": dictated, "applied": False,
+                                          "source": old.get("source")}
+
+
+@st.fragment(run_every=1.0)
+def render_notes_run(safe_lib: str) -> None:
+    """The pop-up while a Chat message searches your notes: what it understood, each step, warnings, Hide and
+    Cancel. Clicking on the page shrinks it to a chip; the work carries on until Cancel."""
+    run = st.session_state.get(NOTES_RUN_KEY)
+    if not run:
+        return
+    advance_notes_run(run, safe_lib)
+    run = st.session_state.get(NOTES_RUN_KEY)
+    if not run:
+        return
+    if run["stage"] == "done" and not run["warnings"] and time.time() - run.get("finished", 0) > 2.5:
+        st.session_state.pop(NOTES_RUN_KEY, None)
+        st.rerun(scope="fragment")
+    st.html(themed_panel_style(NOTES_RUN_STYLE))
+    status = notes_run_status(run)
+    working = run["stage"] in ("finding", "retrying", "answering", "narrating")
+    if run.get("chip") and run["stage"] != "empty":
+        with st.container(key="notes_run_chip", horizontal=True, vertical_alignment="center", gap="small"):
+            st.markdown((":material/progress_activity: " if working else ":material/check: ")
+                        + f"**Searching your notes** · {status}", width="content")
+            st.button("Open", key="notes_run_open", on_click=set_notes_run_chip, args=(False,))
+            if not working:
+                st.button("Close", key="notes_run_chip_close", on_click=close_notes_run)
+            elif st.button("Cancel", key="notes_run_chip_cancel"):
+                stop_notes_run("Stopped.")
+                st.rerun()  # the whole page, so the answer area shows it stopped
+        return
+    plan = run["plan"]
+    with st.container(key="notes_run_panel"):
+        st.markdown(":material/travel_explore: **Searching your notes**")
+        st.caption(describe_notes_search(plan))
+        for line in run["log"]:
+            st.markdown(f":material/check_small: {line}")
+        if working:
+            st.markdown(f":material/progress_activity: {status}")
+        for warning in run["warnings"]:
+            st.warning(warning, icon=":material/warning:")
+        if working and shutil.which("say"):
+            st.toggle("Read the answer to me", key="notes_run_read", on_change=set_notes_run_read,
+                      help="Once the answer is written, it's rewritten for listening with the **Read aloud "
+                           "(dictation)** prompt and read out; the written answer stays as it is, with the version "
+                           "for listening under it. On by default when you dictate (your choice is remembered).")
+        if run["stage"] == "empty":
+            st.markdown("Nothing matched. Change what to look for, or say it again:")
+            st.text_area("Your message", value=plan.get("message", ""), key="notes_retry_text", height=80,
+                         label_visibility="collapsed")
+            with st.container(horizontal=True, gap="small", vertical_alignment="center"):
+                if st.button("Search again", key="notes_retry", type="primary", icon=":material/search:"):
+                    retry_notes_search(st.session_state.get("notes_retry_text", ""))
+                    st.rerun()
+                spoken = dictation_recorder("notes_retry_dictate", "ask", label="Say it again", width=170)
+                if spoken:
+                    retry_notes_search(spoken, dictated=True)
+                    st.rerun()
+                st.button("Close", key="notes_run_close", on_click=close_notes_run)
+                st.button("Send to non-note search", key="notes_run_plain_empty", icon=":material/chat:", on_click=send_to_plain_chat,
+                          help="Not about your notes? Stop this and send the message to **Chat with LLM** as an "
+                               "ordinary message, with no notes involved.")
+            return
+        with st.container(horizontal=True, gap="small"):
+            st.button("Hide", key="notes_run_hide", icon=":material/close_fullscreen:", on_click=set_notes_run_chip,
+                      args=(True,), help="Shrink this to a chip; the search carries on. (Clicking the page does too.)")
+            if working:
+                if st.button("Cancel", key="notes_run_cancel", icon=":material/stop_circle:",
+                             help="Stop the search and the answer being written."):
+                    stop_notes_run("Stopped.")
+                    st.rerun()  # the whole page, so the answer area shows it stopped
+            else:
+                st.button("Close", key="notes_run_done", on_click=close_notes_run)
+            st.button("Send to non-note search", key="notes_run_plain", icon=":material/chat:", on_click=send_to_plain_chat,
+                          help="Not about your notes? Stop this and send the message to **Chat with LLM** as an "
+                               "ordinary message, with no notes involved.")
+
+
+# One line to start, growing as the text wraps or Shift+Enter adds a line (field-sizing; a script covers other browsers).
+ONESHOT_BOX_STYLE = """<style>
+.st-key-oneshot_text [data-testid="stTextAreaRootElement"] { height: auto !important; min-height: 0 !important; }
+.st-key-oneshot_text textarea {
+  field-sizing: content; min-height: 2.5rem !important; height: auto; max-height: 40vh; resize: none;
+}
+</style>"""
+
+
+def submit_oneshot() -> None:
+    text = str(st.session_state.get("oneshot_text") or "").strip()
+    if text:
+        st.session_state[ONESHOT_PENDING_KEY] = {"text": text, "dictated": False}
+
+
+def render_oneshot_box() -> None:
+    """Oneshot search, at the top of the search page: say what you want in a sentence, and it's run the way a
+    dictated notes question is (find, then ask), without reading the answer aloud unless you turn that on."""
+    st.markdown("**Oneshot search**", help=(
+        "Say what to find and what you want from it, in one sentence. It's read into a search (the library, exact "
+        "words, dates, or a topic by meaning), run, and the found notes are asked your question, with progress in a "
+        "pop-up. Enter sends it (or press **Search**); Shift+Enter adds a line, and the box grows as you type. The mic "
+        "dictates it instead (sent after a pause) and, by default, reads the answer to you. Uses the **RAG search** "
+        "prompt (Prompt library) and the **RAG selector model** (Configure)."))
+    mic_col, box_col = st.columns([1, 15], gap="small", vertical_alignment="top")  # the mic stays beside the box
+    with mic_col:
+        spoken = dictation_recorder("oneshot_dictate", "ask", label="", width=48)
+    with box_col:
+        with st.form("oneshot_form", border=False):
+            with st.container(horizontal=True, vertical_alignment="top", gap="small"):
+                st.html(ONESHOT_BOX_STYLE)
+                st.text_area(
+                    "Oneshot search", key="oneshot_text", label_visibility="collapsed",
+                    placeholder="e.g. Find notes from December 2024 where pricing was discussed in my Acme notebook")
+                st.form_submit_button("Search", type="primary", icon=":material/travel_explore:",
+                                      on_click=submit_oneshot)
+    if spoken:  # into the box (on the next run, before it's drawn) and run as a dictated Oneshot search
+        st.session_state[ONESHOT_PENDING_KEY] = {"text": spoken, "dictated": True}
+        st.rerun()
+
+
+def start_pending_oneshot() -> None:
+    """Top of the search page: read a Oneshot search into a plan (with a spinner), to run like a dictated one."""
+    pending = st.session_state.pop(ONESHOT_PENDING_KEY, None)
+    if not pending:
+        return
+    text, dictated = pending["text"], pending["dictated"]
+    st.session_state["oneshot_text"] = text
+    stop_notes_run()
+    model = rag_selector_model(load_app_settings().get(CHAT_MODEL_SETTING) or DEFAULT_OLLAMA_MODEL)
+    with st.spinner("Reading your search…"):
+        plan = read_notes_search(text, model, force=True)
+    if plan:
+        st.session_state[NOTES_SEARCH_KEY] = {**plan, "chat": pending.get("chat"), "dictated": dictated,
+                                              "applied": False, "source": "oneshot"}
+
+
+def take_auto_search(kind: str) -> bool:
+    """The search the Chat message asked for, pressed once."""
+    if st.session_state.get(AUTO_SEARCH_KEY) == kind:
+        st.session_state.pop(AUTO_SEARCH_KEY)
+        return True
+    return False
+
+
+def notes_search_switch_library() -> None:
+    """The bar's library: switch to it and run the same search there."""
+    pick_library("notes_search_library")
+    plan = st.session_state.get(NOTES_SEARCH_KEY)
+    if plan:
+        choice = st.session_state.get("notes_search_library")
+        plan["library"] = None if choice == WHOLE_CORPUS_OPTION else choice
+        stop_notes_run()
+        plan["applied"] = False  # the whole run again, in the new library
+
+
+CHAT_PLAIN_KEY = "chat_send_plain"  # {"chat", "text", "dictated"}: a message to send to Chat as is (no notes)
+
+
+def send_to_plain_chat() -> None:
+    """Send to non-note search: stop the notes search and send the message to Chat with LLM instead, as an
+    ordinary message (no notes). From Chat it goes back to its chat; a Oneshot search starts a new one."""
+    run = st.session_state.get(NOTES_RUN_KEY) or {}
+    plan = run.get("plan") or st.session_state.get(NOTES_SEARCH_KEY) or {}
+    text = str(st.session_state.get("notes_retry_text") or "").strip() if run.get("stage") == "empty" else ""
+    text = text or str(plan.get("message") or "").strip()
+    stop_notes_run()
+    st.session_state.pop(NOTES_SEARCH_KEY, None)
+    if not text:
+        return
+    st.session_state[CHAT_PLAIN_KEY] = {"chat": plan.get("chat"), "text": text, "dictated": bool(plan.get("dictated")),
+                                        "original": plan.get("message")}
+    if plan.get("chat"):
+        open_saved_chat(plan["chat"])
+    else:
+        start_new_chat()
+    st.session_state[CHAT_RETURN_KEY] = {}
+    st.query_params["page"] = CHAT_PAGE
+
+
+def take_plain_chat_message(chat: dict) -> str:
+    """A message sent back from a notes search: drop the chat's note of the move (it's answered here instead) and
+    return the message, to send as an ordinary one."""
+    plain = st.session_state.pop(CHAT_PLAIN_KEY, None)
+    if not plain:
+        return ""
+    msgs = chat["messages"]
+    if plain.get("chat") == chat.get("id") and len(msgs) >= 2 and msgs[-1].get("notes_search") \
+            and msgs[-2]["role"] == "user" and msgs[-2]["content"].strip() == str(plain.get("original") or "").strip():
+        del msgs[-2:]
+        keep_chat(chat)
+    if plain.get("dictated"):  # still a dictated message: narrated and read out like one
+        st.session_state[DICTATED_KEY] = {"target": "chat", "text": plain["text"]}
+    return plain["text"]
+
+
+def back_to_chat_from_search() -> None:
+    plan = st.session_state.pop(NOTES_SEARCH_KEY, None) or {}
+    if plan.get("chat"):
+        st.session_state[CHAT_OPEN_KEY] = plan["chat"]
+    st.session_state[CHAT_RETURN_KEY] = {}
+    st.query_params["page"] = CHAT_PAGE
+
+
+def close_notes_search_bar() -> None:
+    st.session_state.pop(NOTES_SEARCH_KEY, None)
+
+
+NOTES_BAR_STYLE = """<style>
+.st-key-notes_search_bar {
+  position: fixed !important; top: 3.75rem; left: 50%; transform: translateX(-50%); z-index: 1000;
+  width: auto !important; max-width: 94vw; padding: 0.45rem 0.9rem; border-radius: 0.6rem;
+  background: rgb(28, 131, 225); color: #fff; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+.st-key-notes_search_bar p, .st-key-notes_search_bar button { color: #fff !important; }
+.st-key-notes_search_bar button { border-color: rgba(255, 255, 255, 0.7) !important; background: transparent !important; }
+</style>"""
+
+
+def render_notes_search_bar(options: list[str], label) -> None:
+    """On the search page after a Chat message moved here: what was understood, the library (pick another to
+    search there instead), Back to chat, and close."""
+    plan = st.session_state.get(NOTES_SEARCH_KEY)
+    run = st.session_state.get(NOTES_RUN_KEY)
+    if not plan or run and not run.get("chip"):  # the open pop-up shows the same, just below
+        return
+    st.session_state["notes_search_library"] = st.session_state.get("library_picker", WHOLE_CORPUS_OPTION)
+    with st.container(key="notes_search_bar", horizontal=True, vertical_alignment="center", gap="small"):
+        st.html(NOTES_BAR_STYLE)
+        source = ("Oneshot from Chat" if plan.get("chat") else "Oneshot") if plan.get("source") == "oneshot" \
+            else "From Chat"
+        st.markdown(f":material/travel_explore: **{source}:** {describe_notes_search(plan)}", width="content")
+        st.selectbox("Library", options, key="notes_search_library", format_func=label, width=230,
+                     label_visibility="collapsed", on_change=notes_search_switch_library,
+                     help="Search somewhere else instead: the same search runs there.")
+        if plan.get("chat"):
+            st.button("Back to chat", key="notes_search_back", icon=":material/chat:", on_click=back_to_chat_from_search)
+        st.button("Send to non-note search", key="notes_search_plain", icon=":material/forum:",
+                  on_click=send_to_plain_chat,
+                  help="Not about your notes? Send the message to **Chat with LLM** as an ordinary message.")
+        st.button("", key="notes_search_close", icon=":material/close:", on_click=close_notes_search_bar,
+                  help="Hide this bar (the search and its filters stay).")
+
+
+def move_to_notes_search(chat: dict, prompt: str, plan: dict) -> None:
+    """Note the move in the chat, then go to the search page to run it."""
+    dictated = (st.session_state.get(DICTATED_KEY) or {}).get("target") == "chat"
+    chat["messages"].append({"role": "user", "content": prompt.strip(), "at": now_iso(), "dictated": dictated})
+    chat["messages"].append({"role": "assistant", "content": f"Searching your notes: {describe_notes_search(plan)}",
+                             "notes_search": True, "model": chat["model"], "at": now_iso()})
+    if not chat.get("titled"):
+        chat.update(title=truncate_text(" ".join(prompt.split()), CHAT_TITLE_CHARS), titled=True)
+    keep_chat(chat)
+    # Run as a Oneshot search: your words in the Oneshot box, the same flow from there (Back to chat and Send to
+    # non-note search still lead back to this chat).
+    st.session_state[NOTES_SEARCH_KEY] = {**plan, "chat": chat["id"], "dictated": dictated, "applied": False,
+                                          "source": "oneshot"}
+    st.query_params.clear()
+    st.rerun()
+
+
+def render_chat_page() -> None:
+    """Chat with LLM: a classic chat with an installed Ollama model, with saved chats in the sidebar."""
+    arrive_with_hotkey_job()
+    reply_again = st.session_state.pop(REPLY_AGAIN_KEY, None)
+    if reply_again and reply_again.get("dictated"):  # still a dictated message: narrated and read out as before
+        st.session_state[DICTATED_KEY] = reply_again["dictated"]
+    chat = current_chat()
+    sent_back = take_plain_chat_message(chat)  # from a notes search: before the messages are drawn (it drops the move's note)
+    # Dictate at the top of the sidebar, where Dictate to Chat is on the other pages: sent after a pause, like a
+    # typed message.
+    with st.sidebar:
+        spoken = dictation_recorder("chat_dictate", "chat", label="Dictate a message", hotkey_priority=1,
+                                    width="stretch")
+    render_chat_sidebar(chat)
+    render_page_title("Chat with LLM")
+    if is_in_confidence(chat):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.info("**In confidence.** Nothing in this chat is saved or logged: not what you type or dictate, the "
+                    "replies, or that it happened. It's gone when you end it, start or open another chat, leave Chat "
+                    "or close this tab.", icon=":material/lock:", width="stretch")
+            st.button("End and forget", icon=":material/delete_forever:", on_click=start_new_chat,
+                      key="end_in_confidence")
+    render_chat_title(chat)
+    render_chat_settings(chat)
+    remember = not is_in_confidence(chat)  # in confidence, spoken answers aren't cached
+    for index, message in enumerate(chat["messages"]):
+        with st.chat_message(message["role"]):
+            if message["role"] == "assistant" and message.get("notes_search"):
+                st.markdown(f":material/travel_explore: {message['content']}")
+            elif message["role"] == "assistant":
+                render_chat_reply(message)
+                voice_key = f"chat_voice_{chat['id']}_{index}"
+                asked = chat["messages"][index - 1] if index and chat["messages"][index - 1]["role"] == "user" else None
+                render_voice_tools("chat", index, message["content"], narrated=bool(message.get("narrated")),
+                                   key=voice_key, remember=remember, model=message.get("model") or chat["model"],
+                                   question=asked["content"] if asked else None)
+                request = take_rerun_request("chat", index)
+                if request:
+                    make_chat_variant(chat, index, request["narrate"], request.get("model"), request.get("question"))
+                save = lambda: keep_chat(chat)  # noqa: E731  (in confidence, keep_chat keeps it in the session)
+                render_answer_variant("chat", index, message.get("variant"), key=voice_key, remember=remember,
+                                      save=save)
+                render_alternatives("chat", index, message.get("alternatives"), key=voice_key, remember=remember,
+                                    save=save)
+            else:
+                render_user_message(chat, index)
+    submitted = st.chat_input(f"Message {chat['model']}…", key="chat_input", submit_mode="disable")
+    typed = (submitted or "").strip()
+    hotkey = "" if spoken or typed else finish_hotkey_job()
+    prompt = spoken or typed or hotkey or sent_back
+    # Only a dictated message (mic or hotkey) may be a notes question; typed ones are for the chat (use Oneshot
+    # search on the search page for your notes).
+    if (spoken or hotkey) and notes_search_enabled() and not is_in_confidence(chat):
+        with st.spinner("Checking whether this is for your notes…"):
+            plan = read_notes_search(prompt, rag_selector_model(chat["model"]))
+        if plan:
+            move_to_notes_search(chat, prompt, plan)
+    if prompt:
+        dictated = (st.session_state.get(DICTATED_KEY) or {}).get("target") == "chat"
+        chat["messages"].append({"role": "user", "content": prompt.strip(), "at": now_iso(), "dictated": dictated})
+        if not chat.get("titled"):
+            chat["title"] = truncate_text(" ".join(prompt.split()), CHAT_TITLE_CHARS)
+            chat["titled"] = True
+        keep_chat(chat)  # saved before the reply, so a cancelled or failed reply keeps the question
+        with st.chat_message("user"):
+            render_user_message(chat, len(chat["messages"]) - 1)  # Edit here stops the reply below
+        generate_chat_reply(chat)
+    elif chat["messages"] and chat["messages"][-1]["role"] == "user":
+        # The last reply was cancelled or failed: offer to ask again (at once, after switching model mid-reply).
+        if st.session_state.get(CHAT_EDITING_KEY):
+            pass  # being fixed in place: its reply comes when it's sent
+        elif reply_again or st.button("Get a reply", icon=":material/refresh:", key="chat_retry"):
+            generate_chat_reply(chat)
+
+
 # ---------------------------------------------------------------------------
 # PAGE SETUP
 # ---------------------------------------------------------------------------
@@ -10184,13 +13274,30 @@ PAGE_TITLES = {
     "actions": "RAG - Actions",
     "configure": "RAG - Configure",
     "reference": "RAG - Reference document",
+    CHAT_PAGE: "RAG - Chat with LLM",
 }
 st.set_page_config(page_title=PAGE_TITLES.get(st.query_params.get("page"), "RAG Workspace Manager"),
                    layout="wide")
 # Starts the background auto-rescan thread once per server process.
 get_text_rescan_scheduler()
+_dictated = st.session_state.pop(DICTATED_KEY, None)  # set by the run that sent a dictated message
 if st.session_state.pop(LLM_CANCELLED_KEY, False):
-    st.toast("Stopped the LLM. Change what you need and run it again.", icon=":material/stop_circle:")
+    if _dictated:
+        restore_after_stop(_dictated)
+        st.toast("Stopped. Your dictated text is back in its box: edit it and send again.", icon=":material/edit:")
+    else:
+        st.toast("Stopped the LLM. Change what you need and run it again.", icon=":material/stop_circle:")
+if not st.session_state.get("landing_page_chosen"):
+    st.session_state["landing_page_chosen"] = True
+    if not st.query_params.get("page") and load_app_settings().get("open_on_chat"):
+        st.query_params["page"] = CHAT_PAGE
+if st.session_state.pop(TRANSCRIPTION_CANCELLED_KEY, False):
+    st.toast("Cancelled. Nothing was sent.", icon=":material/close:")
+if st.query_params.get("page") == CHAT_PAGE:
+    render_chat_page()
+    st.stop()
+forget_in_confidence_chat()  # however Chat was left
+render_dictate_to_chat()
 if st.query_params.get("page") == "prompts":
     render_prompt_library_page()
     st.stop()
@@ -10203,6 +13310,12 @@ if st.query_params.get("page") == "configure":
 if st.query_params.get("page") == "reference":
     render_reference_page()
     st.stop()
+start_pending_oneshot()
+_notes_plan = st.session_state.get(NOTES_SEARCH_KEY)
+if _notes_plan and not _notes_plan.get("applied"):  # a Chat message moved here: fill in its search
+    apply_notes_search(_notes_plan)
+    _notes_plan["applied"] = True
+apply_notes_run_step()
 
 render_outbox_status()
 st.title("🧠 RAG Workspace Manager")
@@ -10212,110 +13325,157 @@ if should_show_setup_wizard():
     st.stop()
 
 # ---------------------------------------------------------------------------
-# SIDEBAR — CORPUS ROOT
+# SIDEBAR — CHAT, AND CONFIGURE (NOTES LOCATION)
 # ---------------------------------------------------------------------------
 
-st.sidebar.header("Notes location")
-if st.sidebar.button("Browse…", key="browse_corpus_root", use_container_width=True):
-    current = load_corpus_root_path()
-    picked = browse_for_directory(str(current) if current else None)
-    if picked:
-        picked = picked.strip()
-        save_app_settings({"corpus_root_path": picked})
-        st.session_state["corpus_root_path_input"] = picked
-        st.rerun()
-
-sync_corpus_root_widget_from_settings()
-_saved_corpus_root = load_corpus_root_path()
-st.sidebar.text_input(
-    "Corpus root folder",
-    value=str(_saved_corpus_root) if _saved_corpus_root else "",
-    key="corpus_root_path_input",
-    on_change=persist_corpus_root_path,
-    help="Notes export folder. Multi-Corpus: one subfolder per library. Single-Corpus: index the whole tree.",
-    placeholder="Select or enter your notes export folder…",
+st.sidebar.button(
+    "Chat with LLM",
+    icon=":material/chat:",
+    width="stretch",
+    on_click=open_chat_page,
+    help="A classic chat with any model installed in Ollama, with your chats saved. Opens in this tab; "
+    "**Back to search** returns here.",
 )
-
-corpus_root_path = get_corpus_root_path()
-if not corpus_root_path:
-    st.sidebar.info("Set the corpus root folder above to load your libraries.")
-    st.stop()
-if not corpus_root_path.exists():
-    st.sidebar.warning(f"Folder not found:\n`{corpus_root_path}`")
-    st.stop()
-
-st.sidebar.caption(f"Saved in `{APP_SETTINGS_PATH.name}`")
-
-sync_corpus_mode_from_settings()
-st.sidebar.radio(
-    "Corpus mode",
-    options=[CORPUS_MODE_MULTI, CORPUS_MODE_SINGLE],
-    format_func=lambda mode: "Multi-Corpus" if mode == CORPUS_MODE_MULTI else "Single-Corpus",
-    key="corpus_mode_toggle",
-    horizontal=True,
-    on_change=persist_corpus_mode,
-    help=(
-        "**Multi-Corpus** — each immediate subfolder is a separate searchable library. "
-        "**Single-Corpus** — one library for all notes under the root (flat or mixed layouts)."
-    ),
-)
-if is_single_corpus_mode():
-    st.sidebar.caption("Single-Corpus indexes every supported file under the root, including subfolders.")
-else:
-    st.sidebar.caption("Multi-Corpus treats each top-level subfolder as its own library.")
-
 st.sidebar.divider()
+# The sidebar reads top to bottom as: Status, Library Controls (library, Prompt library, Configure), Advanced.
+# The code runs in another order (the notes folder in Configure is needed to list the libraries, and Status needs
+# the library), so each part gets its slot here and is filled in when its data is ready.
+status_slot = st.sidebar.container()
+st.sidebar.header("Library Controls")
+library_slot = st.sidebar.container()
+prompt_library_slot = st.sidebar.container()
+configure_slot = st.sidebar.container()
+
+# Configure: the notes location (rarely changed, so folded) and a link to the Configure page. It opens by itself
+# when the notes folder isn't set or can't be found.
+sync_corpus_root_widget_from_settings()
+_root_ok = bool(get_corpus_root_path() and get_corpus_root_path().exists())
+with configure_slot.expander("Configure", icon=":material/settings:", expanded=not _root_ok):
+    st.markdown("**Notes location**")
+    if st.button("Browse…", key="browse_corpus_root", width="stretch"):
+        current = load_corpus_root_path()
+        picked = browse_for_directory(str(current) if current else None)
+        if picked:
+            picked = picked.strip()
+            save_app_settings({"corpus_root_path": picked})
+            st.session_state["corpus_root_path_input"] = picked
+            st.rerun()
+    st.text_input(
+        "Corpus root folder",  # its value comes from the saved setting (sync_corpus_root_widget_from_settings)
+        key="corpus_root_path_input",
+        on_change=persist_corpus_root_path,
+        help="Notes export folder. Multi-Corpus: one subfolder per library. Single-Corpus: index the whole tree.",
+        placeholder="Select or enter your notes export folder…",
+    )
+    corpus_root_path = get_corpus_root_path()
+    if not corpus_root_path:
+        st.info("Set the corpus root folder above to load your libraries.")
+    elif not corpus_root_path.exists():
+        st.warning(f"Folder not found:\n`{corpus_root_path}`")
+    else:
+        st.caption(f"Saved in `{APP_SETTINGS_PATH.name}`")
+        sync_corpus_mode_from_settings()
+        st.radio(
+            "Corpus mode",
+            options=[CORPUS_MODE_MULTI, CORPUS_MODE_SINGLE],
+            format_func=lambda mode: "Multi-Corpus" if mode == CORPUS_MODE_MULTI else "Single-Corpus",
+            key="corpus_mode_toggle",
+            horizontal=True,
+            on_change=persist_corpus_mode,
+            help=(
+                "**Multi-Corpus** — each immediate subfolder is a separate searchable library. "
+                "**Single-Corpus** — one library for all notes under the root (flat or mixed layouts)."
+            ),
+        )
+        if is_single_corpus_mode():
+            st.caption("Single-Corpus indexes every supported file under the root, including subfolders.")
+        else:
+            st.caption("Multi-Corpus treats each top-level subfolder as its own library.")
+    st.link_button(
+        "Configure page",
+        CONFIGURE_PAGE_URL,
+        icon=":material/open_in_new:",
+        width="stretch",
+        help="Task executor settings (the connector and other links), the outbox, the task title marker and "
+        "settings export. Opens in a new tab.",
+    )
+    render_read_aloud_toggle("read_aloud_toggle")
+    render_dictate_hotkey_toggle("dictate_hotkey_toggle")
+    render_rag_selector_model("rag_selector_model_sidebar")
+    corpus_visibility_slot = st.container()  # Manage corpus visibility, filled once the libraries are known
+if not corpus_root_path or not corpus_root_path.exists():
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # SIDEBAR — LIBRARY MANAGEMENT
 # ---------------------------------------------------------------------------
 
-st.sidebar.header("Library Controls")
 if _migrated_legacy_app_data:
-    st.sidebar.info(
+    library_slot.info(
         "Copied previous data from `~/llmware_data` into `./llmware_data` "
         f"({', '.join(_migrated_legacy_app_data)})."
     )
 if _migrated_tables:
-    st.sidebar.info(
+    library_slot.info(
         f"Migrated {len(_migrated_tables)} vector index(es) from `/tmp/lancedb`."
     )
 
 all_libraries = get_libraries()
 if not all_libraries:
     if is_single_corpus_mode():
-        st.sidebar.error(
+        library_slot.error(
             f"No ingestible files found under:\n`{corpus_root_path}`\n\n"
             f"Supported types: {', '.join(sorted(INGEST_EXTENSIONS))}"
         )
     else:
-        st.sidebar.error(f"No subfolders found in:\n`{corpus_root_path}`")
+        library_slot.error(f"No subfolders found in:\n`{corpus_root_path}`")
     st.stop()
 # All-corpora scans and rebuilds skip hidden corpora.
 scan_libraries = filter_libraries_for_display(all_libraries)
 # Agents' actions, brought up to date (receipts, and marks in notes rescanned since) for the badges and filter.
 sync_actions_log([resolve_library_registry_name(lib) for lib in scan_libraries])
 
+# Select Library: Single Corpus (the whole corpus) first, then each library, so you can switch between them here.
+folder_libraries = sorted(d.name for d in corpus_root_path.iterdir() if d.is_dir())
+visible_libraries = build_library_select_options(folder_libraries) if folder_libraries else []
+if folder_libraries and not visible_libraries:
+    library_slot.warning("All corpora are hidden. Turn off hiding in Advanced or unhide a corpus.")
+    visible_libraries = folder_libraries
+sync_selected_library_from_settings(visible_libraries)
+if visible_libraries and st.session_state.get("selected_library") not in visible_libraries:
+    st.session_state["selected_library"] = visible_libraries[0]
+st.session_state["library_picker"] = (
+    WHOLE_CORPUS_OPTION if is_single_corpus_mode() or not visible_libraries else st.session_state["selected_library"]
+)
+_whole_corpus_label = f"Single Corpus · {short_indexed_at(SINGLE_CORPUS_LIBRARY_NAME)}"
+install_full_text_tooltips()
+LIBRARY_PICKER_OPTIONS = [WHOLE_CORPUS_OPTION, *visible_libraries]
+LIBRARY_PICKER_HELP = ("**Single Corpus** searches every note under the corpus root as one library (the same as Corpus mode "
+         "Single), with when it was last indexed; pick a library to search just that folder again. A library you "
+         "haven't indexed in Single Corpus mode needs **Re-index (full rebuild)** first.")
+
+
+def library_picker_label(option: str) -> str:
+    return _whole_corpus_label if option == WHOLE_CORPUS_OPTION else option
+
+
+library_slot.selectbox("Select Library", LIBRARY_PICKER_OPTIONS, key="library_picker", format_func=library_picker_label,
+                       on_change=pick_library, help=LIBRARY_PICKER_HELP)
+render_notes_search_bar(LIBRARY_PICKER_OPTIONS, library_picker_label)
+if st.session_state.get(NOTES_RUN_KEY):
+    render_notes_run(resolve_library_registry_name(SINGLE_CORPUS_DISPLAY_NAME if is_single_corpus_mode()
+                                                   else st.session_state.get("selected_library", "")))
+if folder_libraries:  # in the Configure dropdown: which libraries Select Library and all-library scans include
+    with corpus_visibility_slot:
+        render_corpus_visibility_controls(folder_libraries)
 if is_single_corpus_mode():
     selected_lib = SINGLE_CORPUS_DISPLAY_NAME
-    st.sidebar.markdown(f"**Library:** {SINGLE_CORPUS_DISPLAY_NAME}")
 else:
-    visible_libraries = build_library_select_options(all_libraries)
-    if not visible_libraries:
-        st.sidebar.warning("All corpora are hidden. Turn off hiding in Advanced or unhide a corpus.")
-        visible_libraries = all_libraries
-
-    sync_selected_library_from_settings(visible_libraries)
-    selected_lib = st.sidebar.selectbox(
-        "Select Library",
-        visible_libraries,
-        key="selected_library",
-        on_change=persist_selected_library,
-    )
+    selected_lib = st.session_state["selected_library"]
     if is_hide_corpora_enabled():
         hidden_count = len(all_libraries) - len(filter_libraries_for_display(all_libraries))
         if hidden_count:
-            st.sidebar.caption(f"{hidden_count} corpus/corpora hidden from this list.")
+            library_slot.caption(f"{hidden_count} corpus/corpora hidden from this list.")
 
     if selected_lib != load_last_selected_library():
         save_app_settings({"last_selected_library": selected_lib})
@@ -10323,7 +13483,7 @@ else:
 safe_lib = resolve_library_registry_name(selected_lib)
 library_content_path = resolve_library_content_path(corpus_root_path, selected_lib)
 corpus_config = get_corpus_config(safe_lib)
-render_prompt_library_sidebar(corpus_config)
+render_prompt_library_sidebar(corpus_config, prompt_library_slot)
 
 model_catalog = list(load_embedding_model_catalog())
 model_ids = [model["id"] for model in model_catalog]
@@ -10336,19 +13496,17 @@ try:
     status_model = get_pending_index_settings(safe_lib, corpus_config)[0]
     emb_ready, emb_message = is_embedding_ready(_status_lib, status_model)
     if emb_ready:
-        st.sidebar.success(f"**Status:** Ready — {emb_message}")
+        status_slot.success(f"**Status:** Ready — {emb_message}")
     else:
-        st.sidebar.warning(f"**Status:** Not ready — {emb_message}")
+        status_slot.warning(f"**Status:** Not ready — {emb_message}")
 except Exception:
     _status_lib = None
     active_model = None
-    st.sidebar.warning(
+    status_slot.warning(
         "Library not yet initialised. Use **Re-index (full rebuild)** below to create the search index."
     )
 
-last_updated = get_last_updated(library_content_path)
-if last_updated:
-    st.sidebar.caption(f"Last indexed: {last_updated}")
+# The index line under Status is added once the embedding model and cutoff are final (below).
 
 with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
     _app_settings = load_app_settings()
@@ -10469,8 +13627,6 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
         st.success("Saved for this corpus.")
 
     if not is_single_corpus_mode():
-        render_corpus_visibility_controls(all_libraries)
-
         st.divider()
         st.markdown("**Multi-corpus clean rebuild**")
         st.caption(
@@ -10528,9 +13684,6 @@ with st.sidebar.expander("Advanced — Indexing & Embeddings", expanded=False):
 with st.sidebar.expander("Advanced — Actions log", expanded=False):
     render_actions_log_backup()
 
-with st.sidebar.expander("Debug details", expanded=False):
-    render_debug_panel(selected_lib, safe_lib, _status_lib, corpus_config)
-
 st.sidebar.divider()
 st.sidebar.markdown(f"**This corpus** — {selected_lib}")
 
@@ -10583,7 +13736,43 @@ if sync_clicked:
     except Exception as exc:
         handle_embedding_run_error(exc, pending_model, sidebar=True)
 
-if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, key=f"rebuild_{safe_lib}"):
+REBUILD_CONFIRMED_KEY = "rebuild_confirmed"  # the library a full rebuild was just confirmed for
+
+
+@st.dialog("Re-index (full rebuild)?", width="medium")
+def confirm_full_rebuild(safe_lib: str, library: str, folder: Path, model: str) -> None:
+    """Check before a full rebuild: what it does, how long it may take, and what's quicker."""
+    notes = sum(1 for p in folder.rglob("*") if p.suffix.lower() in INGEST_EXTENSIONS and p.is_file()) \
+        if folder.is_dir() else 0
+    config = get_corpus_config(safe_lib)
+    took, for_notes = config.get("last_rebuild_seconds"), config.get("last_rebuild_notes")
+    st.warning(f"This deletes **{library}**'s search index and builds it again from all **{notes:,} notes**: the text "
+               f"index, then the embeddings with `{model}`. It can take a long time (minutes, or hours for a big "
+               "corpus), and **searching this library won't work until it's finished**. The page is busy meanwhile: "
+               "keep this tab open.", icon=":material/warning:")
+    if took:
+        st.caption(f"Last full rebuild here took **{format_duration(took)}**"
+                   + (f" for {for_notes:,} notes" if for_notes else "") + ".")
+    else:
+        st.caption("No timing from an earlier full rebuild here yet.")
+    st.info("Only want new, edited or deleted notes picked up? **⚡ Rescan (incremental)** does that and is much "
+            "quicker. A full rebuild is for a changed embedding model or an index that's gone wrong.",
+            icon=":material/bolt:")
+    sure = st.checkbox("I understand searching will be unavailable until it finishes", key=f"rebuild_sure_{safe_lib}")
+    with st.container(horizontal=True, gap="small"):
+        if st.button("Rebuild now", type="primary", icon=":material/construction:", disabled=not sure):
+            st.session_state[REBUILD_CONFIRMED_KEY] = safe_lib
+            st.rerun()
+        if st.button("Cancel"):
+            st.rerun()
+
+
+if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, key=f"rebuild_{safe_lib}",
+                     help="Deletes and rebuilds this library's index from scratch. You'll be asked to confirm."):
+    confirm_full_rebuild(safe_lib, selected_lib, library_content_path, pending_model)
+if st.session_state.get(REBUILD_CONFIRMED_KEY) == safe_lib:
+    st.session_state.pop(REBUILD_CONFIRMED_KEY, None)
+    rebuild_started = time.monotonic()
     try:
         ensure_embedding_dependencies(pending_model)
         ensure_corpus_root_persisted(corpus_root_path)
@@ -10603,6 +13792,9 @@ if st.sidebar.button("🔨 Re-index (full rebuild)", disabled=rebuild_disabled, 
                 "embedding_model": pending_model,
                 "distance_threshold": pending_threshold,
                 "vector_db": VECTOR_DB,
+                # For the next confirmation: how long a full rebuild takes here.
+                "last_rebuild_seconds": round(time.monotonic() - rebuild_started),
+                "last_rebuild_notes": int(job_status.get("docs_added") or 0) or None,
             },
         )
         st.rerun()
@@ -10631,8 +13823,16 @@ if multi_rebuild_request and not is_single_corpus_mode():
     except Exception as exc:
         handle_embedding_run_error(exc, multi_rebuild_request, sidebar=True)
 
-render_multi_corpus_rebuild_summary()
-render_sidebar_job_summary(selected_lib, safe_lib)
+with st.sidebar:  # at the bottom, after the index buttons: the last scan or rebuild, then Debug details
+    _job = resolve_job_status(selected_lib, safe_lib)
+    if _job or st.session_state.get("multi_rebuild_summary"):
+        st.divider()
+        with st.expander("Corpus index" + (f" · {_job.get('operation', 'Scan')}" if _job else ""),
+                         icon=":material/database:", key="corpus_index_open"):
+            render_multi_corpus_rebuild_summary()
+            render_sidebar_job_summary(selected_lib, safe_lib)
+    with st.expander("Debug details", icon=":material/bug_report:", key="debug_details_open"):
+        render_debug_panel(selected_lib, safe_lib, _status_lib, corpus_config)
 
 # Reload saved config for search (may have just been updated in session)
 corpus_config = get_corpus_config(safe_lib)
@@ -10645,11 +13845,7 @@ library_folder = library_content_path
 # MAIN INTERFACE — SEARCH
 # ---------------------------------------------------------------------------
 st.header(f"Search: {selected_lib}")
-st.caption(
-    f"Corpus embedding: **{get_model_label(selected_embedding_model)}** · "
-    f"cutoff **{distance_threshold:.2f}** — "
-    f"{get_embedding_model_summary(selected_embedding_model)}"
-)
+render_oneshot_box()
 
 # ?pick=<reference document id>: the search page is used to choose that document's notes (no LLM).
 pick_ref = find_reference_document(st.query_params.get("pick"))
@@ -10688,7 +13884,7 @@ with filter_box_col:
             on_click=clear_all_search_page,
             use_container_width=True,
             help="Start the page afresh: clears the filter, exclusions, results and discussion, your question, "
-            "**Find notes about**, any injected task prompt and the **☁️ Salesforce** reference. Settings such "
+            "**Find notes about**, the **Oneshot search**, any injected task prompt and the **☁️ Salesforce** reference. Settings such "
             "as the route, **Max results** and the model stay.",
         )
         # Two routes into the notes: semantic (vector) search or literal text matching. The controls below
@@ -10791,32 +13987,41 @@ with filter_box_col:
                         key=_key,
                         accept_new_options=True,
                         on_change=persist_search_filter,
+                        args=(field,),
                         placeholder="Type a term, press Enter",
                         label_visibility="collapsed",
                     )
         # How many passages (Semantic) or notes (Literal) a search returns: a search setting, so it's here.
         _max_key = max_results_key(exact_text_only)
         _max_limit = MAX_RESULTS_LIMITS["literal" if exact_text_only else "semantic"]
-        if _max_key not in st.session_state:  # saved between searches and sessions
-            st.session_state[_max_key] = min(max(int(load_app_settings().get(_max_key, 15) or 15), 1), _max_limit)
+        if st.session_state.get(_max_key) is None:  # saved between searches and sessions (30 to start)
+            st.session_state[_max_key] = saved_max_results(_max_key)
+        st.session_state[_max_key] = min(max(int(st.session_state[_max_key]), 1), _max_limit)
         search_filter = get_search_filter_from_widgets()
+        # The sidebar's Select Library, here too (both routes): switch library without leaving the search.
+        st.session_state["library_picker_search"] = st.session_state["library_picker"]
+        st.selectbox("Select Library", LIBRARY_PICKER_OPTIONS, key="library_picker_search",
+                     format_func=library_picker_label, on_change=pick_library, args=("library_picker_search",),
+                     help=LIBRARY_PICKER_HELP)
         # One line: Max results (its title beside the box), then what the filter and exclusions leave out, with
         # Clear exclusions rightmost.
         with st.container(horizontal=True, vertical_alignment="center", gap="small", key="max_results_row"):
             st.markdown("Max results", width="content",
-                        help="The most passages (Semantic route, up to 50) or notes (Literal route, up to 1000) a "
-                        f"search returns. **Ask (filtered only)** answers from at most {ASK_NOTES_LIMIT} notes; "
-                        "**Filter search only** lists up to the full number. Each route's value is saved.")
-            result_limit = st.number_input(
+                        help="The most passages (Semantic route) or notes (Literal route) a search returns, 1 to "
+                        f"{_max_limit} (30 to start). **Ask (filtered only)** answers from at most "
+                        f"{ASK_NOTES_LIMIT} notes; **Filter search only** lists up to the full number. Each "
+                        "route's value is saved.")
+            result_limit = st.slider(
                 "Max results",
                 min_value=1,
                 max_value=_max_limit,
                 key=_max_key,
                 on_change=persist_max_results,
                 args=(_max_key,),
-                width=80,
+                width=240,
                 label_visibility="collapsed",
             )
+            result_limit = int(result_limit or saved_max_results(_max_key))
             # The filter takes the free space and wraps within it, so the rest stays on this line.
             st.caption(f"Filter: {describe_search_filter(search_filter)}"
                        if is_filter_active(search_filter) or describe_actioned_filter() else "")
@@ -10853,6 +14058,8 @@ with filter_box_col:
                         use_container_width=True,
                     )
 
+                if st.session_state.pop("rerun_filter_search", False) or take_auto_search("filter"):
+                    filter_only_clicked = True  # Show all N, or a notes search from Chat
                 rescan_all = search_all_libraries and not is_single_corpus_mode()
                 rescan_libraries = scan_libraries if rescan_all else [selected_lib]
                 rescan_note_col, rescan_btn_col = st.columns([1.5, 1.3], vertical_alignment="center")
@@ -10916,7 +14123,7 @@ with filter_box_col:
                     key="find_notes_button",
                     use_container_width=True,
                     help="Lists the notes about what's in **Find notes about**, within **Narrow by terms** if set.",
-                )
+                ) or take_auto_search("find")
         # Scripts with no visible part: last in the Filter box, so their empty slots don't open gaps between rows.
         install_filter_commit_on_blur()
         install_tooltip_hide_on_click()
@@ -10928,6 +14135,16 @@ with filter_box_col:
 ollama_ok, installed_ollama_models = discover_ollama_models()
 ollama_model_options = installed_ollama_models if ollama_ok and installed_ollama_models else SUGGESTED_OLLAMA_MODELS
 default_ollama = corpus_config.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+if ollama_ok and installed_ollama_models and default_ollama not in installed_ollama_models:
+    # The library's saved model isn't installed (any more): answer with one that is, and say so once.
+    _missing = default_ollama
+    _chat_model = load_app_settings().get(CHAT_MODEL_SETTING)
+    default_ollama = next((m for m in (_chat_model, DEFAULT_OLLAMA_MODEL) if m in installed_ollama_models),
+                          installed_ollama_models[0])
+    if st.session_state.get(f"missing_model_noted_{safe_lib}") != _missing:
+        st.session_state[f"missing_model_noted_{safe_lib}"] = _missing
+        st.toast(f"`{_missing}`, saved for this library, isn't installed: answering with `{default_ollama}` instead. "
+                 "Pick a model under **Ollama model details** to keep one.", icon=":material/swap_horiz:")
 if default_ollama not in ollama_model_options:
     ollama_model_options = [default_ollama] + list(ollama_model_options)
 
@@ -10937,6 +14154,7 @@ with ask_box_col:
     if pick_ref is not None:
         # Pick mode: no LLM; the document being filled is shown under the Filter box instead.
         prompt_text, search_clicked, use_llm_answer, scope_clicked = "", False, False, False
+        dictated_question = ""
         selected_ollama_model = default_ollama
         llm_max_tokens = int(corpus_config["llm_max_tokens"])
         llm_temperature = float(corpus_config["llm_temperature"])
@@ -10972,7 +14190,11 @@ with ask_box_col:
                 with st.container(horizontal=True, vertical_alignment="center", key="question_heading"):
                     st.markdown(QUESTION_LABEL, width="stretch",
                                 help="Saved locally and restored when the page is reloaded.")
+                    dictated_question = dictation_recorder("dictate_question", "ask")
                     big_question = st.toggle("Bigger", key="question_bigger", help="A taller box for long questions.")
+                if dictated_question:  # into the box (drawn just below), then searched straight away
+                    st.session_state["question_text"] = dictated_question
+                    persist_question()
                 if not big_question:
                     st.html(QUESTION_ONE_LINE_STYLE)
                 prompt_text = st.text_area(
@@ -11018,6 +14240,31 @@ with ask_box_col:
                         ),
                     )
                     st.caption(describe_answer_length(llm_max_tokens))
+                    chars_key = f"llm_notes_chars_{safe_lib}"
+                    saved_chars = int(st.session_state.get(chars_key) or corpus_config.get("llm_notes_chars")
+                                      or LLM_CONTEXT_MAX_CHARS)
+                    chosen_chars = st.select_slider(
+                        "Notes budget",
+                        options=sorted({*NOTES_BUDGET_STEPS, saved_chars}),
+                        value=saved_chars,
+                        format_func=lambda c: f"{c:,} characters",
+                        key=chars_key,
+                        on_change=persist_llm_tuning,
+                        args=(safe_lib,),
+                        help=(
+                            "How much note text **Ask** sends the LLM, shared between the notes in scope; longer "
+                            "notes are trimmed to fit. More means fuller answers from more notes, but slower answers "
+                            "and more memory, as Ollama's context window grows to hold them (about 3 characters a "
+                            "token). It's capped to what the answer model's context window can hold beside the "
+                            "answer. Saved for this corpus."
+                        ),
+                    )
+                    fit_chars = notes_budget_fit(selected_ollama_model, llm_max_tokens)
+                    st.caption(
+                        f"≈{chosen_chars // 3:,} tokens of notes"
+                        + (f" · capped to {fit_chars:,} characters: the most `{selected_ollama_model}`'s context "
+                           f"window holds beside {llm_max_tokens:,} answer tokens" if fit_chars < chosen_chars else "")
+                    )
                     llm_temperature = st.slider(
                         "Temperature",
                         min_value=0.0,
@@ -11079,11 +14326,13 @@ with ask_box_col:
                 + f" Returns at most {ask_limit if exact_text_only else result_limit} results (**Max results**, in the "
                 "Filter box" + (f"; Ask answers from {ASK_NOTES_LIMIT} notes at most" if exact_text_only else "") + ").",
             )
+            search_clicked = search_clicked or bool(dictated_question) or take_auto_search("search")
             _in_scope = gathered_notes(safe_lib)
             _kept_in_scope = kept_gathered_notes(_in_scope) if _in_scope else []
             # Only worth offering when the in-scope notes aren't just what Ask (filtered only) sends anyway.
             same_as_filtered = literal is not None and len(literal) <= ask_limit and set(_kept_in_scope) == literal
-            scope_clicked = bool(_kept_in_scope) and not same_as_filtered and st.button(
+            auto_scope = take_auto_search("scope") and bool(_kept_in_scope)  # a Chat message's notes run
+            scope_clicked = auto_scope or bool(_kept_in_scope) and not same_as_filtered and st.button(
                 f"🗂 Ask about in-scope notes ({len(_kept_in_scope)})",
                 use_container_width=True,
                 help="Answers your question from every note in **In scope** (under the Filter box) that you haven't "
@@ -11105,12 +14354,13 @@ if new_search:
     persist_question()
     remember_searched_dates()
 run_filter_only = filter_only_clicked or (search_clicked and exact_text_only)
-# Filter search only lists up to Max results (up to 1000); Ask (filtered only) answers from at most ASK_NOTES_LIMIT.
+# Filter search only lists up to Max results (up to 200); Ask (filtered only) answers from at most ASK_NOTES_LIMIT.
 notes_limit = result_limit if filter_only_clicked else min(result_limit, ASK_NOTES_LIMIT)
 _gathered = gathered_notes(safe_lib)
 _in_scope_before = len(_gathered["notes"]) if _gathered else 0
 search_all_libraries = search_all_libraries and run_filter_only and not is_single_corpus_mode()
 
+notes_chars = notes_budget(safe_lib, selected_ollama_model, llm_max_tokens)  # notes text Ask sends the LLM
 if new_search:
     # A new search replaces the previous results and discussion.
     st.session_state.pop(LAST_SEARCH_KEY, None)
@@ -11132,10 +14382,11 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
         if scope_clicked:
             # Every in-scope note kept, each with an equal share of the LLM's context.
             kept = kept_gathered_notes(_gathered)
-            final_results, trimmed = share_context(_gathered, kept, LLM_CONTEXT_MAX_CHARS)
+            final_results, trimmed = share_context(_gathered, kept, notes_chars)
             if trimmed:
                 notice = (f"{trimmed} of the {len(kept)} in-scope notes were trimmed so every one fits the LLM's "
-                          f"context ({LLM_CONTEXT_MAX_CHARS:,} characters of notes).")
+                          f"notes budget ({notes_chars:,} characters of notes). Raise **Notes budget** in "
+                          "**Ollama model details** to send more.")
             try:
                 uploads_dirs = get_library_uploads_dirs(Library().load_library(safe_lib))
             except Exception:
@@ -11268,33 +14519,46 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                     if use_llm_answer and agents else None
                 ),
             }
+            search_state["notes_chars"] = notes_chars  # follow-ups send the notes with the same budget
             # A chosen task can drive the answer on its own, e.g. after an exact-text search.
             if final_results and use_llm_answer and (
                 search_state["question"] or (tasks and not listing)
             ):
-                with llm_progress(search_progress_slot, f"Generating answer with `{selected_ollama_model}`…") as report:
-                    try:
-                        search_state["answer"], search_state["usage"] = answer_with_ollama(
-                            question=search_state["question"],
-                            results=final_results,
-                            model_name=selected_ollama_model,
-                            max_tokens=llm_max_tokens,
-                            temperature=llm_temperature,
-                            corpus_prompt=with_salesforce_context(
-                                search_state, search_state["prompt_context"], final_results),
-                            task_prompt=search_state["task_prompt"],
-                            on_progress=report,
-                        )
-                        for task in tasks:
-                            mark_prompt_used(task["id"])
-                        if run_references:
-                            mark_references_used([ref["id"] for ref in run_references])
-                    except Exception as llm_exc:
-                        search_state["answer_error"] = str(llm_exc)
-                # Keep this run's speed for the model, and show it under Search now the spinner has gone.
-                record_llm_speed(selected_ollama_model, search_state["usage"])
-                search_progress_slot.caption(describe_llm_speed(selected_ollama_model))
+                if notes_run_answering() and scope_clicked:  # a Chat message's run: written in the background
+                    start_background_answer(
+                        search_state, search_state["question"], final_results, selected_ollama_model, llm_max_tokens,
+                        llm_temperature,
+                        with_read_aloud(with_salesforce_context(search_state, search_state["prompt_context"],
+                                                                final_results), "ask"),
+                        search_state["task_prompt"], notes_chars)
+                else:
+                    with llm_progress(search_progress_slot, f"Generating answer with `{selected_ollama_model}`…") as report:
+                        try:
+                            search_state["answer"], search_state["usage"] = answer_with_ollama(
+                                question=search_state["question"],
+                                results=final_results,
+                                model_name=selected_ollama_model,
+                                max_tokens=llm_max_tokens,
+                                temperature=llm_temperature,
+                                corpus_prompt=with_read_aloud(with_salesforce_context(
+                                    search_state, search_state["prompt_context"], final_results), "ask"),
+                                task_prompt=search_state["task_prompt"],
+                                on_progress=report,
+                                notes_chars=notes_chars,
+                            )
+                            search_state["narrated"] = bool(read_aloud_instruction("ask"))
+                            queue_read_aloud("ask", search_state["answer"])
+                            for task in tasks:
+                                mark_prompt_used(task["id"])
+                            if run_references:
+                                mark_references_used([ref["id"] for ref in run_references])
+                        except Exception as llm_exc:
+                            search_state["answer_error"] = str(llm_exc)
+                    # Keep this run's speed for the model, and show it under Search now the spinner has gone.
+                    record_llm_speed(selected_ollama_model, search_state["usage"])
+                    search_progress_slot.caption(describe_llm_speed(selected_ollama_model))
             st.session_state[LAST_SEARCH_KEY] = search_state
+            notes_run_step_done()
 
             if final_results and use_llm_answer and not listing:
                 tuning = {"llm_max_tokens": llm_max_tokens, "llm_temperature": llm_temperature}
@@ -11307,6 +14571,7 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                 st.rerun()
     except Exception as exc:
         st.error(f"Search failed: {exc}")
+    notes_run_step_done()  # whatever happened (nothing found, index not ready): the run moves on from here
 
 # Results are kept in session state so they survive reruns (follow-ups, downloads, expanders).
 last_search = st.session_state.get(LAST_SEARCH_KEY)
