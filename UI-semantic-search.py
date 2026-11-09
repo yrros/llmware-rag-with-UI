@@ -154,6 +154,7 @@ ACTIONS_LOG_PATH = APP_DATA_DIR / "actions_log.json"  # which notes each Agent h
 PROMPT_STACK_SIZE = 5
 
 DEFAULT_APP_SETTINGS = {
+    "outbox_hold_minutes": 10,  # how long a sent package is held for review before connectors can see it
     "use_gpu_for_embeddings": False,
     "hide_corpora_enabled": False,
     "corpus_mode": "multi",
@@ -165,7 +166,12 @@ DEFAULT_APP_SETTINGS = {
     "dictate_hotkey": "`",
     "dictate_hotkey_2": "",  # an optional second key, e.g. for another keyboard layout
     "open_on_chat": False,  # open the app on Chat with LLM instead of the search page
+    "notify_when_away": True,  # a macOS notification when LLM work finishes while you're on another tab or app
+    "note_dates": "either",  # how date filter terms match a note: its text, its file's creation date, or either
 }
+NOTE_DATES_SETTING = "note_dates"
+NOTE_DATES_OPTIONS = {"text": "Written in the note (e.g. 2026-11-05)", "created": "The file's creation date",
+                      "either": "Either"}
 
 CORPUS_MODE_MULTI = "multi"
 CORPUS_MODE_SINGLE = "single"
@@ -1723,6 +1729,13 @@ def load_prompt_library() -> dict:
         library.setdefault("links", [])  # common links: [{"id", "title", "url"}]; prompts pick theirs by id
         library.setdefault("references", [])  # reference documents: [{"id", "title", "notes", "last_used"?}]
         library.setdefault("semantic_fixes", [])  # Agent Semantic Fixes: [{"id", "text", "added", "edited"?}]
+        library.setdefault("workflows", [])  # Note-Workflows: [{"id", "name", "dates", "model", "stages"}]
+        if not library.get("workflows_seeded"):  # Weekly Kick-off, added once, so deleting it sticks
+            library["workflows"].append(weekly_kickoff_workflow())
+            library["workflows_seeded"] = True
+            save_prompt_library(library)
+        for workflow in library["workflows"]:  # starred ones head the search page's menu
+            workflow.setdefault("favourite", workflow["id"] == "weekly_kickoff")
         for prompt in library["prompts"]:
             # Libraries saved before Agent existed: prompts that already drafted output become Agents.
             prompt.setdefault("agent", prompt.get("output", "text") in DRAFT_OUTPUT_TYPES and not prompt.get("global"))
@@ -1861,6 +1874,12 @@ HANDOFF_SCHEMA_PATHS = {
 NEXT_STEP_LIMIT = 255  # characters an opportunity's Next Step can hold
 DEFAULT_OUTBOX_DIR = PROJECT_DIR / "outbox"
 HANDOFF_RESULT_DIRS = ("processed", "failed")  # where connectors move packages, with a receipt beside each
+# Sent packages wait here for their review time, out of connectors' reach (they only read the outbox's top level),
+# with a .hold.json beside each saying when it's released into the outbox.
+HELD_DIR = "held"
+OUTBOX_HOLD_SETTING = "outbox_hold_minutes"
+OUTBOX_HOLD_RANGE = (5, 60)  # the default review time, set on the Configure page (minutes)
+REVIEW_HOLD_RANGE = (5, 300)  # one package's review time, set on its staged box (minutes)
 RELATED_KINDS = ["", "opportunity", "account", "contact"]
 TASK_PRIORITIES = ["", "low", "normal", "high"]
 STRUCTURED_OUTPUT_GUIDES = {
@@ -3148,6 +3167,18 @@ def stage_agent_items(
         items = expand_next_steps(entries, marker, profile_short_name(library), datetime.date.today())
     else:
         items = [apply_title_marker(normalise_draft_item(item_type, item), marker) for item in entries]
+    # Salesforce knows people by their full name: a nickname from the notes (e.g. an owner) becomes the full
+    # name the saved facts, About me or the corpus prompt give, so the connector can match it.
+    people = item_people(items)
+    if people:
+        try:
+            library_key = str(search_state.get("library") or "")
+            corpus = get_active_corpus_prompt(get_corpus_config(library_key)) \
+                if library_key and library_key != ALL_LIBRARIES_KEY else ""
+            aliases = extract_aliases(alias_facts(corpus_prompt=corpus), model_name, chat_with_ollama, people)
+        except RuntimeError:
+            aliases = {}
+        items = [apply_aliases(item, aliases) for item in items]
     for item in items:
         item["_agent_id"] = prompt["id"]  # which Agent staged it, for the actions log; not sent
     return {
@@ -3178,16 +3209,105 @@ def validate_handoff_package(package: dict) -> None:
     jsonschema.validate(package, json.loads(path.read_text()))
 
 
-def write_handoff_package(package: dict, outbox: Path) -> Path:
-    """Validate, then write atomically so a connector never reads a half-written file."""
+def write_handoff_package(package: dict, outbox: Path, hold_until: datetime.datetime | None = None) -> Path:
+    """Validate, then write atomically so a connector never reads a half-written file. With `hold_until`, it's
+    written to held/ instead and released into the outbox then. Returns its path in the outbox either way."""
     validate_handoff_package(package)
-    outbox.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.fromisoformat(package["created"]).strftime("%Y%m%d-%H%M%S")
     target = outbox / f"{stamp}-{package['item_type']}-{package['id'][:8]}.json"
-    temp = outbox / f".{target.name}.tmp"
+    folder = outbox / HELD_DIR if hold_until else outbox
+    folder.mkdir(parents=True, exist_ok=True)
+    if hold_until:
+        write_hold(folder / target.name, hold_until)
+    temp = folder / f".{target.name}.tmp"
     temp.write_text(json.dumps(package, indent=2, ensure_ascii=False))
-    temp.replace(target)
+    temp.replace(folder / target.name)
     return target
+
+
+def held_path(package_file: Path) -> Path:
+    """Where a package (named by its outbox path) waits while held for review."""
+    return package_file.parent / HELD_DIR / package_file.name
+
+
+def hold_sidecar(path: Path) -> Path:
+    return path.with_name(f"{path.stem}.hold.json")
+
+
+def write_hold(path: Path, release_at: datetime.datetime) -> None:
+    sidecar = hold_sidecar(path)
+    temp = sidecar.with_name(f".{sidecar.name}.tmp")
+    temp.write_text(json.dumps({"release_at": release_at.astimezone().isoformat(timespec="seconds")}))
+    temp.replace(sidecar)
+
+
+def read_hold(path: Path) -> datetime.datetime | None:
+    """When a held package is released (None: no note, so it goes at the next check)."""
+    try:
+        when = datetime.datetime.fromisoformat(json.loads(hold_sidecar(path).read_text())["release_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return when if when.tzinfo else when.astimezone()
+
+
+def held_outbox_files(outbox: Path) -> list[Path]:
+    folder = outbox / HELD_DIR
+    if not folder.is_dir():
+        return []
+    return [p for p in folder.glob("*.json") if not p.name.startswith(".") and not p.name.endswith(".hold.json")]
+
+
+def release_package(path: Path) -> bool:
+    """Move a held package into the outbox now (its hold note goes). False if it had already moved."""
+    if not path.is_file():
+        return False
+    target = path.parent.parent / path.name
+    path.replace(target)
+    hold_sidecar(path).unlink(missing_ok=True)
+    return True
+
+
+def release_held_packages(outbox: Path | None = None) -> int:
+    """Release every held package whose review time is up. Run on each page and by a background thread."""
+    outbox = outbox or get_outbox_dir()
+    now = datetime.datetime.now().astimezone()
+    released = 0
+    for path in held_outbox_files(outbox):
+        when = read_hold(path)
+        if when is None or when <= now:
+            try:
+                released += release_package(path)
+            except OSError:
+                pass
+    return released
+
+
+HOLD_THREAD_NAME = "outbox-hold-release"
+
+
+def start_hold_release_thread() -> None:
+    """Once per server: release held packages on time, even when no page is open (while the app runs)."""
+    if any(thread.name == HOLD_THREAD_NAME for thread in threading.enumerate()):
+        return
+
+    def loop() -> None:
+        while True:
+            try:
+                release_held_packages()
+            except Exception:
+                pass
+            time.sleep(20)
+
+    threading.Thread(target=loop, name=HOLD_THREAD_NAME, daemon=True).start()
+
+
+def outbox_hold_minutes() -> int:
+    """The default review time (Configure page), in minutes."""
+    try:
+        minutes = int(load_app_settings().get(OUTBOX_HOLD_SETTING) or DEFAULT_APP_SETTINGS[OUTBOX_HOLD_SETTING])
+    except (TypeError, ValueError):
+        minutes = DEFAULT_APP_SETTINGS[OUTBOX_HOLD_SETTING]
+    return max(OUTBOX_HOLD_RANGE[0], min(OUTBOX_HOLD_RANGE[1], minutes))
 
 
 def build_handoff_package(
@@ -3252,6 +3372,8 @@ def render_outbox_status(link: bool = True) -> None:
     """One line at the top of every page: what's waiting in the outbox, what needs attention, and when a
     connector last processed it, with a link to the Actions page."""
     outbox = get_outbox_dir()
+    release_held_packages(outbox)
+    held = len(held_outbox_files(outbox))
     waiting = pending_outbox_files(outbox)
     items = 0
     for path in waiting:
@@ -3263,6 +3385,7 @@ def render_outbox_status(link: bool = True) -> None:
 
     st.caption(
         f":material/outbox: **Outbox:** {len(waiting)} waiting ({items} item{'' if items == 1 else 's'})"
+        + (f" · {held} held for review" if held else "")
         + (f" · :orange[**{attention} need{'s' if attention == 1 else ''} attention**]" if attention else "")
         + f" · Last processed {format_when(latest_receipt_time(outbox / 'processed'))}"
         + f" · Last error {format_when(latest_receipt_time(outbox / 'failed'))}"
@@ -3277,6 +3400,7 @@ def render_outbox_status(link: bool = True) -> None:
 ACTIONS_PAGE_URL = "?page=actions"
 OUTBOX_STATES = {  # tab order on the Actions page: what needs attention first
     "failed": ("Needs attention", "Nothing needs attention."),
+    "held": ("Held for review", "Nothing is held for review."),
     "waiting": ("Waiting", "Nothing is waiting for a connector."),
     "processed": ("Processed", "Nothing has been processed yet."),
     "withdrawn": ("Withdrawn", "Nothing has been withdrawn."),
@@ -3289,6 +3413,7 @@ PACKAGE_STATUS = {
     "needs_review": ("⚠️", "needs review"),
     "failed": ("❌", "failed"),
     "waiting": ("⏳", "waiting"),
+    "held": ("⏸️", "held for review"),
     "withdrawn": ("🚫", "withdrawn"),
     "": ("❔", "no receipt"),
 }
@@ -3307,6 +3432,7 @@ def load_outbox_entries(outbox: Path) -> dict[str, list[dict]]:
     """Every package by state (see OUTBOX_STATES), newest first, with its receipt if it has one."""
     entries: dict[str, list[dict]] = {state: [] for state in OUTBOX_STATES}
     files = [("waiting", path) for path in pending_outbox_files(outbox)]
+    files += [("held", path) for path in held_outbox_files(outbox)]
     for folder in (*HANDOFF_RESULT_DIRS, WITHDRAWN_DIR):
         files += [
             (folder, path) for path in (outbox / folder).glob("*.json")
@@ -3318,7 +3444,7 @@ def load_outbox_entries(outbox: Path) -> dict[str, list[dict]]:
             entry["package"] = json.loads(path.read_text())
         except (OSError, ValueError) as exc:
             entry["error"] = f"This file can't be read as a package: {exc}"
-        if state != "waiting" and receipt_beside(path).is_file():
+        if state not in ("waiting", "held") and receipt_beside(path).is_file():
             try:
                 entry["receipt"] = json.loads(receipt_beside(path).read_text())
             except (OSError, ValueError):
@@ -3354,6 +3480,7 @@ def move_outbox_package(path_text: str, destination: str, action: str) -> None:
         else:
             receipt.unlink()
     path.replace(target_dir / path.name)
+    hold_sidecar(path).unlink(missing_ok=True)  # a held package sent now or withdrawn isn't held any more
     st.session_state["actions_notice"] = f"{action} `{path.name}`."
 
 
@@ -3424,7 +3551,7 @@ def render_outbox_entry(entry: dict, state: str) -> None:
     items = [item for item in package.get("items", []) if isinstance(item, dict)]
     source = package.get("source") or {}
     prompt_name = (source.get("prompt") or {}).get("name", "")
-    status = state if state in ("waiting", "withdrawn") else receipt.get("status", "")
+    status = state if state in ("waiting", "held", "withdrawn") else receipt.get("status", "")
     icon, status_text = PACKAGE_STATUS.get(status, PACKAGE_STATUS[""])
     kind = {"note": "note", "task": "task", "email": "email", "update": "update"}.get(package.get("item_type"), "item")
     flagged = sum(1 for index, item in enumerate(items) if item_duplicate_matches(entry, index, item)) \
@@ -3534,6 +3661,18 @@ def render_outbox_entry_actions(entry: dict, state: str) -> None:
     path, key = str(entry["path"]), f"{state}_{entry['path'].name}"
     unreadable = bool(entry["error"] or (entry["receipt"] or {}).get("error"))
     with st.container(horizontal=True):
+        if state == "held":
+            when = read_hold(entry["path"])
+            st.caption(f"Held for review until **{when.strftime('%d %b %H:%M') if when else 'the next check'}**, "
+                       "then released into the outbox for a connector.")
+            st.button(
+                "Send now",
+                icon=":material/send:",
+                key=f"actions_release_{key}",
+                on_click=move_outbox_package,
+                args=(path, "", "Released into the outbox:"),
+                help="Stop holding it: a connector can pick it up at its next run.",
+            )
         if state == "failed":
             st.button(
                 "Retry",
@@ -3547,7 +3686,7 @@ def render_outbox_entry_actions(entry: dict, state: str) -> None:
                     if unreadable else "Move it back to the outbox for the connector's next run."
                 ),
             )
-        if state in ("waiting", "failed"):
+        if state in ("waiting", "failed", "held"):
             with st.popover("Withdraw", icon=":material/block:", help="Take it out of the outbox so no connector acts on it"):
                 st.markdown(
                     "Withdraw this package? Connectors won't see it. Nothing already created in the other system "
@@ -3589,7 +3728,7 @@ def render_outbox_entry_actions(entry: dict, state: str) -> None:
         render_package_editor(entry, key, editable, state)
 
 
-EDITABLE_OUTBOX_STATES = ("waiting", "failed", "withdrawn")
+EDITABLE_OUTBOX_STATES = ("waiting", "held", "failed", "withdrawn")
 
 
 def editable_item_indexes(entry: dict, state: str) -> list[int]:
@@ -3876,19 +4015,68 @@ ALIAS_SCHEMA = {"type": "object", "required": ["aliases"], "properties": {"alias
 PERSON_FIELDS = ("owner", "to")  # fields holding people, where a known nickname is replaced by the full name
 
 
-def extract_aliases(texts: list[str], model_name: str, chat) -> dict[str, str]:
-    """{nickname, lower case: full name} stated in the fixes and context. The model only reads them out; the
-    app makes the swap, so it doesn't depend on the model judging the item (cached for the session)."""
+def alias_facts(extra: list[str] | None = None, corpus_prompt: str = "") -> list[str]:
+    """What people's full names are looked up in: the saved Fix with context facts, About me (that's you, the
+    user) and the library's corpus prompt, plus anything given for this item."""
+    library = load_prompt_library()
+    profile = library.get("profile") or {}
+    texts = [str(f.get("text", "")) for f in semantic_fixes(library)]
+    if profile.get("enabled") and str(profile.get("text", "")).strip():
+        texts.append("About me (the user): " + str(profile["text"]).strip())
+    if corpus_prompt.strip():
+        texts.append("About these notes: " + corpus_prompt.strip())
+    return [t for t in texts + list(extra or []) if t.strip()]
+
+
+def item_people(items: list[dict]) -> list[str]:
+    """The names in the items' person fields (owner, recipients)."""
+    names = []
+    for item in items:
+        if isinstance(item.get("owner"), str):
+            names.append(item["owner"])
+        if isinstance(item.get("to"), list):
+            names.extend(str(r) for r in item["to"])
+    return list(dict.fromkeys(n.strip() for n in names if n.strip()))
+
+
+FULL_NAME_PATTERN = re.compile(r"\b([A-Z][a-z]+(?:[ -][A-Z][a-z'’-]+)+)\b")  # e.g. Samantha Example
+
+
+def short_name_matches(names: list[str], texts: list[str]) -> dict[str, str]:
+    """{name, lower case: full name} where the name is the start of the first name of exactly one full name in the
+    facts, e.g. a shortened first name of the user named in About me. Ambiguous or unmatched names are left out."""
+    full_names = {m.group(1) for t in texts for m in FULL_NAME_PATTERN.finditer(t)}
+    found = {}
+    for name in names:
+        short = name.strip()
+        if len(short) < 2 or " " in short:
+            continue
+        hits = {f for f in full_names if f.split()[0].lower().startswith(short.lower()) and f.lower() != short.lower()}
+        if len(hits) == 1:
+            found[short.lower()] = hits.pop()
+    return found
+
+
+def extract_aliases(texts: list[str], model_name: str, chat, names: list[str] | None = None) -> dict[str, str]:
+    """{nickname, lower case: full name} from the facts. The model only reads them out; the app makes the swap,
+    so it doesn't depend on the model judging the item (cached for the session). With `names` (the people an
+    item names), it's also asked which of them is a short form of a full name in the facts, e.g. a shortened first
+    name of the user in About me, which no fact states as a pair."""
     facts = "\n".join(f"- {t.strip()}" for t in texts if t.strip())
     if not facts:
         return {}
     cache = st.session_state.setdefault("reassess_alias_cache", {})
-    key = json.dumps([facts, model_name])
+    key = json.dumps([facts, model_name, sorted(names or [])])
     if key not in cache:
+        ask = ("List every person these facts give a nickname, short name or alias for, with their full name. "
+               "Only pairs the facts state; an empty list if there are none.")
+        if names:
+            ask += (" Also, for each of these names: " + ", ".join(names) + " — if it is a nickname or a short "
+                    "form of the first name of exactly one full name in the facts (e.g. 'Sam' for 'Samantha "
+                    "Example'), list it with that full name. Leave out a name that is already a full name or that "
+                    "matches nobody, or more than one person.")
         reply, _usage = chat(
-            [{"role": "user", "content": (
-                "List every person these facts give a nickname, short name or alias for, with their full name. "
-                "Only pairs the facts state; an empty list if there are none.\n\n" + facts)}],
+            [{"role": "user", "content": ask + "\n\n" + facts}],
             model_name, max_tokens=512, temperature=0.0, response_format=ALIAS_SCHEMA, think=False,
         )
         try:
@@ -3900,6 +4088,8 @@ def extract_aliases(texts: list[str], model_name: str, chat) -> dict[str, str]:
             for p in pairs if isinstance(p, dict) and str(p.get("alias", "")).strip() and str(p.get("full_name", "")).strip()
             and str(p.get("alias", "")).strip().lower() != str(p.get("full_name", "")).strip().lower()
         }
+        unmatched = [n for n in names or [] if n.strip().lower() not in cache[key]]
+        cache[key].update(short_name_matches(unmatched, texts))  # what the model left: a plain first-name match
     return cache[key]
 
 
@@ -3922,7 +4112,9 @@ def reassess_item(entry: dict, index: int, context: str, model_name: str, chat=N
     package = entry["package"]
     item = package["items"][index]
     fixes = semantic_fixes()
-    aliases = extract_aliases([f["text"] for f in fixes] + [context], model_name, chat)
+    library_key = str(package.get("source", {}).get("library_key") or "")
+    corpus = get_active_corpus_prompt(get_corpus_config(library_key)) if library_key else ""
+    aliases = extract_aliases(alias_facts([context], corpus), model_name, chat, item_people([item]))
     resolved = apply_aliases(item, aliases)
     reply, _usage = chat(reassess_messages(package, index, entry["receipt"], context, fixes, resolved), model_name,
                          max_tokens=1024, temperature=0.1, num_ctx=FOLLOW_UP_NUM_CTX,
@@ -4308,7 +4500,7 @@ def render_duplicate_check_panel(entries: dict[str, list[dict]]) -> None:
 
 
 # Actions log: which notes each Agent has actioned, for tracking. A note is logged when its package is sent
-# (That's right), marked done when the connector's receipt says its items went through, and logged as done
+# (Execute, or Send), unlogged if it's recalled while held, marked done when the connector's receipt says its items went through, and logged as done
 # when the Agent's mark (e.g. [SF_Tasks]) is found in the note, for things done by hand in Apple Notes.
 ACTIONS_LOG_FORMAT = "llm-notes-actions-log/v1"
 ACTION_STATUS_BADGES = {"done": "✓", "sent": "⏳", "failed": "⚠", "withdrawn": "↩"}
@@ -4389,6 +4581,8 @@ def package_action_status(entry: dict) -> tuple[str, list[str]]:
         if done or (not results and receipt.get("status") == "done"):
             return "done", links
         return "failed", []
+    if held_path(package_file).is_file():
+        return "sent", []  # held for review, then released
     if (package_file.parent / WITHDRAWN_DIR / package_file.name).is_file() or not package_file.is_file():
         return "withdrawn", []  # withdrawn on the Actions page, or deleted
     return "sent", []
@@ -4546,6 +4740,16 @@ def describe_actioned_filter() -> str:
     return f"{'not yet actioned' if setting['mode'] == 'hide' else 'actioned'} {by}"
 
 
+# Actioned set to anything but All notes: the row turns strongly red, as it quietly hides (or keeps only) notes.
+ACTIONED_ON_STYLE = """<style>
+.st-key-actioned_filter_row { padding: 0.25rem 0.5rem; border-radius: 0.5rem;
+  background: rgba(220, 38, 38, 0.16); outline: 2px solid rgb(220, 38, 38); }
+.st-key-actioned_filter_row p { color: rgb(220, 38, 38) !important; font-weight: 700; }
+.st-key-actioned_filter_row [data-testid="stSelectbox"] [role="group"] { border: 2px solid rgb(220, 38, 38) !important;
+  background: rgba(220, 38, 38, 0.12) !important; }
+</style>"""
+
+
 def render_actioned_filter() -> None:
     """Actioned: All notes / Not yet actioned / Only actioned, by one Agent or any."""
     setting = actioned_filter_setting()
@@ -4553,6 +4757,8 @@ def render_actioned_filter() -> None:
     st.session_state.setdefault("actioned_filter_mode", setting["mode"])
     st.session_state.setdefault("actioned_filter_agent", setting["agent"] if setting["agent"] in agents else "")
     with st.container(horizontal=True, vertical_alignment="center", gap="small", key="actioned_filter_row"):
+        if st.session_state["actioned_filter_mode"] != "all":
+            st.html(ACTIONED_ON_STYLE)
         st.markdown("Actioned", width="content", help=(
             "Leave out notes an Agent has already actioned, or show only those. A note counts once its package "
             "is sent (⏳) or done (✓), or when the Agent's mark, e.g. `[SF_Tasks]`, is in the note. Failed and "
@@ -5013,8 +5219,8 @@ def render_agent_workflow_editor(prompt: dict) -> None:
         placeholder="e.g. Send to tasks in Salesforce",
         help=(
             "The last step. Its button in the Discussion panel stages what you agreed as "
-            f"{OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()}; you confirm with **That's right** "
-            "before anything goes to the outbox."
+            f"{OUTPUT_TYPES[get_prompt_output_type(prompt)].lower()} and sends them, held for review first "
+            "(the Configure page's review time) so you can drop items or Recall them before a connector sees them."
         ),
     )
     st.text_input(
@@ -5633,8 +5839,22 @@ def render_configure_page() -> None:
             on_change=persist_outbox_path,
             help="Must match the folder your connector reads. Leave empty for the default.",
         )
+        st.slider(
+            "Review time before sending",
+            *OUTBOX_HOLD_RANGE,
+            value=outbox_hold_minutes(),
+            step=5,
+            format="%d min",
+            key="outbox_hold_input",
+            on_change=lambda: save_app_settings({OUTBOX_HOLD_SETTING: int(st.session_state["outbox_hold_input"])}),
+            help="An Agent's **Execute** sends its items straight away, but they're held (in held/, which connectors "
+                 "don't read) for this long first, so you can review them, drop some, or **Recall** them. A "
+                 "connector sync during that time doesn't see them. Each staged box can change its own time, up "
+                 "to 300 minutes.",
+        )
         counts = {folder: len(list((outbox / folder).glob("*.receipt.json"))) for folder in HANDOFF_RESULT_DIRS}
-        st.caption(f"Waiting: **{waiting}** · Processed: **{counts['processed']}** · Failed: **{counts['failed']}**")
+        st.caption(f"Held: **{len(held_outbox_files(outbox))}** · Waiting: **{waiting}** · Processed: "
+                   f"**{counts['processed']}** · Failed: **{counts['failed']}**")
 
     marker = get_title_marker(library)
     with st.expander(
@@ -5646,7 +5866,7 @@ def render_configure_page() -> None:
         st.caption(
             "Added to the title of everything an **Agent** stages (task subjects, note titles, email subjects), "
             "so you can find those records easily, e.g. in Salesforce. It's added when the Agent stages, so you "
-            "see it before **That's right**; a title that already contains it is left alone. Empty means off."
+            "see it before it's sent; a title that already contains it is left alone. Empty means off."
         )
         with st.container(horizontal=True, vertical_alignment="bottom"):
             st.text_input(
@@ -5784,6 +6004,7 @@ def render_prompt_library_page() -> None:
     render_reference_documents_section(library)
 
     render_rag_prompts_section()
+    render_workflows_section()
     with prompt_section("task", "Task prompts", ":material/checklist:"):
         st.caption(
             "Pick a task in the Ask panel to tell the LLM what to write from the notes. Tick **Global** to "
@@ -6381,6 +6602,44 @@ def library_source_paths(safe_lib: str, library_folder: str, corpus_root: str) -
     return {source: path for source, path in paths.items() if path}
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def library_file_created(folder: str) -> dict[str, list[str]]:
+    """{file name: [its creation date, e.g. 2026-11-05]} for every note under a library folder (cached 5 min)."""
+    root = Path(folder)
+    created: dict[str, list[str]] = {}
+    if root.is_dir():
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in INGEST_EXTENSIONS and not path.name.startswith("."):
+                info = path.stat()
+                stamp = getattr(info, "st_birthtime", None) or info.st_mtime  # macOS keeps the creation time
+                created.setdefault(path.name, []).append(datetime.date.fromtimestamp(stamp).isoformat())
+    return created
+
+
+def date_matches(terms: set[str], safe_lib: str, library_folder: Path) -> dict[str, list[str]]:
+    """{date term: notes whose file was created then} for the date-like terms (2026-11-05, 2026-11, 2026,
+    Week#45), when Note dates matches creation dates."""
+    if load_app_settings().get(NOTE_DATES_SETTING, "either") == "text":
+        return {}
+    created = library_file_created(str(library_folder))
+    try:
+        with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+            table = safe_lib.replace('"', '""')
+            sources = [str(r[0]) for r in conn.execute(f'SELECT DISTINCT file_source FROM "{table}"')]
+    except sqlite3.Error:
+        sources = []
+    dated = {source: created.get(Path(source).name, []) for source in sources}
+    found: dict[str, list[str]] = {}
+    for term in terms:
+        if re.fullmatch(r"\d{4}(-\d{2}){0,2}", term):
+            found[term] = [s for s, days in dated.items() if any(d.startswith(term) for d in days)]
+        elif week := re.fullmatch(r"week\s*#?\s*(\d{1,2})", term):
+            number = int(week.group(1))
+            found[term] = [s for s, days in dated.items()
+                           if any(datetime.date.fromisoformat(d).isocalendar()[1] == number for d in days)]
+    return found
+
+
 def with_path_matches(search_filter: dict, safe_lib: str, library_folder: Path | None, corpus_root: Path | None) -> dict:
     """Let filter terms match the folders notes are in, e.g. `Clients-Prospects`.
 
@@ -6397,7 +6656,8 @@ def with_path_matches(search_filter: dict, safe_lib: str, library_folder: Path |
     for term in terms:
         if hits := [source for source, haystack in haystacks.items() if term in haystack]:
             path_sources[term] = hits
-    return {**search_filter, "path_sources": path_sources}
+    return {**search_filter, "path_sources": path_sources, "date_sources": date_matches(terms, safe_lib, library_folder),
+            "date_mode": load_app_settings().get(NOTE_DATES_SETTING, "either")}
 
 
 def add_folder_paths(results: list, library_folder: Path, corpus_root: Path | None) -> None:
@@ -7082,13 +7342,15 @@ def sticky_follow_up_style(box_key: str) -> str:
     and scrolls within itself when it's taller than the window.
     """
     background = "#0e1117" if st.context.theme.type == "dark" else "#ffffff"
-    # A column holds one .stVerticalBlock; the keyed box (or the wrapper carrying its key) sits directly in it.
-    column = f'[data-testid="stColumn"]:has(> .stVerticalBlock > .st-key-{box_key})'
+    # A column holds one .stVerticalBlock; the keyed box sits in it, inside a layout wrapper exactly its own
+    # height (a sticky element can't move within that), so the wrapper is what sticks.
+    column = f'[data-testid="stColumn"]:has(> .stVerticalBlock > [data-testid="stLayoutWrapper"] > .st-key-{box_key})'
+    sticky = f'[data-testid="stLayoutWrapper"]:has(> .st-key-{box_key})'
     return f"""<style>
 [data-testid="stHorizontalBlock"]:has({column}) {{ align-items: stretch; }}
 {column} {{ align-self: stretch; }}
 {column} > .stVerticalBlock {{ height: 100%; }}
-.st-key-{box_key} {{ position: sticky; top: 4.25rem; z-index: 5; background: {background};
+{sticky} {{ position: sticky; top: 4.25rem; z-index: 5; background: {background};
   max-height: calc(100vh - 5.5rem); overflow-y: auto; overflow-x: hidden; }}
 </style>"""
 
@@ -7300,11 +7562,16 @@ def render_library_counts(search_state: dict, key_prefix: str = "results") -> No
     if library_counts:
         shown_notes = len({(r.get("_library"), r.get("file_source")) for r in results})
         total_notes = sum(count for _library, count in library_counts)
+        listed = {r.get("_library") for r in results}
+        counts = dict(library_counts)
+        # Only the selected library's notes are listed: compare with its own count, not every library's.
+        here = counts.get(next(iter(listed))) if len(listed) == 1 and next(iter(listed)) in counts else total_notes
         with st.expander(
             f"Matches by library — {total_notes} note(s) in {len(library_counts)} library(ies)",
             expanded=True,
         ):
-            if shown_notes < total_notes:
+            if shown_notes < here:
+                total_notes = here
                 with st.container(horizontal=True, vertical_alignment="center"):
                     st.warning(f"Showing **{shown_notes} of {total_notes}** matching notes: **Max results** is "
                                f"{st.session_state.get(max_results_key(True), shown_notes)}.",
@@ -7783,25 +8050,148 @@ def start_needs_work(agent: dict) -> None:
     agent["rejected"], agent["staged"], agent["needs_work"] = agent["staged"], None, True
 
 
+def staged_signature(staged: dict) -> str:
+    return hashlib.sha1(json.dumps(staged["items"], sort_keys=True, default=str).encode()).hexdigest()
+
+
 def send_staged_to_outbox(
     search_state: dict, prompts: list[dict], source_notes: list[tuple[str, Path | None]]
 ) -> None:
+    """Write the staged items as one package, held for its review time (the staged box's slider, else the
+    Configure default) before connectors can see it. The staged box stays, to review, drop items or Recall."""
     agent = search_state["agent"]
     staged = agent["staged"]
+    minutes = int(st.session_state.get(f"agent_hold_{staged['id']}") or outbox_hold_minutes())
+    now = datetime.datetime.now().astimezone()
     try:
         package = build_handoff_package(search_state, prompts, staged, source_notes)
-        path = write_handoff_package(package, get_outbox_dir())
+        path = write_handoff_package(package, get_outbox_dir(), now + datetime.timedelta(minutes=minutes))
     except Exception as exc:
         agent["send_error"] = f"Couldn't write to the outbox: {exc}"
         return
     log_sent_actions(search_state, prompts, staged, path)
+    staged["hold_minutes"] = minutes
+    staged["held"] = {"file": str(path), "at": now.isoformat(timespec="seconds"), "created": package["created"],
+                      "sig": staged_signature(staged)}
+
+
+def finish_held(agent: dict) -> None:
+    """The staged package is out of the staged box: listed under Sent (held, released or withdrawn)."""
+    staged = agent["staged"]
+    held = staged["held"]
     agent["sent"].append({
-        "file": str(path),
+        "file": held["file"],
         "type": staged["type"],
         "items": staged["items"],
-        "at": datetime.datetime.now().strftime("%H:%M"),
+        "at": datetime.datetime.fromisoformat(held["at"]).strftime("%H:%M"),
     })
     agent["staged"] = None
+
+
+def unlog_package(package_file: str) -> None:
+    """A recalled package wasn't sent after all: drop its entries from the actions log."""
+    log = load_actions_log()
+    kept = [entry for entry in log["entries"] if entry.get("package") != package_file]
+    if len(kept) != len(log["entries"]):
+        log["entries"] = kept
+        save_actions_log(log)
+
+
+def sync_held_staged(search_state: dict, prompts: list[dict], source_notes: list[tuple[str, Path | None]]) -> None:
+    """Keep a held package in step with its staged box: changes made there (items dropped, records picked) are
+    written to it; once it's left held/ (released, or sent or withdrawn on the Actions page) it moves to Sent."""
+    agent = search_state["agent"]
+    staged = agent["staged"]
+    held = staged.get("held")
+    if not held:
+        return
+    path = held_path(Path(held["file"]))
+    if not path.is_file():
+        finish_held(agent)
+        return
+    if not staged["items"]:  # everything dropped: nothing to send
+        recall_staged(agent)
+        return
+    signature = staged_signature(staged)
+    if signature == held.get("sig"):
+        return
+    try:
+        package = build_handoff_package(search_state, prompts, staged, source_notes)
+        package["created"] = held["created"]
+        validate_handoff_package(package)
+        temp = path.with_name(f".{path.name}.tmp")
+        temp.write_text(json.dumps(package, indent=2, ensure_ascii=False))
+        temp.replace(path)
+    except Exception as exc:
+        agent["send_error"] = f"Couldn't change the held package: {exc}"
+        return
+    if Path(held["file"]).is_file():  # released while it was being written: the change came too late
+        path.unlink(missing_ok=True)
+        agent["send_error"] = "It was released into the outbox just before that change, so the change wasn't sent."
+        finish_held(agent)
+        return
+    held["sig"] = signature
+    unlog_package(held["file"])
+    log_sent_actions(search_state, prompts, staged, Path(held["file"]))
+
+
+def set_staged_hold(agent: dict) -> None:
+    """The staged box's Review time: held that long from when it was sent (released now if that's passed)."""
+    staged = agent.get("staged")
+    if not staged:
+        return
+    staged["hold_minutes"] = int(st.session_state[f"agent_hold_{staged['id']}"])
+    held = staged.get("held")
+    path = held_path(Path(held["file"])) if held else None
+    if path and path.is_file():
+        write_hold(path, datetime.datetime.fromisoformat(held["at"])
+                   + datetime.timedelta(minutes=staged["hold_minutes"]))
+
+
+def release_staged(agent: dict) -> None:
+    """Send now: release the held package into the outbox."""
+    held = (agent.get("staged") or {}).get("held")
+    if held:
+        release_package(held_path(Path(held["file"])))
+        finish_held(agent)
+
+
+def recall_staged(agent: dict) -> bool:
+    """Take the held package back out: the items stay in the staged box, unsent. False if it was too late."""
+    staged = agent.get("staged") or {}
+    held = staged.get("held")
+    if not held:
+        return True
+    path = held_path(Path(held["file"]))
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        agent["send_error"] = ("Too late to recall: it was already released into the outbox. If a connector hasn't "
+                               "picked it up yet, you can withdraw it on the Actions page.")
+        finish_held(agent)
+        return False
+    hold_sidecar(path).unlink(missing_ok=True)
+    unlog_package(held["file"])
+    staged.pop("held")
+    return True
+
+
+def recall_for_needs_work(agent: dict) -> None:
+    if recall_staged(agent):
+        start_needs_work(agent)
+
+
+@st.fragment(run_every=20)
+def render_hold_countdown(package_file: str) -> None:
+    """When the held package goes, counting down; once it's gone, the page moves it to Sent."""
+    path = held_path(Path(package_file))
+    if not path.is_file():
+        st.rerun(scope="app")
+    when = read_hold(path)
+    left = max(0, math.ceil(((when - datetime.datetime.now().astimezone()).total_seconds()) / 60)) if when else 0
+    st.caption(f":material/schedule: Held until **{when.strftime('%H:%M') if when else 'the next check'}** "
+               f"({plural(left, 'minute')} left), then released into the outbox for the connector's next sync. "
+               "Until then nothing has been sent on.")
 
 
 def render_sent_batch(batch: dict) -> bool:
@@ -7823,6 +8213,12 @@ def render_sent_status(batch: dict) -> bool:
     """What happened to one sent package; returns True while it's still waiting for a connector."""
     count = f"{len(batch['items'])} {OUTPUT_TYPES.get(batch['type'], 'items').lower()}"
     package_file = Path(batch["file"])
+    if held_path(package_file).is_file():
+        when = read_hold(held_path(package_file))
+        st.info(f"Sent {count} at {batch['at']}, held for review until "
+                f"{when.strftime('%H:%M') if when else 'the next check'}. **View in outbox** to send it now or "
+                "withdraw it.")
+        return True
     if (package_file.parent / WITHDRAWN_DIR / package_file.name).is_file():
         st.info(f"Sent {count} at {batch['at']}, then withdrawn on the Actions page.")
         return False
@@ -7860,8 +8256,11 @@ def render_agent_panel(
     max_tokens: int,
     temperature: float,
     corpus_prompt: str,
+    review=None,
 ) -> None:
-    """Agent workflow under the discussion: step buttons, Agent:<name> to stage, That's right / Needs work."""
+    """Agent workflow under the discussion: step buttons, One last note, and Execute, which stages and sends
+    (held for review); the review of what was sent goes in `review`, below the dock."""
+    review = review if review is not None else st.container()
     agent = search_state["agent"]
     # Read the prompts live, so edits made in the prompt library apply on the next click. Searches from
     # before several Agents could be injected hold one "prompt".
@@ -7916,19 +8315,22 @@ def render_agent_panel(
                 st.caption(
                     "No reference snapshot yet: the task executor can refresh one so the Agent uses real record names."
                 )
-        # Folded until needed; its title says when a note is waiting to go with Execute.
+        # Always open, growing as you type: sent with Execute as a final instruction.
         note_key = f"agent_last_note_{search_state.get('id', '')}"
-        typed = str(st.session_state.get(note_key, "")).strip()
-        with st.expander("One last note" + (" · will be sent" if typed else ""), icon=":material/edit_note:"):
-            last_note = st.text_area(
-                "One last note",
-                key=note_key,
-                height=90,
-                placeholder="e.g. exclude points 2-5, or make them all due Friday",
-                label_visibility="collapsed",
-                help="Sent with **Execute** only, as a final instruction that overrides the discussion where they "
-                "differ. Saves another round in the discussion before staging.",
-            )
+        last_note = st.text_area(
+            "One last note",
+            key=note_key,
+            height="content",
+            placeholder="One last note, e.g. exclude points 2-5, or make them all due Friday",
+            label_visibility="collapsed",
+            help="Sent with **Execute** only, as a final instruction that overrides the discussion where they "
+            "differ. Saves another round in the discussion before staging.",
+        )
+        minutes = outbox_hold_minutes()
+        auto_execute = bool(search_state.get("id")) \
+            and st.session_state.get(AGENT_AUTO_EXECUTE_KEY) == search_state.get("id")
+        if auto_execute:  # a Note-Workflow step set to Skip and approve
+            st.session_state.pop(AGENT_AUTO_EXECUTE_KEY, None)
         if st.button(
             f"Execute :material/smart_toy: {label} with context",
             key="agent_run",
@@ -7936,11 +8338,16 @@ def render_agent_panel(
             help=(
                 "**Action Command" + ("s" if several else "") + ":** "
                 + "; ".join(agent_command(prompt) for prompt in prompts)
-                + "\n\nStages what you've agreed so you can check it first"
-                + (", asking the model once per Agent; it's all sent as one package." if several else ".")
+                + f"\n\nStages what you've agreed and sends it, held for review for {minutes} minutes first "
+                "(change it in the box that opens, or the default on the Configure page): drop items or **Recall** "
+                "it until then"
+                + (". The model is asked once per Agent; it's all one package." if several else ".")
             ),
-        ):
-            with st.spinner(f"`{model_name}` is staging the {item_kind}…"):
+        ) or auto_execute:
+            if (agent.get("staged") or {}).get("held"):
+                finish_held(agent)  # the one already held stays held, and is listed under Sent
+            with notify_as(f"{label}: Execute has finished — check what's held for review"), \
+                    st.spinner(f"`{model_name}` is staging the {item_kind}…"):
                 try:
                     agent["staged"] = stage_agent_batch(
                         search_state, prompts, model_name, max_tokens, temperature, corpus_prompt, last_note
@@ -7949,80 +8356,125 @@ def render_agent_panel(
                 except Exception as exc:
                     st.error(f"Couldn't stage the {item_kind}: {exc}")
                 else:
+                    if agent["staged"]["items"]:
+                        send_staged_to_outbox(search_state, prompts, source_notes)
+                    workflow_agent_executed(search_state, bool(agent["staged"]["items"]))  # a workflow moves on
                     st.rerun()
 
-        staged = agent.get("staged")
-        if staged:
-            with st.container(border=True, key="agent_staging"):
-                st.markdown(f"**Staged — check before it goes to the outbox**  \n{staged['summary']}")
-                if any(i["type"] == "update" for i in staged["items"]) and not profile_short_name(load_prompt_library()):
-                    st.warning("Next Steps are signed with the date only: set your **Short name** in the prompt "
-                               "library's **About me** (e.g. JDOE), then stage again.")
-                if not staged["items"]:
-                    st.info("Nothing to send: no agreed items were found. Choose **Needs work** and say what you want.")
-                for index, item in enumerate(staged["items"]):
-                    item_col, remove_col = st.columns([0.92, 0.08])
-                    with item_col:
-                        if item["type"] == "update":
-                            render_update_diff(item)
-                        else:
-                            st.markdown(link_opportunity_names(describe_staged_item(item)))
-                        render_full_staged_item(item)
-                        render_reference_picker(agent, index, item)
-                        render_duplicate_check(agent, index, item)
-                        render_next_step_checks(agent, index, item)
-                    with remove_col:
-                        st.button(
-                            ":material/close:",
-                            key=f"agent_unstage_{staged['id']}_{index}",
-                            type="tertiary",
-                            on_click=unstage_item,
-                            args=(agent, index),
-                            help="Leave this one out",
-                        )
-                right_col, needs_col = st.columns(2)
-                right_col.button(
-                    "That's right",
-                    key=f"agent_confirm_{staged['id']}",
-                    type="primary",
-                    icon=":material/check:",
-                    on_click=send_staged_to_outbox,
-                    args=(search_state, prompts, source_notes),
-                    disabled=not staged["items"],
-                    use_container_width=True,
-                    help=f"Write these to the outbox ({get_outbox_dir()}).",
-                )
-                needs_col.button(
-                    "Needs work",
-                    key=f"agent_reject_{staged['id']}",
-                    icon=":material/edit:",
-                    on_click=start_needs_work,
+    # Under Execute, in the dock (which scrolls within itself when it's taller than the window).
+    with review:
+        render_agent_review(search_state, prompts, source_notes, model_name, max_tokens, temperature, corpus_prompt)
+
+
+def render_agent_review(
+    search_state: dict,
+    prompts: list[dict],
+    source_notes: list[tuple[str, Path | None]],
+    model_name: str,
+    max_tokens: int,
+    temperature: float,
+    corpus_prompt: str,
+) -> None:
+    """What Execute staged and sent, held for review: its review time at the top, the items (drop any), and Send
+    now / Recall / Needs work; then Needs work's box, and the packages sent before."""
+    agent = search_state["agent"]
+    if agent.get("staged"):
+        sync_held_staged(search_state, prompts, source_notes)
+    staged = agent.get("staged")
+    if staged:
+        held = staged.get("held")
+        with st.container(border=True, key="agent_staging"):
+            hold_key = f"agent_hold_{staged['id']}"
+            if hold_key not in st.session_state:
+                st.session_state[hold_key] = int(staged.get("hold_minutes") or outbox_hold_minutes())
+            with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+                st.slider(
+                    "Review time",
+                    *REVIEW_HOLD_RANGE,
+                    step=5,
+                    format="%d min",
+                    key=hold_key,
+                    on_change=set_staged_hold,
                     args=(agent,),
-                    use_container_width=True,
-                    help="Discard this and say what's wrong; then keep refining and stage again.",
+                    help="How long this package is held before it's released into the outbox for a connector. "
+                    "Counted from when it was sent.",
                 )
-        if error := agent.pop("send_error", None):
-            st.warning(error)
-
-        if agent.get("needs_work"):
-            with st.form("agent_needs_work_form", clear_on_submit=True):
-                issue = st.text_area(
-                    "What needs work?", placeholder="e.g. Task 2 is Jo's, not mine, and drop the last one."
+                st.link_button(
+                    "Default",
+                    CONFIGURE_PAGE_URL,
+                    icon=":material/settings:",
+                    type="tertiary",
+                    help="Set the default review time (5 to 60 minutes) on the Configure page, under **Outbox**.",
                 )
-                submitted = st.form_submit_button("Send", type="primary")
-            if submitted and issue.strip():
-                rejected = agent.get("rejected") or {"items": []}
-                proposal = "\n".join(f"- {describe_staged_item(item)}" for item in rejected["items"]) or "- (nothing)"
-                if add_discussion_turn(
-                    search_state, f"**Needs work:** {issue.strip()}", model_name, max_tokens, temperature,
-                    corpus_prompt, sent_text=f"You proposed:\n{proposal}\n\nThat needs work: {issue.strip()}",
-                ):
-                    agent["needs_work"], agent["rejected"] = False, None
-                    st.rerun()
+            if held:
+                st.markdown(f"**Sent — held for review**  \n{staged['summary']}")
+                render_hold_countdown(held["file"])
+            else:
+                st.markdown(f"**Staged — not sent**  \n{staged['summary']}")
+            if any(i["type"] == "update" for i in staged["items"]) and not profile_short_name(load_prompt_library()):
+                st.warning("Next Steps are signed with the date only: set your **Short name** in the prompt "
+                           "library's **About me** (e.g. JDOE), then stage again.")
+            if not staged["items"]:
+                st.info("Nothing to send: no agreed items were found. Choose **Needs work** and say what you want.")
+            for index, item in enumerate(staged["items"]):
+                item_col, remove_col = st.columns([0.92, 0.08])
+                with item_col:
+                    if item["type"] == "update":
+                        render_update_diff(item)
+                    else:
+                        st.markdown(link_opportunity_names(describe_staged_item(item)))
+                    render_full_staged_item(item)
+                    render_reference_picker(agent, index, item)
+                    render_duplicate_check(agent, index, item)
+                    render_next_step_checks(agent, index, item)
+                with remove_col:
+                    st.button(
+                        ":material/close:",
+                        key=f"agent_unstage_{staged['id']}_{index}",
+                        type="tertiary",
+                        on_click=unstage_item,
+                        args=(agent, index),
+                        help="Leave this one out" + (" (the held package is changed to match)" if held else ""),
+                    )
+            with st.container(horizontal=True, gap="small"):
+                if held:
+                    st.button("Send now", key=f"agent_release_{staged['id']}", type="primary", icon=":material/send:",
+                              on_click=release_staged, args=(agent,), width="stretch",
+                              help="Stop holding it: a connector can pick it up at its next run.")
+                    st.button("Recall", key=f"agent_recall_{staged['id']}", icon=":material/undo:",
+                              on_click=recall_staged, args=(agent,), width="stretch",
+                              help="Take it back out of the outbox: the items stay here to change and send again.")
+                else:
+                    st.button("Send", key=f"agent_confirm_{staged['id']}", type="primary", icon=":material/send:",
+                              on_click=send_staged_to_outbox, args=(search_state, prompts, source_notes),
+                              disabled=not staged["items"], width="stretch",
+                              help=f"Send these to the outbox ({get_outbox_dir()}), held for the review time first.")
+                st.button("Needs work", key=f"agent_reject_{staged['id']}", icon=":material/edit:",
+                          on_click=recall_for_needs_work, args=(agent,), width="stretch",
+                          help="Discard this" + (" (recalling it)" if held else "")
+                          + " and say what's wrong; then keep refining and Execute again.")
+    if error := agent.pop("send_error", None):
+        st.warning(error)
 
-        waiting = [render_sent_batch(batch) for batch in reversed(agent["sent"])]
-        if any(waiting):
-            st.button("Check again", icon=":material/refresh:", key="agent_check_sent")
+    if agent.get("needs_work"):
+        with st.form("agent_needs_work_form", clear_on_submit=True):
+            issue = st.text_area(
+                "What needs work?", placeholder="e.g. Task 2 is Jo's, not mine, and drop the last one."
+            )
+            submitted = st.form_submit_button("Send", type="primary")
+        if submitted and issue.strip():
+            rejected = agent.get("rejected") or {"items": []}
+            proposal = "\n".join(f"- {describe_staged_item(item)}" for item in rejected["items"]) or "- (nothing)"
+            if add_discussion_turn(
+                search_state, f"**Needs work:** {issue.strip()}", model_name, max_tokens, temperature,
+                corpus_prompt, sent_text=f"You proposed:\n{proposal}\n\nThat needs work: {issue.strip()}",
+            ):
+                agent["needs_work"], agent["rejected"] = False, None
+                st.rerun()
+
+    waiting = [render_sent_batch(batch) for batch in reversed(agent["sent"])]
+    if any(waiting):
+        st.button("Check again", icon=":material/refresh:", key="agent_check_sent")
 
 
 def make_ask_variant(search_state: dict, narrate: bool, max_tokens: int, temperature: float,
@@ -8227,8 +8679,10 @@ def render_search_results(
         )
         if search_state.get("agent"):
             with dock:  # under the follow-up box, so both stay in view as the answer is scrolled
-                render_agent_panel(search_state, notes_in_use, follow_up_model, max_tokens, temperature,
-                                   corpus_prompt)
+                panel, review = st.container(), st.container()  # the review of what Execute sent goes last
+                with panel:
+                    render_agent_panel(search_state, notes_in_use, follow_up_model, max_tokens, temperature,
+                                       corpus_prompt, review)
 
 
 def get_pending_index_settings(safe_lib: str, corpus_config: dict) -> tuple[str, float, bool]:
@@ -9495,6 +9949,21 @@ def notes_budget(safe_lib: str, model: str, max_tokens: int) -> int:
     return min(chosen, notes_budget_fit(model, max_tokens))
 
 
+def notes_budget_advice(safe_lib: str, model: str, max_tokens: int) -> str:
+    """How to send more notes: raise the Notes budget, or, when the model's context window is what cuts it (a big
+    Max tokens takes most of the window), lower Max tokens or use a model with a larger window."""
+    chosen = int(st.session_state.get(f"llm_notes_chars_{safe_lib}")
+                 or get_corpus_config(safe_lib).get("llm_notes_chars") or LLM_CONTEXT_MAX_CHARS)
+    fit = notes_budget_fit(model, max_tokens)
+    if fit >= chosen:
+        return "raise **Notes budget** in **Ollama model details** for fuller answers."
+    limit = ollama_model_info(model)["context_length"]
+    return (f"your **Notes budget** of {chosen:,} characters is cut to {fit:,} because `{model}` holds "
+            + (f"{limit:,} tokens" if limit else "a limited context window")
+            + f" and **Max tokens** ({int(max_tokens):,}) keeps most of that for the answer. Lower **Max tokens** in "
+            "**Ollama model details** (or answer with a model that holds more) for fuller answers.")
+
+
 def build_context_from_results(results: list, max_chars: int = LLM_CONTEXT_MAX_CHARS) -> str:
     """Pack retrieved note chunks into a prompt context block for the LLM."""
     parts: list[str] = []
@@ -9692,7 +10161,9 @@ def chat_with_ollama(
     `on_text(content, thinking)` gets the reply so far as it streams (every LLM_TEXT_SECONDS, and once at the end),
     for pages that show it live, e.g. Chat with LLM. `extra_options` are more Ollama options (e.g. top_p, seed, or
     an exact num_ctx), set over the ones above.
+    A call that took a while queues a notification, shown if you've gone to another tab or app (see notify_as).
     """
+    call_started = time.monotonic()
     options = {
         "temperature": temperature,
         "num_predict": max_tokens,
@@ -9800,7 +10271,9 @@ def chat_with_ollama(
         "prompt_tokens_per_second": (prompt_tokens / (data["prompt_eval_duration"] / 1e9))
         if data.get("prompt_eval_duration") else None,
         "num_ctx": options["num_ctx"],
+        "done_reason": data.get("done_reason"),  # "length" when Max tokens cut it short
     }
+    queue_task_notification(seconds=time.monotonic() - call_started)
     return answer, usage
 
 
@@ -9989,11 +10462,16 @@ def build_note_filter_sql(search_filter: dict) -> tuple[str, list]:
         "OR instr(lower(coalesce(file_source, '')), ?) > 0)"
     )
     path_sources = search_filter.get("path_sources") or {}
+    date_sources = search_filter.get("date_sources") or {}  # date terms, by file creation date (Note dates)
     params: list = []
 
     def matches(term: str) -> str:
+        dated = date_sources.get(term.lower())
+        if dated is not None and search_filter.get("date_mode") == "created":  # the creation date only
+            params.extend(dated)
+            return f"file_source IN ({', '.join('?' for _ in dated)})" if dated else "0"
         params.extend([term.lower(), term.lower()])
-        sources = path_sources.get(term.lower(), [])
+        sources = path_sources.get(term.lower(), []) + (dated or [])
         if not sources:
             return f"{term_in_note} = 1"
         params.extend(sources)
@@ -10160,12 +10638,14 @@ def exact_text_search_all_libraries(
     max_documents: int,
     corpus_root: Path,
     apply_exclusions: bool = False,
+    results_from: str | None = None,
 ) -> tuple[list[dict], list[tuple[str, int]]]:
     """Literal filter search across libraries; no embeddings are used.
 
     Returns (blocks of up to `max_documents` notes, [(library, matching note count)]),
-    taking notes from the libraries with the most matches first. With `apply_exclusions`,
-    notes the user excluded are left out.
+    taking notes from the libraries with the most matches first. With `results_from` (a library key), every
+    library is counted but only that library's notes are returned. With `apply_exclusions`, notes the user
+    excluded are left out.
     """
     counts: list[tuple[str, str, int, dict]] = []
     for library in libraries:
@@ -10184,6 +10664,8 @@ def exact_text_search_all_libraries(
     for library, lib_key, _matches, lib_filter in counts:
         if remaining <= 0:
             break
+        if results_from and lib_key != results_from:  # counted, so you can switch to it, but not listed
+            continue
         blocks = exact_text_search(lib_key, lib_filter, remaining)
         try:
             uploads_dirs = get_library_uploads_dirs(Library().load_library(lib_key))
@@ -10420,6 +10902,9 @@ def clear_all_search_page() -> None:
     st.session_state["question_text"] = ""
     persist_question()
     st.session_state["find_notes_query"] = ""
+    st.session_state["actioned_filter_mode"] = "all"  # Actioned back to All notes, by any Agent
+    st.session_state["actioned_filter_agent"] = ""
+    persist_actioned_filter()
     st.session_state["oneshot_text"] = ""  # the Oneshot search, and the bar describing the search it ran
     st.session_state.pop(ONESHOT_PENDING_KEY, None)
     if (st.session_state.get(NOTES_SEARCH_KEY) or {}).get("source") == "oneshot" and not st.session_state.get(NOTES_RUN_KEY):
@@ -10608,12 +11093,14 @@ def wait_for_transcription(token: str, recorder_key: str | None = None) -> str |
         st.button("Cancel", key="transcribe_cancel", icon=":material/close:", on_click=cancel_transcription,
                   args=(token, recorder_key), help="Stop now: nothing is sent.")
     tick = st.empty()
+    started = time.monotonic()
     try:
         while not job["future"].done():
             tick.empty()  # a page update, so a Cancel click takes effect here
             time.sleep(TRANSCRIBE_TICK_SECONDS)
     finally:
         panel.empty()
+    queue_task_notification("Your dictation has been transcribed", time.monotonic() - started)
     return finish_transcription(token)
 
 
@@ -10916,6 +11403,18 @@ FULL_TEXT_TOOLTIPS_JS = """
 export default function () {
   if (window.__llmNotesFullText) return
   window.__llmNotesFullText = true
+  // Starred Note-Workflows: a button that doesn't fit the row's width is hidden (they're all in the menu too).
+  const fitStarred = () => {
+    const box = document.querySelector(".st-key-workflow_starred")
+    if (!box) return
+    const right = box.getBoundingClientRect().right
+    for (const item of box.children) {
+      item.style.visibility = ""
+      if (item.getBoundingClientRect().right > right + 1) item.style.visibility = "hidden"
+    }
+  }
+  addEventListener("resize", fitStarred)
+  setInterval(fitStarred, 500)
   // Oneshot search: Enter sends it (as Cmd/Ctrl+Enter does, which saves the text first); Shift+Enter adds a line.
   document.addEventListener("keydown", (event) => {
     const box = event.target
@@ -10947,6 +11446,87 @@ export default function () {
 }
 """
 _full_text_tooltips = st.components.v2.component("full_text_tooltips", html="<span></span>", js=FULL_TEXT_TOOLTIPS_JS)
+
+
+# --- Notifications: LLM work that finishes while you're away from the tab --------------------------------------
+NOTIFY_SETTING = "notify_when_away"
+NOTIFY_PENDING_KEY = "task_notification"  # {id, title, body}: shown by the notifier (in the sidebar) once
+NOTIFY_CONTEXT_KEY = "task_notify_as"  # what the LLM call running now is for, e.g. "Answer ready · Search: CorpA"
+NOTIFY_MIN_SECONDS = 8  # quicker work isn't worth a notification (you're likely still looking)
+TASK_NOTIFIER_JS = """
+export default function (component) {
+  const { data } = component
+  if (!data || !data.enabled || !("Notification" in window)) return
+  const shown = window.__llmNotesShown || (window.__llmNotesShown = new Set())
+  // The browser asks once, on your next click on the page (it only allows asking from a click).
+  if (!window.__llmNotesAsk && Notification.permission === "default") {
+    window.__llmNotesAsk = true
+    const ask = () => {
+      document.removeEventListener("click", ask, true)
+      if (Notification.permission === "default") Notification.requestPermission()
+    }
+    document.addEventListener("click", ask, true)
+  }
+  const note = data.note
+  if (!note || shown.has(note.id)) return
+  shown.add(note.id)
+  // Only when you're not looking at this tab (another tab, another app, or the window minimised).
+  if (document.visibilityState === "visible" && document.hasFocus()) return
+  if (Notification.permission !== "granted") return
+  const n = new Notification(note.title, { body: note.body, tag: "llm-notes-task" })
+  n.onclick = () => { window.focus(); n.close() }  // brings this tab (and its window) to the front
+}
+"""
+_task_notifier = st.components.v2.component("task_notifier", html="<span></span>", js=TASK_NOTIFIER_JS)
+
+
+@contextmanager
+def notify_as(text: str):
+    """What a notification says if the LLM work inside finishes while you're away (no note content)."""
+    before = st.session_state.get(NOTIFY_CONTEXT_KEY)
+    st.session_state[NOTIFY_CONTEXT_KEY] = text
+    try:
+        yield
+    finally:
+        st.session_state[NOTIFY_CONTEXT_KEY] = before
+
+
+def default_notify_text() -> str:
+    page = st.query_params.get("page") or ""
+    if page == CHAT_PAGE:
+        return "Chat: the reply is ready"
+    if page:
+        return "Your task has finished"
+    library = st.session_state.get("selected_library")
+    return f"Answer ready · Search: {library}" if library else "Answer ready"
+
+
+def queue_task_notification(body: str | None = None, seconds: float | None = None) -> None:
+    """Queue a notification for finished LLM work, shown by the notifier only if you're away from the tab.
+    `seconds`: how long it took (quick work is skipped). Never from a worker thread (no session there)."""
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+    if get_script_run_ctx() is None or (seconds is not None and seconds < NOTIFY_MIN_SECONDS):
+        return
+    st.session_state[NOTIFY_PENDING_KEY] = {
+        "id": uuid.uuid4().hex, "title": "LLM-Notes",
+        "body": body or st.session_state.get(NOTIFY_CONTEXT_KEY) or default_notify_text()}
+
+
+@st.fragment(run_every=4)
+def render_task_notifier(enabled: bool) -> None:
+    """In the sidebar: hands the browser the latest finished task. It refreshes by itself every few seconds (it
+    waits for a running page to finish, never cutting it short), so a task that ends a page run is still shown."""
+    note = st.session_state.pop(NOTIFY_PENDING_KEY, None)
+    _task_notifier(key="task_notifier", data={"enabled": enabled, "note": note if enabled else None})
+
+
+def install_task_notifier() -> None:
+    """On every page, out of sight in the sidebar: the notifier for LLM work that finishes while you're away."""
+    with st.sidebar, st.container(key="task_notifier_box"):
+        st.html("<style>.st-key-task_notifier_box { position: absolute !important; height: 0 !important; "
+                "overflow: hidden; pointer-events: none; }</style>")
+        render_task_notifier(bool(load_app_settings().get(NOTIFY_SETTING, True)))
 
 
 def install_full_text_tooltips() -> None:
@@ -11099,6 +11679,15 @@ def render_voice_settings_section() -> None:
             render_dictate_hotkey_toggle("dictate_hotkey_toggle_configure")
         render_read_aloud_toggle("read_aloud_toggle_configure")
         render_open_on_chat_toggle("open_on_chat_toggle_configure")
+        st.toggle("Notify me when a task finishes while I'm away", key="notify_toggle_configure",
+                  value=bool(load_app_settings().get(NOTIFY_SETTING, True)),
+                  on_change=persist_app_toggle, args=(NOTIFY_SETTING, "notify_toggle_configure"),
+                  help="When an answer, a Note-Workflow stage, an Agent's **Execute**, a Chat reply or a dictation "
+                       "finishes while you're on another tab or app, a macOS notification says so (what finished and "
+                       "where, nothing from your notes). Click it to come back to this tab. Quick ones (under "
+                       f"{NOTIFY_MIN_SECONDS} seconds) are skipped. The browser asks to allow notifications once, on "
+                       "your next click on the page; if they don't show, allow them for this site in the browser, "
+                       "and for the browser in System Settings > Notifications.")
 
 
 def speakable_text(markdown_text: str) -> str:
@@ -12796,14 +13385,15 @@ def advance_notes_run(run: dict, safe_lib: str) -> None:
                 run.update(stage="done", finished=time.time())
                 return
             config = get_corpus_config(safe_lib)
-            budget = notes_budget(safe_lib, config.get("ollama_model") or DEFAULT_OLLAMA_MODEL,
-                                  int(config.get("llm_max_tokens") or 512))
+            answer_model = config.get("ollama_model") or DEFAULT_OLLAMA_MODEL
+            answer_tokens = int(config.get("llm_max_tokens") or 512)
+            budget = notes_budget(safe_lib, answer_model, answer_tokens)
             share = budget // count
             if count > 1 and share < 800:
                 run["warnings"].append(
                     f"{count} notes share the LLM's {budget:,}-character notes budget, about {share:,} characters "
-                    "each, so long notes are trimmed. Narrow the search (more exact words, a date), or raise "
-                    "**Notes budget** in **Ollama model details**, for fuller answers.")
+                    "each, so long notes are trimmed. Narrow the search (more exact words, a date), or: "
+                    + notes_budget_advice(safe_lib, answer_model, answer_tokens))
             queue_notes_run_step(run, "scope", {"question_text": plan["intent"], "use_llm_answer": True},
                                  "answering", f"Asking: “{truncate_text(plan['intent'], 70)}”", plan.get("dictated"))
         elif run["stage"] == "finding" and plan["route"] == "literal":
@@ -12824,6 +13414,7 @@ def advance_notes_run(run: dict, safe_lib: str) -> None:
             return
         background_answers().pop(token, None)
         last.pop("answer_pending", None)
+        queue_task_notification("Searching your notes: " + ("it stopped" if job["error"] else "the answer is ready"))
         if job["error"]:
             last["answer_error"] = job["error"]
             run["warnings"].append(job["error"] if "token budget" in job["error"] else f"The answer failed: {job['error']}")
@@ -13024,6 +13615,18 @@ def submit_oneshot() -> None:
         st.session_state[ONESHOT_PENDING_KEY] = {"text": text, "dictated": False}
 
 
+def start_fresh() -> None:
+    """Start fresh, beside the Oneshot box: everything Clear all clears, plus a running Note-Workflow and a Chat
+    message's notes run, so the page is as it opens. Settings (route, Max results, models) stay."""
+    stop_notes_run()
+    st.session_state.pop(WORKFLOW_RUN_KEY, None)
+    st.session_state.pop(NOTES_SEARCH_KEY, None)
+    st.session_state.pop(AUTO_SEARCH_KEY, None)
+    st.session_state.pop(AGENT_AUTO_EXECUTE_KEY, None)
+    clear_all_search_page()
+    st.toast("Started fresh.", icon=":material/restart_alt:")
+
+
 def render_oneshot_box() -> None:
     """Oneshot search, at the top of the search page: say what you want in a sentence, and it's run the way a
     dictated notes question is (find, then ask), without reading the answer aloud unless you turn that on."""
@@ -13045,6 +13648,11 @@ def render_oneshot_box() -> None:
                     placeholder="e.g. Find notes from December 2024 where pricing was discussed in my Acme notebook")
                 st.form_submit_button("Search", type="primary", icon=":material/travel_explore:",
                                       on_click=submit_oneshot)
+                st.form_submit_button("Start fresh", key="start_fresh", icon=":material/restart_alt:",
+                                      on_click=start_fresh,
+                                      help="Clear the page and start again: the filter, results, discussion, question "
+                                           "and this box (as **Clear all** does), and close a running Note-Workflow. "
+                                           "Your settings stay. Anything already sent stays in the outbox.")
     if spoken:  # into the box (on the next run, before it's drawn) and run as a dictated Oneshot search
         st.session_state[ONESHOT_PENDING_KEY] = {"text": spoken, "dictated": True}
         st.rerun()
@@ -13064,6 +13672,1349 @@ def start_pending_oneshot() -> None:
     if plan:
         st.session_state[NOTES_SEARCH_KEY] = {**plan, "chat": pending.get("chat"), "dictated": dictated,
                                               "applied": False, "source": "oneshot"}
+
+
+# --- Note-Workflows ------------------------------------------------------------------
+# Multi-stage tasks fired from the search page (e.g. Weekly Kick-off): the search is set up (cleared, a date
+# window, Filter search, every note kept in scope), then each stage asks the LLM about those notes. A Checklist
+# stage lists items to keep (with a box for context); a Written stage writes the output, to copy or refine in
+# Chat. Each stage is told what the next one does with its output. Defined in the Prompt library.
+WORKFLOW_RUN_KEY = "workflow_run"  # the workflow running on the search page: id, week, stage, outputs, picks
+WORKFLOW_RECENT_SETTING = "workflow_recent"  # app setting: ids of the workflows run most recently, newest first
+WORKFLOW_RECENT_SHOWN = 5
+WORKFLOW_DATES = {"today": "Today", "yesterday": "Yesterday", "working_week": "Last working week (this week from Thursday)",
+                  "this_week": "This week", "last_week": "Last week", "this_month": "This month",
+                  "last_month": "Last month", "none": "No date filter"}
+WORKFLOW_STAGE_KINDS = {"pick": "Checklist to pick from", "write": "Written output", "agent": "Run an Agent"}
+ISO_DAY = re.compile(r"\b(19|20)\d\d-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b")
+WORKFLOW_PICK_SCHEMA = {
+    "type": "object",
+    "properties": {"groups": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"subject": {"type": "string"}, "items": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"kind": {"type": "string"}, "text": {"type": "string"}, "owner": {"type": "string"},
+                           "due": {"type": "string"}, "source": {"type": "string"}, "route": {"type": "string"}},
+            "required": ["kind", "text"]}}},
+        "required": ["subject", "items"]}}},
+    "required": ["groups"],
+}
+WORKFLOW_PICK_INSTRUCTION = (
+    "Answer in JSON only: groups, one per client, prospect or subject (subject: its name, e.g. 'Acme', not a "
+    "folder path: in 'Clients > Customers > Acme' the client is Acme), each with items: kind "
+    "(the item's category, as the request names them, e.g. Problem, Plan, Progress or Action), text (the item in "
+    "one or two plain sentences), owner (the person responsible, by name, or empty if nobody is named), due (when "
+    "it's due, if the note says, else empty) and source (the file name of the note it came from).")
+WORKFLOW_PLACEHOLDERS = ("{week} the date window · {selection} the items you kept · {system} the items routed to "
+                         "Agent · {message} the items routed to Message, under a heading per person · {context} what "
+                         "you added beside the checklist · {previous} the last stage's output · {earlier} every "
+                         "earlier stage's written output (e.g. an email drafted first), by stage name; added at the "
+                         "end by itself when there is some and the prompt doesn't place it")
+WORKFLOW_ROUTES = {"nfa": "NFA", "system": "Agent", "message": "Message (via user)"}  # where a routed item goes
+WORKFLOW_GROUP_BY = {"subject": "Client / subject", "owner": "Person", "kind": "Kind"}
+WORKFLOW_CHANGE_INSTRUCTION = (
+    "You rearrange a checklist. Apply the user's instruction to the list and return the whole resulting list in "
+    "the same JSON format: groups (subject) with items (kind, text, owner, due, source, route). Keep each item's "
+    "wording, owner, due, source and route unless the instruction changes them; leave out items the instruction "
+    "removes; regroup if it asks. An item with a correction: apply the correction to that item (its wording, "
+    "owner or due date) and leave the correction field out.")
+
+
+def weekly_kickoff_workflow() -> dict:
+    return {
+        "id": "weekly_kickoff", "name": "Weekly Kick-off", "dates": "working_week", "model": "", "favourite": True,
+        "stages": [
+            {"id": "stage_topics", "name": "Stage topics", "kind": "pick", "source": "text", "note": None,
+             "model": "", "send_notes": True,
+             "text": "I'm creating a Problems, Plans, and Progress report for the week {week}. Use these notes to "
+                     "stage those topics for me: enumerate each problem, progress and plan made, in a list "
+                     "grouped by the client, prospect or subject."},
+            {"id": "write_report", "name": "Write the report", "kind": "write", "source": "text", "note": None,
+             "model": "", "send_notes": True,
+             "text": "Write my Problems, Plans and Progress report for the week {week} from the items I kept "
+                     "below: bullet points grouped by client, prospect or subject, under the headings Problems, "
+                     "Plans and Progress. Use the notes for detail, but only write up the items I kept.\n\n"
+                     "Items I kept:\n{selection}\n\nMy context:\n{context}"},
+        ],
+    }
+
+
+def note_workflows() -> list[dict]:
+    return load_prompt_library().get("workflows") or []
+
+
+def find_workflow(workflow_id: str) -> dict | None:
+    return next((w for w in note_workflows() if w["id"] == workflow_id), None)
+
+
+def working_week(today: datetime.date) -> tuple[datetime.date, datetime.date]:
+    """Monday to Friday of the last working week; from Thursday on, this week to today (to prep it early)."""
+    monday = today - datetime.timedelta(days=today.weekday())
+    if today.weekday() <= 2:  # Monday to Wednesday: the week before
+        monday -= datetime.timedelta(days=7)
+        return monday, monday + datetime.timedelta(days=4)
+    return monday, min(monday + datetime.timedelta(days=4), today)
+
+
+def describe_week(week: tuple[datetime.date, datetime.date]) -> str:
+    start, end = week
+    return f"{start:%a %-d %b %Y}" if start == end else f"{start:%a %-d %b} – {end:%a %-d %b %Y}"
+
+
+def start_workflow(workflow_id: str | None = None) -> None:
+    """Note-Workflows menu (or a starred workflow's button): set the search up afresh (Clear all, Literal, the
+    date window, the notes found) and press Filter search; the panel then runs the stages."""
+    workflow = find_workflow(workflow_id or st.session_state.get("workflow_menu") or "")
+    if not workflow:
+        return
+    recent = [workflow["id"], *[i for i in load_app_settings().get(WORKFLOW_RECENT_SETTING) or [] if i != workflow["id"]]]
+    save_app_settings({WORKFLOW_RECENT_SETTING: recent[:20]})
+    stop_notes_run()
+    clear_all_search_page()
+    # A fresh run (or Start again): the last run's filled-in prompts, models and checklist choices go.
+    run_keys = ("wf_prompt_", "wf_model_", "wf_group_by_", "wf_pick_", "wf_route_", "wf_left_out_", "wf_context",
+                "wf_change_", "wf_fix_")
+    for key in [k for k in st.session_state if str(k).startswith(run_keys)]:
+        if not str(key).startswith(f"wf_model_{workflow['id']}"):  # wf_model_<workflow id>: its editor's Model
+            del st.session_state[key]
+    week, days = workflow_window(workflow.get("dates", "none"), datetime.date.today())
+    st.session_state["search_route"] = "literal"
+    save_app_settings({"exact_text_only": True})
+    st.session_state["filter_any"] = days
+    st.session_state["filter_fold_any"] = bool(days)
+    scope = str(workflow.get("folder") or "").strip()
+    if scope:  # only notes in this folder (filter terms match folder paths, e.g. "Clients > Prospects")
+        st.session_state["filter_all"] = [scope]
+        st.session_state["filter_fold_all"] = True
+    persist_search_filter()
+    st.session_state[max_results_key(True)] = MAX_RESULTS_LIMITS["literal"]  # every note of the week (not saved)
+    st.session_state[AUTO_SEARCH_KEY] = "filter"
+    st.session_state[WORKFLOW_RUN_KEY] = {
+        "id": workflow["id"], "week": [d.isoformat() for d in week] if week else None, "stage": 0,
+        "status": "finding" if days or scope else "ready", "outputs": {}, "picked": {}, "context": "", "error": "",
+    }
+
+
+def workflow_window(kind: str, today: datetime.date) -> tuple[tuple[datetime.date, datetime.date] | None, list[str]]:
+    """(the date window, the filter terms for it) for a workflow's Dates choice."""
+    if kind == "working_week":
+        week = working_week(today)
+        return week, [(week[0] + datetime.timedelta(days=i)).isoformat() for i in range((week[1] - week[0]).days + 1)]
+    if kind in ("today", "yesterday"):
+        day = today - datetime.timedelta(days=0 if kind == "today" else 1)
+        return (day, day), [day.isoformat()]
+    if kind in ("this_week", "last_week"):
+        monday = today - datetime.timedelta(days=today.weekday(), weeks=0 if kind == "this_week" else 1)
+        return (monday, monday + datetime.timedelta(days=6)), quick_date_terms(kind, today, "any")
+    if kind in ("this_month", "last_month"):
+        first = today.replace(day=1) if kind == "this_month" else (today.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
+        last = (first.replace(day=28) + datetime.timedelta(days=4)).replace(day=1) - datetime.timedelta(days=1)
+        return (first, last), [f"{first:%Y-%m}"]
+    return None, []
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def library_note_dates(lib_key: str, folder: str) -> dict[str, tuple[str, float]]:
+    """{file_source: (the latest date written in its name or opening text, its file's creation time)}, to put
+    notes in order of when they were written."""
+    table = lib_key.replace('"', '""')
+    try:
+        with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+            rows = conn.execute(f'SELECT file_source, text_block FROM "{table}" WHERE doc_ID IN '
+                                f'(SELECT MIN(doc_ID) FROM "{table}" GROUP BY file_source)').fetchall()
+    except sqlite3.Error:
+        rows = []
+    times: dict[str, float] = {}
+    root = Path(folder)
+    if root.is_dir():
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in INGEST_EXTENSIONS and not path.name.startswith("."):
+                info = path.stat()
+                times[path.name] = max(times.get(path.name, 0), getattr(info, "st_birthtime", None) or info.st_mtime)
+    today = datetime.date.today().isoformat()
+    dates = {}
+    for source, text in rows:
+        written = [m.group(0) for m in ISO_DAY.finditer(f"{source}\n{str(text or '')[:600]}") if m.group(0) <= today]
+        dates[str(source)] = (max(written) if written else "", times.get(Path(str(source)).name, 0.0))
+    return dates
+
+
+def note_written_key(entry: tuple[str, float]) -> tuple:
+    """Order notes by when they were written: the date in the note (Note dates: written in it), its file's creation
+    time (creation date), or whichever is later (either); the creation time breaks ties within a day."""
+    written, created = entry
+    created_day = datetime.date.fromtimestamp(created).isoformat() if created else ""
+    mode = load_app_settings().get(NOTE_DATES_SETTING, "either")
+    day = written if mode == "text" else created_day if mode == "created" else max(written, created_day)
+    return day, created
+
+
+def keep_most_recent(lib_key: str, folder: str, keep: int) -> list[str]:
+    """Keep only the `keep` most recently written in-scope notes (the rest are excluded, as 🚫 does); the
+    sources in order, newest first."""
+    gathered = gathered_notes(lib_key)
+    if not gathered:
+        return []
+    dates = library_note_dates(lib_key, folder)
+    keys = sorted(gathered["notes"], key=lambda k: note_written_key(dates.get(k[1], ("", 0.0))), reverse=True)
+    for n, (lib, source) in enumerate(keys):
+        _set_note_excluded(lib, source, n >= keep)
+    persist_excluded_notes()
+    return [source for _lib, source in keys]
+
+
+def latest_note_day(lib_key: str, folder: str, within: str = "") -> str:
+    """The most recent day any note in the library (or, with `within`, in the folders matching it) was written,
+    for a workflow that found none in its window."""
+    dates = library_note_dates(lib_key, folder)
+    if within:
+        term = within.strip().lower()
+        paths = library_source_paths(lib_key, folder, str(get_corpus_root_path() or ""))
+        dates = {source: entry for source, entry in dates.items()
+                 if term in f"{paths.get(source, '')}\n{paths.get(source, '').replace(FOLDER_PATH_SEPARATOR, '/')}".lower()}
+    days = [note_written_key(entry)[0] for entry in dates.values()]
+    return max([d for d in days if d], default="")
+
+
+def close_workflow() -> None:
+    st.session_state.pop(WORKFLOW_RUN_KEY, None)
+
+
+def workflow_week(run: dict) -> tuple[datetime.date, datetime.date] | None:
+    return tuple(datetime.date.fromisoformat(d) for d in run["week"]) if run.get("week") else None
+
+
+def workflow_note_text(note: dict | None) -> str:
+    """A stage prompt kept in a note: the note's text from its library's index (any file type)."""
+    if not note or not note.get("library") or not note.get("source"):
+        return ""
+    table = str(note["library"]).replace('"', '""')
+    try:
+        with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+            rows = conn.execute(f'SELECT text_block FROM "{table}" WHERE file_source = ? ORDER BY doc_ID',
+                                (note["source"],)).fetchall()
+    except sqlite3.Error:
+        return ""
+    return "\n".join(str(r[0] or "") for r in rows).strip()
+
+
+def stage_prompt_text(stage: dict) -> str:
+    return workflow_note_text(stage.get("note")) if stage.get("source") == "note" else str(stage.get("text") or "")
+
+
+def checklist_items(output: dict) -> list[tuple[str, str, dict]]:
+    """(item id, its group's subject, the item) for every item in a Checklist stage's output."""
+    return [(f"{g}.{n}", str(group.get("subject") or "Other"), item)
+            for g, group in enumerate(output.get("groups") or []) for n, item in enumerate(group.get("items") or [])]
+
+
+def item_route(run: dict, index: int, item_id: str) -> str:
+    """Where a kept item of a routed Checklist goes: Agent ("system") unless you chose otherwise."""
+    return (run.get("routes") or {}).get(str(index), {}).get(item_id, "system")
+
+
+def describe_item(item: dict, subject: str = "") -> str:
+    extra = [f"owner: {item['owner'].strip()}" if str(item.get("owner") or "").strip() else "",
+             f"due: {item['due'].strip()}" if str(item.get("due") or "").strip() else "",
+             f"re {subject}" if subject else "", f"from {item['source']}" if item.get("source") else ""]
+    extra = [e for e in extra if e]
+    correction = str(item.get("correction") or "").strip()
+    return (f"{str(item.get('kind') or '').strip()}: {str(item.get('text') or '').strip()}"
+            + (f" ({'; '.join(extra)})" if extra else "")
+            + (f" [the user's correction, which overrides the above: {correction}]" if correction else ""))
+
+
+def workflow_selection_text(run: dict, stage_index: int, route: str | None = None) -> str:
+    """The items kept from the last Checklist stage before `stage_index`, as text: grouped by subject, or for
+    `route` only the items routed there (Message: under a heading per person)."""
+    for i in range(stage_index - 1, -1, -1):
+        output = run["outputs"].get(str(i))
+        if output and output.get("groups") is not None:
+            picked = set(run["picked"].get(str(i), []))
+            fixes = (run.get("corrections") or {}).get(str(i), {})
+            items = [(iid, subject, {**item, "correction": fixes.get(iid, "")})
+                     for iid, subject, item in checklist_items(output) if iid in picked
+                     and (route is None or item_route(run, i, iid) == route)]
+            groups: dict[str, list[str]] = {}
+            for _iid, subject, item in items:
+                if route == "message":
+                    groups.setdefault(str(item.get("owner") or "").strip() or "No one named", []).append(
+                        describe_item({**item, "owner": "", "source": ""}, subject))  # for a message: no file names
+                else:
+                    groups.setdefault(subject, []).append(describe_item(item))
+            return "\n".join(f"{head}:\n" + "\n".join(f"- {line}" for line in lines) for head, lines in groups.items())
+    return ""
+
+
+def workflow_output_text(output: dict | None) -> str:
+    if not output:
+        return ""
+    if output.get("groups") is not None:
+        return "\n".join(f"{g.get('subject')}: " + "; ".join(f"{i.get('kind')}: {i.get('text')}" for i in g.get("items") or [])
+                         for g in output["groups"])
+    return str(output.get("text") or "")
+
+
+def workflow_earlier_text(run: dict, stage_index: int, skip: int | None = None) -> str:
+    """Every earlier stage's written output (e.g. an email drafted first), under the stage's name; not `skip`."""
+    stages = (find_workflow(run["id"]) or {}).get("stages") or []
+    parts = []
+    for i in range(min(stage_index, len(stages))):
+        if i == skip:
+            continue
+        output = run["outputs"].get(str(i)) or {}
+        if output.get("text") and output.get("groups") is None and not output.get("agent"):
+            parts.append(f"{stages[i]['name']}:\n{output['text'].strip()}")
+    return "\n\n".join(parts)
+
+
+def fill_workflow_prompt(text: str, run: dict, stage_index: int) -> str:
+    """The stage's prompt with its placeholders filled in. Written output from earlier stages is added at the end
+    for context, unless the prompt places it ({earlier}) or already takes the stage just before ({previous})."""
+    earlier = workflow_earlier_text(run, stage_index)
+    if "{earlier}" not in text:  # added by itself, without the stage {previous} already brings in
+        extra = workflow_earlier_text(run, stage_index, skip=stage_index - 1 if "{previous}" in text else None)
+        if extra:
+            text += "\n\nEarlier in this workflow (for context):\n" + extra
+    week = workflow_week(run)
+    values = {"{week}": describe_week(week) if week else "", "{selection}": workflow_selection_text(run, stage_index),
+              "{system}": workflow_selection_text(run, stage_index, "system"),
+              "{message}": workflow_selection_text(run, stage_index, "message"),
+              "{context}": run.get("context", "").strip() or "(none)",
+              "{previous}": workflow_output_text(run["outputs"].get(str(stage_index - 1))),
+              "{earlier}": earlier or "(none)"}
+    for name, value in values.items():
+        text = text.replace(name, value)
+    return text
+
+
+def workflow_stage_model(workflow: dict, stage: dict, corpus_config: dict) -> str:
+    return stage.get("model") or workflow.get("model") or corpus_config.get("ollama_model") or DEFAULT_OLLAMA_MODEL
+
+
+def run_workflow_stage(workflow: dict, run: dict, index: int, prompt: str, model: str, safe_lib: str,
+                       corpus_config: dict, slot) -> None:
+    """Ask the LLM one stage, about the notes in scope; told what the next stage does with the output."""
+    stage = workflow["stages"][index]
+    max_tokens = max(int(corpus_config.get("llm_max_tokens") or 512), 2048)
+    notes, trimmed = "", 0
+    if stage.get("send_notes", True):
+        gathered = gathered_notes(safe_lib)
+        kept = kept_gathered_notes(gathered) if gathered else []
+        if not kept:
+            run["error"] = "No notes in scope: find some first (the Filter search above), or untick Send the notes."
+            return
+        budget = notes_budget(safe_lib, model, max_tokens)
+        blocks, trimmed = share_context(gathered, kept, budget)
+        notes = build_context_from_results(blocks, budget)
+    library = load_prompt_library()
+    profile = library["profile"]
+    preamble = build_prompt_context(profile_text=str(profile.get("text", "")) if profile.get("enabled") else "")
+    following = workflow["stages"][index + 1] if index + 1 < len(workflow["stages"]) else None
+    system = (f"{preamble}\n\nYou're running stage {index + 1} of {len(workflow['stages'])} of the note workflow "
+              f"“{workflow['name']}”: {stage['name']}.")
+    if following:
+        system += (f"\n\nAfter this, the next stage is “{following['name']}”, which will use your output like this:"
+                   f"\n{truncate_text(stage_prompt_text(following), 500)}\nShape your output so it serves that stage.")
+    if stage.get("kind") == "pick":
+        system += "\n\n" + WORKFLOW_PICK_INSTRUCTION
+    user = prompt + (f"\n\nThe notes:\n{notes}" if notes else "")
+    run["error"] = ""
+    with notify_as(f"Note-Workflow · {stage['name']} is ready to check"), \
+            llm_progress(slot, f"{stage['name']} with `{model}`…") as report:
+        try:
+            answer, usage = chat_with_ollama(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}], model,
+                max_tokens=max_tokens, temperature=0.2, on_progress=report,
+                response_format=WORKFLOW_PICK_SCHEMA if stage.get("kind") == "pick" else None)
+        except RuntimeError as exc:
+            run["error"] = str(exc)
+            return
+    answer = split_inline_thinking(answer)[1].strip()
+    output = {"model": model, "prompt": prompt, "trimmed": trimmed, "at": now_iso(),
+              "tokens_per_second": usage.get("tokens_per_second"), "done_reason": usage.get("done_reason")}
+    if stage.get("kind") == "pick":
+        try:
+            groups = [g for g in json.loads(answer or "{}").get("groups") or [] if g.get("items")]
+        except (ValueError, AttributeError):
+            groups = None
+        if groups is None:  # not JSON after all: show it as text to edit by hand
+            output["text"] = answer
+        else:
+            for group in groups:  # a fresh list starts routed to Agent; only Change this list keeps routes
+                for item in group.get("items") or []:
+                    item.pop("route", None)
+            output["groups"] = groups
+            reset_checklist_state(run, index, groups)
+    else:
+        output["text"] = answer
+    run["outputs"][str(index)] = output
+    for later in [k for k in run["outputs"] if int(k) > index]:  # later stages built on the old output
+        run["outputs"].pop(later)
+
+
+def start_workflow_agent(workflow: dict, run: dict, index: int, prompt: str, model: str) -> None:
+    """An Agent stage: the Agent is injected into the Ask box with this stage's prompt as the question, and Ask
+    about in-scope notes runs, so it stages its items for review and sending as usual."""
+    stage = workflow["stages"][index]
+    agent = find_prompt(load_prompt_library(), stage.get("agent") or "")
+    if not agent:
+        run["error"] = "Pick the Agent this stage runs (Prompt library > Note-Workflows)."
+        return
+    st.session_state["question_text"] = prompt
+    persist_question()
+    st.session_state[ACTIVE_TASK_PROMPTS_KEY] = [agent["id"]]
+    if not st.session_state.get("use_llm_answer"):
+        st.session_state["use_llm_answer"] = True
+    st.session_state[AUTO_SEARCH_KEY] = "scope"
+    run["error"] = ""
+    run["outputs"][str(index)] = {"agent": agent["name"], "model": model, "prompt": prompt, "at": now_iso(),
+                                  "running": True}  # until its answer is in (see finish_workflow_agent)
+
+
+def reset_checklist_state(run: dict, index: int, groups: list[dict]) -> None:
+    """A new list: every item kept (routed as the list says, else Agent), nobody left out."""
+    ids = [f"{g}.{n}" for g, group in enumerate(groups) for n in range(len(group.get("items") or []))]
+    routes = {f"{g}.{n}": item["route"] for g, group in enumerate(groups) for n, item in enumerate(group.get("items") or [])
+              if item.get("route") in ("system", "message")}
+    run["picked"][str(index)] = ids
+    run.setdefault("routes", {})[str(index)] = routes
+    run.setdefault("left_out", {})[str(index)] = []
+    run.setdefault("corrections", {})[str(index)] = {}
+    st.session_state.pop(f"wf_leave_{index}", None)
+
+
+def set_workflow_correction(index: int, item: str, widget_key: str) -> None:
+    """An item's correction in words, sent on with it (the later stages' model applies it)."""
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    if not run:
+        return
+    fixes = run.setdefault("corrections", {}).setdefault(str(index), {})
+    text = str(st.session_state.get(widget_key) or "").strip()
+    if text:
+        fixes[item] = text
+    else:
+        fixes.pop(item, None)
+
+
+AGENT_AUTO_EXECUTE_KEY = "agent_auto_execute"  # the search id whose Agent Executes by itself (Skip and approve)
+WORKFLOW_APPROVE_HELP = ("Run this step and approve what it gives without stopping: a checklist goes on as it's "
+                         "routed, written output is kept, and an Agent's answer is executed (its items are sent "
+                         "but held for review first, to drop any or **Recall** them). Then the next step runs. "
+                         "Saved with the workflow in the Prompt library.")
+
+
+def set_stage_approve(workflow_id: str, stage_id: str, widget_key: str) -> None:
+    """Skip and approve step, ticked in the running panel: saved to the workflow (the Prompt library's tick follows)."""
+    set_stage_field(workflow_id, stage_id, "auto_approve", widget_key)
+    st.session_state.pop(f"wf_{workflow_id}_{stage_id}_auto_approve", None)  # the editor's tick, drawn afresh
+
+
+def toggle_workflow_correction(open_key: str) -> None:
+    st.session_state[open_key] = not st.session_state.get(open_key)
+
+
+def set_workflow_items(index: int, item_ids: list[str], choice: str) -> None:
+    """Keep ("keep"), drop ("nfa") or route ("system", "message") these items of a Checklist stage."""
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    if not run:
+        return
+    picked = set(run["picked"].get(str(index), []))
+    routes = run.setdefault("routes", {}).setdefault(str(index), {})
+    for item_id in item_ids:
+        (picked.discard if choice == "nfa" else picked.add)(item_id)
+        if choice in ("system", "message"):
+            routes[item_id] = choice
+    run["picked"][str(index)] = sorted(picked)
+
+
+def set_workflow_pick(index: int, item: str, widget_key: str) -> None:
+    set_workflow_items(index, [item], "keep" if st.session_state.get(widget_key) else "nfa")
+
+
+def set_workflow_route(index: int, item: str, widget_key: str) -> None:
+    set_workflow_items(index, [item], st.session_state.get(widget_key) or "nfa")
+
+
+def set_workflow_people(index: int, owners_of: dict) -> None:
+    """People to leave out: their items are dropped; people taken off the list come back."""
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    if not run:
+        return
+    chosen = set(st.session_state.get(f"wf_leave_{index}") or [])
+    before = set(run.setdefault("left_out", {}).get(str(index), []))
+    for person in chosen - before:
+        set_workflow_items(index, owners_of.get(person, []), "nfa")
+    for person in before - chosen:
+        set_workflow_items(index, owners_of.get(person, []), "keep")
+    run["left_out"][str(index)] = sorted(chosen)
+
+
+def undo_checklist_change(index: int) -> None:
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    output = (run or {}).get("outputs", {}).get(str(index))
+    if output and output.get("history"):
+        before = output["history"].pop()
+        output["groups"] = before["groups"]
+        run["picked"][str(index)] = before["picked"]
+        run.setdefault("routes", {})[str(index)] = before["routes"]
+        run.setdefault("left_out", {})[str(index)] = before.get("left_out", [])
+        st.session_state.pop(f"wf_leave_{index}", None)
+
+
+def change_checklist(run: dict, index: int, instruction: str, model: str, slot) -> None:
+    """Change this list: the model applies your instruction to the kept items (not the notes again)."""
+    output = run["outputs"][str(index)]
+    picked = set(run["picked"].get(str(index), []))
+    fixes = (run.get("corrections") or {}).get(str(index), {})
+    current: dict[str, list] = {}
+    for iid, subject, item in checklist_items(output):
+        if iid in picked:
+            current.setdefault(subject, []).append({**item, "route": item_route(run, index, iid),
+                                                    **({"correction": fixes[iid]} if fixes.get(iid) else {})})
+    listing = {"groups": [{"subject": subject, "items": items} for subject, items in current.items()]}
+    with notify_as("Note-Workflow · the list has been changed"), \
+            llm_progress(slot, f"Changing the list with `{model}`…") as report:
+        try:
+            answer, _usage = chat_with_ollama(
+                [{"role": "system", "content": WORKFLOW_CHANGE_INSTRUCTION},
+                 {"role": "user", "content": f"Instruction: {instruction}\n\nThe list:\n{json.dumps(listing, indent=1)}"}],
+                model, max_tokens=4096, temperature=0.1, on_progress=report, response_format=WORKFLOW_PICK_SCHEMA)
+            groups = [g for g in json.loads(split_inline_thinking(answer)[1] or "{}").get("groups") or [] if g.get("items")]
+        except (RuntimeError, ValueError, AttributeError) as exc:
+            run["error"] = f"Couldn't change the list: {exc}"
+            return
+    output.setdefault("history", []).append({"groups": output["groups"], "picked": sorted(picked),
+                                             "routes": dict((run.get("routes") or {}).get(str(index), {})),
+                                             "left_out": list((run.get("left_out") or {}).get(str(index), []))})
+    output["groups"] = groups
+    reset_checklist_state(run, index, groups)
+    run["error"] = ""
+
+
+def set_workflow_context() -> None:
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    if run:
+        run["context"] = str(st.session_state.get("wf_context") or "")
+
+
+def move_workflow_stage(step: int) -> None:
+    """Back or Next. Next to a stage not run yet runs it straight away (Cancel stops it, to correct and Run)."""
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    if run:
+        run["stage"] = max(run["stage"] + step, 0)
+        if step > 0 and str(run["stage"]) not in run["outputs"]:
+            run["auto_run"] = True
+        else:
+            run.pop("auto_run", None)
+
+
+# This run's Agent stage: its answer's progress (tokens/s) shows here in the panel, not under the folded Ask box.
+WORKFLOW_PROGRESS_SLOT = None
+
+
+def finish_workflow_agent(search_state: dict) -> None:
+    """After an Ask: if it was a Note-Workflow's Agent stage, it has answered. Next comes a stage that isn't an
+    Agent: the workflow moves on and runs it (the answer, with Execute, stays open under the panel). Next comes
+    another Agent, or this step is set to Skip and approve: it waits for Execute, then moves on (see
+    workflow_agent_executed), since the next Agent's answer replaces this one."""
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    output = run["outputs"].get(str(run["stage"])) if run else None
+    if not output or not output.pop("running", None):
+        return
+    if search_state.get("answer_error"):
+        run["error"] = f"The Agent didn't answer: {search_state['answer_error']}"
+        return
+    output["done"] = True
+    output["search_id"] = search_state.get("id")
+    output["usage"] = {k: v for k, v in (search_state.get("usage") or {}).items()
+                       if k in ("total", "processing_time", "tokens_per_second")}
+    stages = (find_workflow(run["id"]) or {}).get("stages") or []
+    approve = run["stage"] < len(stages) and bool(stages[run["stage"]].get("auto_approve")) and bool(search_state.get("agent"))
+    if approve:
+        st.session_state[AGENT_AUTO_EXECUTE_KEY] = search_state.get("id")  # Execute, on the next page run
+    following = stages[run["stage"] + 1] if run["stage"] + 1 < len(stages) else None
+    if following and not approve and following.get("kind") != "agent":
+        move_workflow_stage(1)
+    st.rerun()
+
+
+def workflow_stage_mark(output: dict | None, current: bool) -> str:
+    """After a stage's name on the panel's stage line: ✓ done; an Agent stage says whether it was sent."""
+    if not output:
+        return ""
+    if output.get("agent"):
+        if output.get("sent"):
+            return " ✓ sent"
+        if output.get("done"):
+            return " · answered, not sent" if not current else ""
+        return ""
+    return "" if current else " ✓"
+
+
+def workflow_agent_executed(search_state: dict, sent: bool) -> None:
+    """Execute pressed (or run by Skip and approve) on a Note-Workflow Agent stage's answer: mark it sent, and move
+    on to the next stage, which runs, if the workflow is still on this stage."""
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    output = run["outputs"].get(str(run["stage"])) if run else None
+    if not output or not output.get("agent") or output.get("search_id") != search_state.get("id"):
+        return
+    output["sent"] = sent
+    stages = (find_workflow(run["id"]) or {}).get("stages") or []
+    if run["stage"] + 1 < len(stages):
+        move_workflow_stage(1)
+
+
+def send_workflow_to_chat(text: str, title: str, model: str) -> None:
+    """Send to LLM Chat: a new chat holding the output, to refine it there."""
+    forget_in_confidence_chat()
+    chat = new_chat_record()
+    chat.update(title=truncate_text(title, CHAT_TITLE_CHARS * 2), titled=True, model=model)
+    chat["messages"] = [
+        {"role": "user", "content": f"{title}: here's the draft. I'll ask you to refine it.", "at": now_iso()},
+        {"role": "assistant", "content": text, "model": model, "at": now_iso()},
+    ]
+    save_chat(chat)
+    st.session_state[CHAT_OPEN_KEY] = chat["id"]
+    st.session_state.pop(CHAT_DRAFT_KEY, None)
+    st.session_state[CHAT_RETURN_KEY] = {}
+    st.query_params["page"] = CHAT_PAGE
+
+
+def workflow_menu_order(workflows: list[dict]) -> list[tuple[str, str]]:
+    """(id, label) for the Note-Workflows menu: starred first, then the most recently run, then the rest."""
+    by_id = {w["id"]: w for w in workflows}
+    starred = [w["id"] for w in workflows if w.get("favourite")]
+    recent = [i for i in load_app_settings().get(WORKFLOW_RECENT_SETTING) or [] if i in by_id and i not in starred]
+    recent = recent[:WORKFLOW_RECENT_SHOWN]
+    rest = [w["id"] for w in workflows if w["id"] not in starred and w["id"] not in recent]
+    return ([(i, f":material/star: {by_id[i]['name']}") for i in starred]
+            + [(i, f":material/history: {by_id[i]['name']}") for i in recent]
+            + [(i, by_id[i]["name"]) for i in rest])
+
+
+# The starred workflows' buttons sit on one line: any that don't fit the window's width wrap onto a second line,
+# which is hidden (they're all in the menu too), so the row shows as many as fit at any width.
+WORKFLOW_ROW_STYLE = """<style>
+.st-key-workflow_row { flex-wrap: nowrap !important; }
+.st-key-workflow_row > div:has(> .st-key-workflow_starred) { flex: 1 1 0 !important; min-width: 0; }
+.st-key-workflow_starred { flex: 0 0 auto !important; width: 100%; flex-wrap: wrap !important;
+  height: 2.75rem !important; overflow: hidden; padding: 0.15rem 0.1rem; align-content: flex-start !important; }
+.st-key-workflow_starred > div { flex-shrink: 0 !important; max-width: none !important; }
+.st-key-workflow_starred button { width: max-content !important; max-width: none !important; }
+.st-key-workflow_starred button p { white-space: nowrap; overflow: visible; text-overflow: clip; }
+.st-key-workflow_row > div:last-child { flex-shrink: 0; }
+</style>"""
+
+
+def render_workflow_menu() -> None:
+    """Under the Oneshot box: the Note-Workflows menu (starred, then recent, then the rest), a button for each
+    starred workflow (as many as fit), and Add a Note-Workflow on the right."""
+    workflows = note_workflows()
+    with st.container(horizontal=True, vertical_alignment="center", gap="small", key="workflow_row"):
+        if workflows:
+            order = workflow_menu_order(workflows)
+            labels = dict(order)
+            st.menu_button("Note-Workflows", [i for i, _label in order], key="workflow_menu", format_func=labels.get,
+                           icon=":material/account_tree:", on_click=start_workflow,
+                           help="Run a multi-stage task on your notes, e.g. **Weekly Kick-off**: the search is cleared "
+                                "and set up (dates, every note kept in scope), then each stage runs in a panel here. "
+                                "Starred workflows (:material/star:) come first, then the ones you ran most recently "
+                                "(:material/history:).")
+        with st.container(horizontal=True, vertical_alignment="center", gap="small", key="workflow_starred"):
+            st.html(WORKFLOW_ROW_STYLE)
+            for workflow in workflows:
+                if workflow.get("favourite"):
+                    st.button(workflow["name"], key=f"workflow_star_{workflow['id']}", icon=":material/star:",
+                              on_click=start_workflow, args=(workflow["id"],),
+                              help="Run this starred Note-Workflow (star or unstar them in the Prompt library).")
+        st.link_button("Add a Note-Workflow", f"{PROMPT_LIBRARY_PAGE_URL}&workflows=new", icon=":material/add:",
+                       type="tertiary",
+                       help="Opens the Prompt library (in a new tab) with a new workflow under **Note-Workflows** to "
+                            "set up. Star a workflow there to put it at the top of this menu.")
+
+
+def finish_workflow_search(safe_lib: str, folder: Path | None) -> None:
+    """End of the search page, once the workflow's Filter search has run: none found, so try the most recent day
+    with notes (if the workflow says so); else keep only its most recent N notes, and the panel moves on."""
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    if run and run.get("auto_run") == "armed" and not run.get("keep_pending") and not run.get("refilter"):
+        # Skip selection: the notes kept have now been drawn, so the browser has them; run the first stage on a
+        # fresh page run (one cut short by Cancel takes its ticks from the browser, which would undo the keep).
+        run["auto_run"] = True
+        st.rerun()
+    if not run or run["status"] != "finding" or st.session_state.get(AUTO_SEARCH_KEY):
+        return
+    workflow = find_workflow(run["id"]) or {}
+    gathered = gathered_notes(safe_lib)
+    if not (gathered and gathered["notes"]) and workflow.get("fallback") and not run.get("fell_back") and folder:
+        day = latest_note_day(safe_lib, str(folder), str(workflow.get("folder") or ""))
+        if day:
+            run.update(fell_back=day, refilter=[day], week=[day, day])
+            st.rerun()
+    if workflow.get("keep") and folder:  # on the next run, before the note checkboxes are drawn
+        run["keep_pending"] = [str(folder), int(workflow["keep"])]
+    run["status"] = "ready"
+    if workflow.get("skip_selection"):
+        run["auto_run"] = "armed"  # runs once the notes kept are on the page (see the top of this function)
+    st.rerun()
+
+
+def apply_workflow_refilter(safe_lib: str) -> None:
+    """Before the filter's and the notes' widgets: keep only the most recent notes found, or search again for the
+    fallback day (widgets can't be changed once drawn, so these wait for the top of the next run)."""
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    if run and run.get("keep_pending"):
+        folder, keep = run.pop("keep_pending")
+        keep_most_recent(safe_lib, folder, keep)
+    if run and run.get("refilter"):
+        st.session_state["filter_any"] = run.pop("refilter")
+        st.session_state["filter_fold_any"] = True
+        persist_search_filter()
+        st.session_state[AUTO_SEARCH_KEY] = "filter"
+
+
+def set_workflow_note(lib_key: str, source: str, widget_key: str) -> None:
+    """Notes considered: ticked takes part, unticked is excluded (the same as 🚫 in the list under the search)."""
+    _set_note_excluded(lib_key, source, not st.session_state.get(widget_key))
+    st.session_state.pop(TARGET_PICKS_KEY, None)
+    persist_excluded_notes()
+
+
+def render_workflow_notes(safe_lib: str, folder: Path | None) -> None:
+    """Notes considered: every note the workflow's search found, newest first, ticked when it takes part."""
+    gathered = gathered_notes(safe_lib)
+    if not gathered or not gathered["notes"]:
+        return
+    dates = library_note_dates(safe_lib, str(folder)) if folder else {}
+    keys = sorted(gathered["notes"], key=lambda k: note_written_key(dates.get(k[1], ("", 0.0))), reverse=True)
+    kept = set(kept_gathered_notes(gathered))
+    with st.expander(f"Notes considered · {len(kept)} of {len(keys)} taking part", icon=":material/description:",
+                     key="wf_notes_open"):
+        st.caption("Newest first. Untick a note to leave it out, or tick another to bring it in (the same as 🚫 in "
+                   "the list under the search). To look elsewhere, change the filter and press **Filter search only**.")
+        for lib, source in keys[:200]:
+            key = f"wf_note::{lib}::{source}"
+            st.session_state[key] = (lib, source) in kept
+            written, created = dates.get(source, ("", 0.0))
+            when = written or (datetime.date.fromtimestamp(created).isoformat() if created else "")
+            st.checkbox(f"{Path(source).stem}" + (f" · {when}" if when else ""), key=key,
+                        on_change=set_workflow_note, args=(lib, source, key))
+
+
+def library_folder_for_workflows() -> Path | None:
+    folder = globals().get("library_content_path")  # the selected library's folder (set on the search page)
+    return Path(folder) if folder else None
+
+
+def workflow_search_fold(safe_lib: str) -> tuple[bool, bool]:
+    """While a Note-Workflow runs past finding its notes, the search page tidies away under it: (fold the Filter
+    and Ask boxes, fold the results). Not while it's finding notes or found none (the filter is needed then), and
+    an Agent stage that's been run keeps its results open (its answer and staged items are there)."""
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    if not run or run.get("status") == "finding":
+        return False, False
+    gathered = gathered_notes(safe_lib)
+    if not gathered or not kept_gathered_notes(gathered):
+        return False, False
+    workflow = find_workflow(run["id"])
+    stages = (workflow or {}).get("stages") or []
+    if not stages:
+        return False, False
+    index = min(run["stage"], len(stages) - 1)
+    agent_open = any(stages[i].get("kind") == "agent" and str(i) in run["outputs"] for i in range(index + 1))
+    return True, not agent_open
+
+
+def search_fold(folded: bool, label: str, icon: str, key: str):
+    """A collapsed expander when a Note-Workflow folds this part of the search page, else a plain container. Keyed
+    by the stage, so it folds again each time the workflow moves on."""
+    if not folded:
+        return st.container()
+    stage = (st.session_state.get(WORKFLOW_RUN_KEY) or {}).get("stage", 0)
+    return st.expander(label, icon=icon, key=f"{key}_{stage}")
+
+
+def render_workflow_panel(safe_lib: str, corpus_config: dict) -> None:
+    """The running workflow: the week and notes found, then the current stage (its prompt and model, Run, and
+    its output: a checklist with a context box, or text to copy or send to Chat), with Back and Next."""
+    run = st.session_state.get(WORKFLOW_RUN_KEY)
+    if not run:
+        return
+    workflow = find_workflow(run["id"])
+    if not workflow or not workflow.get("stages"):
+        st.session_state.pop(WORKFLOW_RUN_KEY, None)
+        return
+    stages = workflow["stages"]
+    index = min(run["stage"], len(stages) - 1)
+    stage = stages[index]
+    week = workflow_week(run)
+    gathered = gathered_notes(safe_lib)
+    count = len(kept_gathered_notes(gathered)) if gathered else 0
+    with st.container(border=True, key="workflow_panel"):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(f":material/account_tree: **{workflow['name']}**"
+                        + (f" · {describe_week(week)}" if week else "")
+                        + (" · finding notes…" if run["status"] == "finding" else f" · {plural(count, 'note')} in scope"),
+                        width="stretch")
+            st.button("Start again", key="wf_restart", icon=":material/restart_alt:", on_click=start_workflow,
+                      args=(run["id"],), type="tertiary",
+                      help="Clear what this run has done and find its notes again, e.g. after changing the workflow.")
+            st.button("Close", key="wf_close", icon=":material/close:", on_click=close_workflow, type="tertiary")
+        st.caption(" → ".join(("**" if i == index else "") + f"{i + 1} {s['name']}" + ("**" if i == index else "")
+                              + workflow_stage_mark(run["outputs"].get(str(i)), i == index)
+                              for i, s in enumerate(stages)))
+        if run["status"] == "finding":
+            st.markdown(":material/progress_activity: Finding the notes…")
+            return
+        if run.get("fell_back"):
+            st.info(f"No notes in the window, so it went back to the most recent day with notes: **{run['fell_back']}**.",
+                    icon=":material/history:")
+        render_workflow_notes(safe_lib, library_folder_for_workflows())
+        if not count and stage.get("send_notes", True):
+            st.warning("No notes in scope. Change the filter below and press **Filter search only**, then come back "
+                       "here.", icon=":material/search_off:")
+        output = run["outputs"].get(str(index))
+        stopped = bool(output and output.pop("running", None))  # an Agent left running by an earlier page run: stopped
+        if stopped:
+            output["stopped"] = True
+        prompt_key = f"wf_prompt_{run['id']}_{index}"
+        if prompt_key not in st.session_state:
+            st.session_state[prompt_key] = fill_workflow_prompt(stage_prompt_text(stage), run, index)
+        models = installed_model_names() or [workflow_stage_model(workflow, stage, corpus_config)]
+        model = workflow_stage_model(workflow, stage, corpus_config)
+        if model not in models:
+            models = [model, *models]
+        template = stage_prompt_text(stage)
+        empty_routes = [WORKFLOW_ROUTES[r] for r in ("system", "message")
+                        if f"{{{r}}}" in template and not workflow_selection_text(run, index, r)]
+        auto = run.get("auto_run") is True and run.pop("auto_run") and output is None and (count or not stage.get("send_notes", True))
+        if auto and empty_routes and index and index + 1 < len(stages):  # nothing for this stage: on to the next
+            st.toast(f"Nothing is routed to {' or '.join(empty_routes)}, so **{stage['name']}** was skipped.",
+                     icon=":material/alt_route:")
+            move_workflow_stage(1)
+            st.rerun()
+        auto = auto and not (empty_routes and index)
+        # One line: the stage's prompt (folded once it's run or running), Skip and approve step, and Stop step.
+        step_row = st.container(horizontal=True, vertical_alignment="top", gap="small", key="wf_step_row")
+        with step_row, st.expander(f"Stage {index + 1}: {stage['name']} · prompt", expanded=output is None and not auto,
+                                   key=f"wf_prompt_open_{index}"):
+            st.text_area("Prompt", key=prompt_key, height=150, label_visibility="collapsed",
+                         help="This run's prompt, filled in from the workflow (edit it here for this run only).")
+            with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                chosen = st.selectbox("Model", models, index=models.index(model), key=f"wf_model_{index}",
+                                      label_visibility="collapsed", width=220)
+                run_clicked = st.button("Run" if output is None else "Run again", key=f"wf_run_{index}",
+                                        type="primary" if output is None else "secondary",
+                                        icon=":material/play_arrow:")
+                st.button("Refill prompt", key=f"wf_refill_{index}", type="tertiary", icon=":material/restart_alt:",
+                          on_click=lambda k=prompt_key: st.session_state.pop(k, None),
+                          help="Fill the prompt in again from the workflow (e.g. after changing your picks).")
+        if auto:  # Skip selection (the first stage) or Next: it runs straight away
+            run_clicked = True
+        running = bool(run_clicked) and not (empty_routes and index)
+        with step_row, st.container(horizontal=True, vertical_alignment="center", gap="small", width="content",
+                                    key="wf_step_controls"):
+            approve_key = f"wf_approve_{stage['id']}"
+            st.session_state[approve_key] = bool(stage.get("auto_approve"))
+            st.checkbox("Skip and approve step", key=approve_key, on_change=set_stage_approve,
+                        args=(workflow["id"], stage["id"], approve_key), help=WORKFLOW_APPROVE_HELP)
+            st.button("Stop step", key="wf_stop_step", icon=":material/stop_circle:", disabled=not running,
+                      on_click=cancel_llm, type="secondary",
+                      help="Stop this step now (the same as **Cancel**), to correct the list or edit the prompt, "
+                           "then press **Run**." if running else "Shows while this step runs.")
+        if empty_routes and index:
+            st.info(f"Nothing is routed to **{' or '.join(empty_routes)}**, so there's nothing for this stage: go on "
+                    "to the next one, or go **Back** and route some items here.", icon=":material/alt_route:")
+        progress = st.empty()
+        if auto:
+            st.caption(f":material/progress_activity: **{stage['name']}** is running. **Stop step** stops it, to "
+                       + ("change the notes under **Notes considered**" if index == 0 else "go **Back** and correct "
+                          "the list, or open the prompt above and edit it")
+                       + ", then press **Run**.")
+        agent_running = False
+        if run_clicked and stage.get("kind") == "agent":
+            start_workflow_agent(workflow, run, index, st.session_state[prompt_key], chosen)
+            output = run["outputs"].get(str(index))  # shown now: the Ask below runs it in this same run
+            agent_running = bool(output and output.get("running"))
+            if agent_running:  # its tokens/s show here (the Ask box is folded away)
+                global WORKFLOW_PROGRESS_SLOT
+                WORKFLOW_PROGRESS_SLOT = progress
+        elif run_clicked:
+            run_workflow_stage(workflow, run, index, st.session_state[prompt_key], chosen, safe_lib, corpus_config,
+                               progress)
+            done = run["outputs"].get(str(index))
+            approved = done and not run.get("error") and (stage.get("kind") != "pick" or done.get("groups") is not None)
+            if stage.get("auto_approve") and approved and index + 1 < len(stages):
+                move_workflow_stage(1)  # Skip and approve step: kept as it is, and on to the next step
+            st.rerun()
+        if run.get("error"):
+            st.error(run["error"], icon=":material/error:")
+        if output:
+            usage = output.get("usage") or {}
+            if usage.get("processing_time") is not None:  # an Agent stage's answer, as the Ask answer shows it
+                st.caption(f"`{output.get('model')}` · {usage.get('total', '?')} tokens · {usage['processing_time']:.1f}s"
+                           + (f" · {usage['tokens_per_second']:.1f} tokens/s" if usage.get("tokens_per_second") else ""))
+            elif output.get("tokens_per_second"):
+                st.caption(f"`{output.get('model')}` · {output['tokens_per_second']:.1f} tokens/s")
+            if output.get("trimmed"):
+                st.caption(f"{output['trimmed']} notes were trimmed to fit the **Notes budget** (Ollama model details).")
+            if output.get("done_reason") == "length":
+                st.warning("The output hit **Max tokens** and may be cut short.", icon=":material/warning:")
+            if output.get("agent") and agent_running:
+                st.info(f"**{output['agent']}** is working on the notes in scope. When it has answered, "
+                        + (f"**{stages[index + 1]['name']}** runs by itself. " if index + 1 < len(stages) else "")
+                        + "Its answer and items are in the results below.", icon=":material/smart_toy:")
+            elif output.get("agent") and output.get("stopped"):
+                st.warning(f"**{output['agent']}** was stopped before it finished. Edit the prompt above (or go "
+                           "**Back** and correct the list), then press **Run again**.", icon=":material/stop_circle:")
+            elif output.get("agent") and stage.get("auto_approve"):
+                st.success(f"**{output['agent']}** has answered and its items were executed (**Skip and approve "
+                           "step**): they're held for review in the results below, to drop any or **Recall** them.",
+                           icon=":material/smart_toy:")
+            elif output.get("agent"):
+                following = stages[index + 1] if index + 1 < len(stages) else None
+                st.success(f"**{output['agent']}** has answered. Its answer is in the results below. When it's "
+                           "right, press **Execute** beside it: the items are sent but held for review first, to "
+                           "drop any or **Recall** them."
+                           + (f" Then **{following['name']}** runs." if following and following.get("kind") == "agent"
+                              and not output.get("sent") else ""), icon=":material/smart_toy:")
+                if following and following.get("kind") == "agent" and not output.get("sent"):
+                    st.caption(f"**Next** without **Execute** skips sending these: the answer from **{following['name']}** "
+                               "replaces this one.")
+            elif output.get("groups") is not None:
+                render_workflow_checklist(run, index, output, bool(stage.get("route")), chosen,
+                                          stage.get("group_by") or "subject")
+            else:
+                st.markdown(output.get("text") or "*(empty)*")
+                with st.container(horizontal=True, gap="small", vertical_alignment="center"):
+                    render_copy_buttons([("Copy", output.get("text") or "")], fit=True)
+                    title = workflow["name"] + (f" · {describe_week(week)}" if week else "")
+                    st.button("Send to LLM Chat", key=f"wf_chat_{index}", icon=":material/forum:",
+                              on_click=send_workflow_to_chat, args=(output.get("text") or "", title, output["model"]),
+                              help="Open it in a new Chat with LLM conversation, to refine it there.")
+        with st.container(horizontal=True, gap="small"):
+            if index:
+                st.button("Back", key="wf_back", icon=":material/arrow_back:", on_click=move_workflow_stage, args=(-1,))
+            if index + 1 < len(stages):
+                st.button(f"Next: {stages[index + 1]['name']}", key="wf_next", type="primary",
+                          icon=":material/arrow_forward:",
+                          disabled=agent_running or (output is None and not (empty_routes and index)),
+                          on_click=move_workflow_stage, args=(1,),
+                          help="Moves on by itself once the Agent has answered." if agent_running else None)
+
+
+def render_workflow_checklist(run: dict, index: int, output: dict, routed: bool, model: str,
+                              group_default: str = "subject") -> None:
+    """A Checklist stage's items, each ticked to keep (or, routed, set to NFA / Agent / Message, and corrected in words), grouped by
+    client, person or kind, with people to leave out and a box to change the list in words; beside them, a box
+    for context for the next stage."""
+    picked = set(run["picked"].get(str(index), []))
+    fixes = (run.get("corrections") or {}).get(str(index), {})
+    entries = checklist_items(output)
+    owners_of: dict[str, list[str]] = {}
+    for iid, _subject, item in entries:
+        owners_of.setdefault(str(item.get("owner") or "").strip() or "No one named", []).append(iid)
+    list_col, context_col = st.columns([3, 2], gap="medium")
+    with list_col:
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+            group_by = st.segmented_control("Group by", list(WORKFLOW_GROUP_BY), format_func=WORKFLOW_GROUP_BY.get,
+                                            default=group_default, key=f"wf_group_by_{index}") or group_default
+            if len(owners_of) > 1:
+                st.pills("Leave out", sorted(owners_of), selection_mode="multi", key=f"wf_leave_{index}",
+                         on_change=set_workflow_people, args=(index, owners_of),
+                         default=(run.get("left_out") or {}).get(str(index)) or None,
+                         help="Drop everything for these people; click again to bring them back.")
+        with st.form(f"wf_change_form_{index}", border=False):
+            with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+                st.text_input("Change this list", key=f"wf_change_{index}", width="stretch",
+                              placeholder="e.g. exclude all actions for Sam · arrange these by person · merge duplicates",
+                              help="The model applies this to the items you've kept (not the notes again) and gives "
+                                   "back a new list. **Undo** puts the last one back.")
+                change_clicked = st.form_submit_button("Change", icon=":material/auto_fix_high:")
+            if output.get("history"):
+                st.form_submit_button(f"Undo ({len(output['history'])})", icon=":material/undo:", type="tertiary",
+                                      on_click=undo_checklist_change, args=(index,))
+        change_slot = st.empty()
+        if change_clicked and str(st.session_state.get(f"wf_change_{index}") or "").strip():
+            change_checklist(run, index, st.session_state[f"wf_change_{index}"].strip(), model, change_slot)
+            st.rerun()
+        if routed:
+            counts = {route: sum(1 for iid, *_ in entries if (route == "nfa") == (iid not in picked)
+                                 and (route == "nfa" or item_route(run, index, iid) == route)) for route in WORKFLOW_ROUTES}
+            st.caption("Choose where each action goes · " + " · ".join(f"{WORKFLOW_ROUTES[r]}: {n}" for r, n in counts.items()))
+        else:
+            st.caption(f"Untick what you don't want to take forward · {len(picked)} of {len(entries)} kept")
+        heading = {"subject": lambda subject, item: subject, "kind": lambda subject, item: str(item.get("kind") or "Other"),
+                   "owner": lambda subject, item: str(item.get("owner") or "").strip() or "No one named"}[group_by]
+        groups: dict[str, list] = {}
+        for iid, subject, item in entries:
+            groups.setdefault(heading(subject, item), []).append((iid, subject, item))
+        for g, (title, rows) in enumerate(groups.items()):
+            ids = [iid for iid, *_ in rows]
+            with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                st.markdown(f"**{title}**", width="content")
+                choices = [("NFA", "nfa"), ("Agent", "system"), ("Message", "message")] if routed \
+                    else [("All", "keep"), ("None", "nfa")]
+                for label, choice in choices:
+                    st.button(label, key=f"wf_bulk_{index}_{group_by}_{g}_{choice}", type="tertiary",
+                              on_click=set_workflow_items, args=(index, ids, choice),
+                              help=f"Set every item under {title} to {label}.")
+            for iid, subject, item in rows:
+                details = [str(item.get(f) or "").strip() for f in ("owner", "due")]
+                details = [d for d in [details[0] if group_by != "owner" else "", f"due {details[1]}" if details[1] else ""] if d]
+                if group_by != "subject":
+                    details.append(subject)
+                label = (f"**{str(item.get('kind') or '').strip()}**: {str(item.get('text') or '').strip()}"
+                         + (f" · *{', '.join(details)}*" if details else ""))
+                tip = f"From {item['source']}" if item.get("source") else None
+                fix = fixes.get(iid, "")
+                open_key, fix_key = f"wf_fix_open_{index}_{iid}", f"wf_fix_{index}_{iid}"
+                with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                    if routed:
+                        key = f"wf_route_{index}_{iid}"
+                        st.session_state[key] = item_route(run, index, iid) if iid in picked else "nfa"
+                        st.radio("Route", list(WORKFLOW_ROUTES), format_func=lambda r: WORKFLOW_ROUTES[r].split(" ")[0],
+                                 key=key, horizontal=True, label_visibility="collapsed", width="content",
+                                 on_change=set_workflow_route, args=(index, iid, key), help=tip)
+                        st.markdown(label, width="stretch")
+                    else:
+                        key = f"wf_pick_{index}_{iid}"
+                        st.session_state[key] = iid in picked
+                        st.checkbox(label, key=key, on_change=set_workflow_pick, args=(index, iid, key), help=tip,
+                                    width="stretch")
+                    st.button("", key=f"wf_fix_btn_{index}_{iid}", icon=":material/edit_note:", type="tertiary",
+                              on_click=toggle_workflow_correction, args=(open_key,),
+                              help="Correct this item in words, e.g. *the owner is Sam, due Friday* or *it's the "
+                                   "renewal, not the pilot*. The correction goes on with the item, and the next "
+                                   "stages apply it.")
+                if st.session_state.get(open_key) or fix:
+                    st.session_state[fix_key] = fix
+                    st.text_area("Correction", key=fix_key, height="content", label_visibility="collapsed",
+                                 placeholder="Correct this item in words, e.g. the owner is Sam, due Friday",
+                                 on_change=set_workflow_correction, args=(index, iid, fix_key))
+    with context_col:
+        st.session_state.setdefault("wf_context", run.get("context", ""))
+        st.text_area("Context for the next stage", key="wf_context", height=260, on_change=set_workflow_context,
+                     placeholder="Anything to add or steer with, e.g. *Acme's renewal slipped to January; leave "
+                                 "out the internal tooling items.*",
+                     help="Sent to the later stages as {context}, with the items you kept as {selection} "
+                          "(or, routed, as {system} and {message}).")
+
+
+# --- Note-Workflows in the Prompt library -------------------------------------------
+WORKFLOW_SECTIONS_KEY = "wf_open_sections"  # {section key: open}: kept by the app, so a title change keeps it open
+
+
+def remember_workflow_section(key: str) -> None:
+    st.session_state.setdefault(WORKFLOW_SECTIONS_KEY, {})[key] = bool(st.session_state.get(key))
+
+
+def open_workflow_section(key: str) -> None:
+    st.session_state.setdefault(WORKFLOW_SECTIONS_KEY, {})[key] = True
+
+
+def workflow_section(label: str, key: str, icon: str | None = None):
+    """A folding section that stays open when its title changes (starring or renaming a workflow, the count):
+    Streamlit draws a section with a new title as a new one, folded, so its state is kept here and passed in."""
+    opened = bool(st.session_state.get(WORKFLOW_SECTIONS_KEY, {}).get(key))
+    return st.expander(label, expanded=opened, key=key, icon=icon, on_change=remember_workflow_section, args=(key,))
+
+
+def save_workflows(workflows: list[dict]) -> None:
+    library = load_prompt_library()
+    library["workflows"] = workflows
+    save_prompt_library(library)
+
+
+def edit_workflow(workflow_id: str, change) -> None:
+    """Apply `change(workflow)` to one workflow and save."""
+    workflows = note_workflows()
+    for workflow in workflows:
+        if workflow["id"] == workflow_id:
+            change(workflow)
+    save_workflows(workflows)
+
+
+def set_workflow_field(workflow_id: str, field: str, widget_key: str) -> None:
+    edit_workflow(workflow_id, lambda w: w.update({field: st.session_state.get(widget_key)}))
+
+
+def set_stage_field(workflow_id: str, stage_id: str, field: str, widget_key: str) -> None:
+    def change(workflow: dict) -> None:
+        for stage in workflow["stages"]:
+            if stage["id"] == stage_id:
+                value = st.session_state.get(widget_key)
+                if field in ("kind", "source") and value is None:  # clicking the chosen option again: keep it
+                    st.session_state[widget_key] = stage.get(field)
+                    return
+                if field == "note_library":
+                    stage["note"] = {"library": value, "source": ""}
+                elif field == "note_source":
+                    stage["note"] = {**(stage.get("note") or {}), "source": value}
+                else:
+                    stage[field] = value
+    edit_workflow(workflow_id, change)
+
+
+def add_stage(workflow_id: str) -> None:
+    edit_workflow(workflow_id, lambda w: w["stages"].append(
+        {"id": uuid.uuid4().hex[:8], "name": f"Stage {len(w['stages']) + 1}", "kind": "write", "source": "text",
+         "note": None, "model": "", "send_notes": True, "text": "{previous}"}))
+
+
+def remove_stage(workflow_id: str, stage_id: str) -> None:
+    edit_workflow(workflow_id, lambda w: w.update(stages=[s for s in w["stages"] if s["id"] != stage_id]))
+
+
+def place_stage(workflow_id: str, stage_id: str, position: int) -> None:
+    """Move a stage to `position` (0 first). A run of this workflow is closed: its outputs follow the old order."""
+    def change(workflow: dict) -> None:
+        stages = workflow["stages"]
+        stage = next(s for s in stages if s["id"] == stage_id)
+        stages.remove(stage)
+        stages.insert(max(0, min(position, len(stages))), stage)
+    edit_workflow(workflow_id, change)
+    if (st.session_state.get(WORKFLOW_RUN_KEY) or {}).get("id") == workflow_id:
+        st.session_state.pop(WORKFLOW_RUN_KEY, None)
+        st.toast("The stages changed order, so its run was closed: run the workflow again.", icon=":material/swap_vert:")
+
+
+def shift_stage(workflow_id: str, stage_id: str, step: int) -> None:
+    stages = (find_workflow(workflow_id) or {}).get("stages") or []
+    i = next((n for n, s in enumerate(stages) if s["id"] == stage_id), None)
+    if i is not None and 0 <= i + step < len(stages):
+        place_stage(workflow_id, stage_id, i + step)
+
+
+def set_stage_position(workflow_id: str, stage_id: str, widget_key: str) -> None:
+    position = st.session_state.get(widget_key)
+    if position is not None:
+        place_stage(workflow_id, stage_id, int(position))
+
+
+STAGE_NEEDS_CHECKLIST = ("{selection}", "{system}", "{message}")
+
+
+def stage_order_problems(workflow: dict, n: int) -> list[str]:
+    """What a stage's prompt takes from earlier stages that, in this order, it won't get."""
+    stage = workflow["stages"][n]
+    text = stage_prompt_text(stage)
+    earlier = workflow["stages"][:n]
+    problems = []
+    needs = [p for p in STAGE_NEEDS_CHECKLIST if p in text]
+    if needs and not any(s.get("kind") == "pick" for s in earlier):
+        problems.append(f"Its prompt uses {', '.join(needs)}, which {'comes' if len(needs) == 1 else 'come'} from a "
+                        "**Checklist** stage, and none comes before it: move it below one.")
+    if "{message}" in text and not any(s.get("kind") == "pick" and s.get("route") for s in earlier) and \
+            any(s.get("kind") == "pick" for s in earlier):
+        problems.append("Its prompt uses {message}, but the Checklist before it doesn't **Route each item**.")
+    if "{previous}" in text and not n:
+        problems.append("Its prompt uses {previous}, but it's the first stage, so there's no stage before it.")
+    return problems
+
+
+def add_workflow() -> str:
+    workflows = note_workflows()
+    workflow_id = uuid.uuid4().hex[:8]
+    workflows.append({"id": workflow_id, "name": "New workflow", "dates": "none", "model": "", "favourite": False,
+                      "stages": [{"id": uuid.uuid4().hex[:8], "name": "Stage 1", "kind": "write", "source": "text",
+                                  "note": None, "model": "", "send_notes": True, "text": ""}]})
+    save_workflows(workflows)
+    open_workflow_section(f"wf_edit_open_{workflow_id}")  # open, ready to set up
+    return workflow_id
+
+
+def duplicate_workflow(workflow_id: str) -> None:
+    """A copy of a workflow (and its stages, with new ids) just under it, open to change; not starred."""
+    workflows = note_workflows()
+    source = next((w for w in workflows if w["id"] == workflow_id), None)
+    if not source:
+        return
+    copy = json.loads(json.dumps(source))
+    copy.update(id=uuid.uuid4().hex[:8], name=f"{source['name']} (copy)", favourite=False)
+    for stage in copy["stages"]:
+        stage["id"] = uuid.uuid4().hex[:8]
+    workflows.insert(workflows.index(source) + 1, copy)
+    save_workflows(workflows)
+    open_workflow_section(f"wf_edit_open_{copy['id']}")
+
+
+def remove_workflow(workflow_id: str) -> None:
+    save_workflows([w for w in note_workflows() if w["id"] != workflow_id])
+    if (st.session_state.get(WORKFLOW_RUN_KEY) or {}).get("id") == workflow_id:
+        st.session_state.pop(WORKFLOW_RUN_KEY, None)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def library_note_sources(lib_key: str) -> list[str]:
+    table = lib_key.replace('"', '""')
+    try:
+        with sqlite3.connect(SQLiteConfig.get_uri_string()) as conn:
+            return sorted(str(r[0]) for r in conn.execute(f'SELECT DISTINCT file_source FROM "{table}"'))
+    except sqlite3.Error:
+        return []
+
+
+def render_workflows_section() -> None:
+    """Prompt library: Note-Workflows, each a search set-up and its stages (prompt as text or from a note)."""
+    if st.query_params.get("workflows") == "new":  # Add a Note-Workflow, from the search page: one new workflow
+        del st.query_params["workflows"]
+        add_workflow()
+        open_workflow_section("workflows_open")
+    elif st.query_params.get("workflows"):
+        del st.query_params["workflows"]
+        open_workflow_section("workflows_open")
+    workflows = note_workflows()
+    with workflow_section(f"Note-Workflows · {len(workflows)}", "workflows_open", icon=":material/account_tree:"):
+        st.caption("Multi-stage tasks run from the search page's **Note-Workflows** menu. The search is cleared and "
+                   "set up (Literal, the date window, the notes found kept in scope, or only the most recent few), "
+                   "then each stage asks about those notes. A **Checklist** stage lists items to keep, with a box for "
+                   "context; a **Written** stage writes the output, to copy or send to Chat; an **Agent** stage runs "
+                   "one of your Agents (e.g. to stage tasks to review and send). Each stage is told what the next "
+                   "one does with its output. In a prompt: " + WORKFLOW_PLACEHOLDERS + ".")
+        models = ["", *installed_model_names()]
+        libraries = {resolve_library_registry_name(name): name for name in notes_libraries()}
+        for workflow in workflows:
+            wid = workflow["id"]
+            with workflow_section((":material/star: " if workflow.get("favourite") else "") + workflow["name"],
+                                  f"wf_edit_open_{wid}"):
+                with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+                    for field, value in (("name", workflow["name"]), ("dates", workflow.get("dates", "none")),
+                                         ("model", workflow.get("model", ""))):
+                        st.session_state.setdefault(f"wf_{field}_{wid}", value)
+                    st.text_input("Name", key=f"wf_name_{wid}", on_change=set_workflow_field,
+                                  args=(wid, "name", f"wf_name_{wid}"), width=240)
+                    st.selectbox("Dates", list(WORKFLOW_DATES), format_func=WORKFLOW_DATES.get, key=f"wf_dates_{wid}",
+                                 on_change=set_workflow_field, args=(wid, "dates", f"wf_dates_{wid}"), width=300,
+                                 help="Last working week: Monday to Friday of last week, or of this week to today "
+                                      "when run from Thursday on. Matched as the dates in your notes, or their "
+                                      "creation dates (Configure > **Note dates**).")
+                    st.selectbox("Model", models if workflow.get("model", "") in models else [workflow["model"], *models],
+                                 key=f"wf_model_{wid}", format_func=lambda m: m or "The library's answer model",
+                                 on_change=set_workflow_field, args=(wid, "model", f"wf_model_{wid}"), width=240,
+                                 help="Every stage's model, unless a stage picks its own.")
+                    st.session_state.setdefault(f"wf_folder_{wid}", str(workflow.get("folder") or ""))
+                    st.text_input("Folder", key=f"wf_folder_{wid}", on_change=set_workflow_field,
+                                  args=(wid, "folder", f"wf_folder_{wid}"), width=240,
+                                  placeholder="Any folder",
+                                  help="Only notes in this folder, written as the folder path is shown, e.g. "
+                                       "*Clients > Prospects* (any part of the path matches). Empty: every folder.")
+                    st.session_state.setdefault(f"wf_keep_{wid}", int(workflow.get("keep") or 0))
+                    st.number_input("Keep the most recent", min_value=0, max_value=200, key=f"wf_keep_{wid}",
+                                    on_change=set_workflow_field, args=(wid, "keep", f"wf_keep_{wid}"), width=170,
+                                    help="Keep only this many of the notes found, the most recently written (0 keeps "
+                                         "them all). The rest are listed under **Notes considered** to tick back in.")
+                    st.session_state.setdefault(f"wf_fallback_{wid}", bool(workflow.get("fallback")))
+                    st.toggle("If none, use the most recent day", key=f"wf_fallback_{wid}", on_change=set_workflow_field,
+                              args=(wid, "fallback", f"wf_fallback_{wid}"),
+                              help="When no notes fall in the dates, go back to the most recent day that has notes.")
+                    st.session_state.setdefault(f"wf_skip_selection_{wid}", bool(workflow.get("skip_selection")))
+                    st.checkbox("Skip selection", key=f"wf_skip_selection_{wid}", on_change=set_workflow_field,
+                                args=(wid, "skip_selection", f"wf_skip_selection_{wid}"),
+                                help="Run the first stage as soon as the notes are found, without stopping to check "
+                                     "**Notes considered**. **Cancel** stops it, to change the notes and **Run** "
+                                     "again; **Start again** finds the notes afresh.")
+                    st.session_state.setdefault(f"wf_favourite_{wid}", bool(workflow.get("favourite")))
+                    st.toggle(":material/star: Favourite", key=f"wf_favourite_{wid}", on_change=set_workflow_field,
+                              args=(wid, "favourite", f"wf_favourite_{wid}"),
+                              help="Starred workflows come first in the search page's **Note-Workflows** menu.")
+                for n, stage in enumerate(workflow["stages"]):
+                    render_stage_editor(wid, workflow, n, stage, models, libraries)
+                with st.container(horizontal=True, gap="small"):
+                    st.button("Add stage", key=f"wf_add_stage_{wid}", icon=":material/add:", on_click=add_stage,
+                              args=(wid,))
+                    st.button("Duplicate", key=f"wf_duplicate_{wid}", icon=":material/content_copy:", type="tertiary",
+                              on_click=duplicate_workflow, args=(wid,),
+                              help="Make a copy of this workflow and its stages, to change without touching this one.")
+                    st.button("Delete workflow", key=f"wf_delete_{wid}", icon=":material/delete:", type="tertiary",
+                              on_click=remove_workflow, args=(wid,))
+        st.button("New workflow", key="wf_new", icon=":material/add:", on_click=add_workflow)
+
+
+def render_stage_editor(wid: str, workflow: dict, n: int, stage: dict, models: list[str], libraries: dict) -> None:
+    sid = stage["id"]
+    base = f"wf_{wid}_{sid}"
+    note = stage.get("note") or {}
+    for field, value in (("name", stage["name"]), ("kind", stage.get("kind", "write")),
+                         ("source", stage.get("source", "text")), ("text", stage.get("text", "")),
+                         ("model", stage.get("model", "")), ("send_notes", stage.get("send_notes", True)),
+                         ("note_library", note.get("library") or ""), ("note_source", note.get("source") or "")):
+        st.session_state.setdefault(f"{base}_{field}", value)
+    with st.container(border=True):
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+            st.text_input(f"Stage {n + 1}", key=f"{base}_name", on_change=set_stage_field,
+                          args=(wid, sid, "name", f"{base}_name"), width=220)
+            st.segmented_control("Output", list(WORKFLOW_STAGE_KINDS), format_func=WORKFLOW_STAGE_KINDS.get,
+                                 key=f"{base}_kind", on_change=set_stage_field, args=(wid, sid, "kind", f"{base}_kind"))
+            st.segmented_control("Prompt from", ["text", "note"], format_func={"text": "Text", "note": "A note"}.get,
+                                 key=f"{base}_source", on_change=set_stage_field,
+                                 args=(wid, sid, "source", f"{base}_source"))
+            position_key = f"{base}_position"
+            st.session_state[position_key] = n
+            st.selectbox("Order", list(range(len(workflow["stages"]))), key=position_key, width=110,
+                         format_func=lambda i: f"Step {i + 1}", on_change=set_stage_position,
+                         args=(wid, sid, position_key), disabled=len(workflow["stages"]) == 1,
+                         help="Move this stage to another step in one go (or use the arrows). A later stage gets "
+                              "the written output of earlier ones as context, e.g. an email drafted first.")
+            st.button("", key=f"{base}_up", icon=":material/arrow_upward:", type="tertiary", disabled=not n,
+                      on_click=shift_stage, args=(wid, sid, -1), help="Move up")
+            st.button("", key=f"{base}_down", icon=":material/arrow_downward:", type="tertiary",
+                      disabled=n == len(workflow["stages"]) - 1, on_click=shift_stage, args=(wid, sid, 1),
+                      help="Move down")
+            st.button("", key=f"{base}_remove", icon=":material/delete:", type="tertiary",
+                      disabled=len(workflow["stages"]) == 1, on_click=remove_stage, args=(wid, sid),
+                      help="Remove this stage")
+        for problem in stage_order_problems(workflow, n):
+            st.warning(problem, icon=":material/swap_vert:")
+        if st.session_state[f"{base}_kind"] == "agent":
+            agents = {p["id"]: p["name"] for p in agent_prompts()}
+            st.session_state.setdefault(f"{base}_agent", stage.get("agent") or "")
+            st.selectbox("Agent", ["", *agents], format_func=lambda a: agents.get(a, "Choose an Agent"),
+                         key=f"{base}_agent", on_change=set_stage_field, args=(wid, sid, "agent", f"{base}_agent"),
+                         width=300, help="Runs like injecting it in the Ask box and asking about the in-scope notes: "
+                                         "this stage's prompt is the question; its items are staged for you to review "
+                                         "and send.")
+        if st.session_state[f"{base}_source"] == "note":
+            with st.container(horizontal=True, gap="small"):
+                st.selectbox("Library", ["", *libraries], format_func=lambda k: libraries.get(k, "Choose a library"),
+                             key=f"{base}_note_library", on_change=set_stage_field,
+                             args=(wid, sid, "note_library", f"{base}_note_library"), width=240)
+                sources = library_note_sources(st.session_state[f"{base}_note_library"]) \
+                    if st.session_state[f"{base}_note_library"] else []
+                if st.session_state[f"{base}_note_source"] not in ["", *sources]:
+                    sources = [st.session_state[f"{base}_note_source"], *sources]
+                st.selectbox("Note", ["", *sources], format_func=lambda s: s or "Choose a note (type to search)",
+                             key=f"{base}_note_source", on_change=set_stage_field,
+                             args=(wid, sid, "note_source", f"{base}_note_source"), width="stretch")
+            text = workflow_note_text(stage.get("note"))
+            st.caption(f"Read when the stage runs: {len(text):,} characters now." if text
+                       else "Pick the note that holds this stage's prompt (it's read each time the stage runs).")
+        else:
+            st.text_area("Prompt", key=f"{base}_text", height=140, on_change=set_stage_field,
+                         args=(wid, sid, "text", f"{base}_text"), help=WORKFLOW_PLACEHOLDERS)
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            st.selectbox("Model", models if stage.get("model", "") in models else [stage["model"], *models],
+                         key=f"{base}_model", format_func=lambda m: m or "The workflow's model",
+                         on_change=set_stage_field, args=(wid, sid, "model", f"{base}_model"), width=240,
+                         label_visibility="collapsed")
+            st.toggle("Send the notes in scope", key=f"{base}_send_notes", on_change=set_stage_field,
+                      args=(wid, sid, "send_notes", f"{base}_send_notes"))
+            st.session_state.setdefault(f"{base}_auto_approve", bool(stage.get("auto_approve")))
+            st.checkbox("Skip and approve step", key=f"{base}_auto_approve", on_change=set_stage_field,
+                        args=(wid, sid, "auto_approve", f"{base}_auto_approve"), help=WORKFLOW_APPROVE_HELP)
+            if st.session_state[f"{base}_kind"] == "pick":
+                st.session_state.setdefault(f"{base}_route", bool(stage.get("route")))
+                st.session_state.setdefault(f"{base}_group_by", stage.get("group_by") or "subject")
+                st.selectbox("Group by", list(WORKFLOW_GROUP_BY), format_func=WORKFLOW_GROUP_BY.get,
+                             key=f"{base}_group_by", on_change=set_stage_field,
+                             args=(wid, sid, "group_by", f"{base}_group_by"), width=200, label_visibility="collapsed",
+                             help="How the checklist is grouped at first (it can be changed while running).")
+                st.toggle("Route each item", key=f"{base}_route", on_change=set_stage_field,
+                          args=(wid, sid, "route", f"{base}_route"),
+                          help="Instead of ticking, set each item to **NFA** (no further action), **Agent** (for "
+                               "an Agent stage, e.g. one that creates tasks, given {system}) or **Message** (drafted for you to "
+                               "send, given {message}).")
 
 
 def take_auto_search(kind: str) -> bool:
@@ -13280,6 +15231,7 @@ st.set_page_config(page_title=PAGE_TITLES.get(st.query_params.get("page"), "RAG 
                    layout="wide")
 # Starts the background auto-rescan thread once per server process.
 get_text_rescan_scheduler()
+start_hold_release_thread()  # releases packages held for review into the outbox on time
 _dictated = st.session_state.pop(DICTATED_KEY, None)  # set by the run that sent a dictated message
 if st.session_state.pop(LLM_CANCELLED_KEY, False):
     if _dictated:
@@ -13293,6 +15245,7 @@ if not st.session_state.get("landing_page_chosen"):
         st.query_params["page"] = CHAT_PAGE
 if st.session_state.pop(TRANSCRIPTION_CANCELLED_KEY, False):
     st.toast("Cancelled. Nothing was sent.", icon=":material/close:")
+install_task_notifier()  # before the pages split, so every page has it
 if st.query_params.get("page") == CHAT_PAGE:
     render_chat_page()
     st.stop()
@@ -13402,6 +15355,11 @@ with configure_slot.expander("Configure", icon=":material/settings:", expanded=n
     render_read_aloud_toggle("read_aloud_toggle")
     render_dictate_hotkey_toggle("dictate_hotkey_toggle")
     render_rag_selector_model("rag_selector_model_sidebar")
+    st.session_state.setdefault("note_dates_choice", load_app_settings().get(NOTE_DATES_SETTING, "either"))
+    st.selectbox("Note dates", list(NOTE_DATES_OPTIONS), format_func=NOTE_DATES_OPTIONS.get, key="note_dates_choice",
+                 on_change=lambda: save_app_settings({NOTE_DATES_SETTING: st.session_state["note_dates_choice"]}),
+                 help="How date filters (the quick dates, a Note-Workflow's week, 2026-11-05 typed as a term) find "
+                      "a note: by a date written in it or its title, by its file's creation date, or either.")
     corpus_visibility_slot = st.container()  # Manage corpus visibility, filled once the libraries are known
 if not corpus_root_path or not corpus_root_path.exists():
     st.stop()
@@ -13846,6 +15804,9 @@ library_folder = library_content_path
 # ---------------------------------------------------------------------------
 st.header(f"Search: {selected_lib}")
 render_oneshot_box()
+render_workflow_menu()
+apply_workflow_refilter(safe_lib)
+render_workflow_panel(safe_lib, corpus_config)
 
 # ?pick=<reference document id>: the search page is used to choose that document's notes (no LLM).
 pick_ref = find_reference_document(st.query_params.get("pick"))
@@ -13855,8 +15816,13 @@ elif pick_ref is not None:
     st.info(f"Choosing notes for the reference document **{md_escape_text(reference_label(pick_ref))}**: "
             "gather notes with the Filter box, then **Add** them in the list under it.")
 
+# A Note-Workflow running past its notes folds the Filter and Ask boxes (and the results) away under its panel.
+fold_search, fold_results = workflow_search_fold(safe_lib) if pick_ref is None else (False, False)
+search_area = search_fold(fold_search, "Filter and Ask", ":material/filter_list:", "wf_fold_search")
+
 # Pick mode is one column: Filter box, the document being filled, then the results to add from.
-filter_box_col, ask_box_col = (st.container(), st.container()) if pick_ref is not None else st.columns(2, gap="medium")
+with search_area:
+    filter_box_col, ask_box_col = (st.container(), st.container()) if pick_ref is not None else st.columns(2, gap="medium")
 
 with filter_box_col:
     with st.container(border=True, key="filter_box"):
@@ -13884,7 +15850,7 @@ with filter_box_col:
             on_click=clear_all_search_page,
             use_container_width=True,
             help="Start the page afresh: clears the filter, exclusions, results and discussion, your question, "
-            "**Find notes about**, the **Oneshot search**, any injected task prompt and the **☁️ Salesforce** reference. Settings such "
+            "**Find notes about**, the **Oneshot search**, the **Actioned** filter, any injected task prompt and the **☁️ Salesforce** reference. Settings such "
             "as the route, **Max results** and the model stay.",
         )
         # Two routes into the notes: semantic (vector) search or literal text matching. The controls below
@@ -14044,8 +16010,9 @@ with filter_box_col:
                         disabled=is_single_corpus_mode(),
                         help=(
                             "Looks in every visible library and shows how many matching notes each one has, so "
-                            "you can switch to the right library for a semantic search. Literal matching only: "
-                            "no embeddings are needed."
+                            "you can switch to the right library. Only the selected library's notes are listed; "
+                            "to list notes from the whole corpus, use Single Corpus. Literal matching only: no "
+                            "embeddings are needed."
                         ),
                     )
                 with filter_btn_col:
@@ -14260,11 +16227,14 @@ with ask_box_col:
                         ),
                     )
                     fit_chars = notes_budget_fit(selected_ollama_model, llm_max_tokens)
-                    st.caption(
-                        f"≈{chosen_chars // 3:,} tokens of notes"
-                        + (f" · capped to {fit_chars:,} characters: the most `{selected_ollama_model}`'s context "
-                           f"window holds beside {llm_max_tokens:,} answer tokens" if fit_chars < chosen_chars else "")
-                    )
+                    st.caption(f"≈{chosen_chars // 3:,} tokens of notes")
+                    if fit_chars < chosen_chars:
+                        model_limit = ollama_model_info(selected_ollama_model)["context_length"]
+                        st.warning(f"Only {fit_chars:,} characters are sent: `{selected_ollama_model}` holds "
+                                   + (f"{model_limit:,} tokens" if model_limit else "a limited context window")
+                                   + f", and **Max tokens** ({llm_max_tokens:,}) keeps most of that for the answer. "
+                                   "Lower **Max tokens** above, or pick a model that holds more, to send more notes.",
+                                   icon=":material/compress:")
                     llm_temperature = st.slider(
                         "Temperature",
                         min_value=0.0,
@@ -14385,8 +16355,8 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
             final_results, trimmed = share_context(_gathered, kept, notes_chars)
             if trimmed:
                 notice = (f"{trimmed} of the {len(kept)} in-scope notes were trimmed so every one fits the LLM's "
-                          f"notes budget ({notes_chars:,} characters of notes). Raise **Notes budget** in "
-                          "**Ollama model details** to send more.")
+                          f"notes budget ({notes_chars:,} characters of notes). To send more, "
+                          + notes_budget_advice(safe_lib, selected_ollama_model, llm_max_tokens))
             try:
                 uploads_dirs = get_library_uploads_dirs(Library().load_library(safe_lib))
             except Exception:
@@ -14394,7 +16364,8 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
             if any(lib != safe_lib for lib, _source in kept):
                 state_library = ALL_LIBRARIES_KEY
         elif search_all_libraries:
-            state_library = ALL_LIBRARIES_KEY
+            # Every library is counted (Matches by library, to switch), but only the selected library's notes
+            # are listed: Single Corpus is the way to list notes from the whole corpus.
             with search_progress_slot.container(), st.spinner("Searching all libraries for exact text…", show_time=True):
                 final_results, library_counts = exact_text_search_all_libraries(
                     filter_libraries_for_display(all_libraries),
@@ -14402,9 +16373,16 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                     notes_limit,
                     corpus_root_path,
                     apply_exclusions=not filter_only_clicked,
+                    results_from=safe_lib,
                 )
-            if not final_results:
+            elsewhere = sum(count for _library, count in library_counts)
+            if not final_results and elsewhere:
+                notice = (f"No notes in this library match {describe_search_filter(search_filter)}; "
+                          f"{elsewhere} in other libraries (**Matches by library**: switch to one, or use Single "
+                          "Corpus to list them all).")
+            elif not final_results:
                 notice = f"No notes in any library match {describe_search_filter(search_filter)}."
+            search_all_libraries = False  # the listed notes are this library's, as in an ordinary literal search
         else:
             try:
                 search_lib = Library().load_library(safe_lib)
@@ -14532,7 +16510,12 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                                                                 final_results), "ask"),
                         search_state["task_prompt"], notes_chars)
                 else:
-                    with llm_progress(search_progress_slot, f"Generating answer with `{selected_ollama_model}`…") as report:
+                    answer_slot = WORKFLOW_PROGRESS_SLOT if scope_clicked and WORKFLOW_PROGRESS_SLOT else search_progress_slot
+                    done_text = ("Note-Workflow · the Agent has answered: check it and press Execute"
+                                 if answer_slot is WORKFLOW_PROGRESS_SLOT else
+                                 f"Answer ready · Search: {search_state['library_display']}")
+                    with notify_as(done_text), \
+                            llm_progress(answer_slot, f"Generating answer with `{selected_ollama_model}`…") as report:
                         try:
                             search_state["answer"], search_state["usage"] = answer_with_ollama(
                                 question=search_state["question"],
@@ -14566,6 +16549,8 @@ elif new_search and (prompt_text or run_filter_only or find_clicked or scope_cli
                 if selected_ollama_model != search_state["prompt_model"]:
                     tuning["ollama_model"] = selected_ollama_model
                 save_corpus_config(safe_lib, tuning)
+            if scope_clicked:
+                finish_workflow_agent(search_state)  # a Note-Workflow's Agent stage: on to the next stage
             # The Ask box was drawn before this search added notes: redraw so its in-scope button counts them.
             if len((gathered_notes(safe_lib) or {}).get("notes", {})) != _in_scope_before:
                 st.rerun()
@@ -14601,21 +16586,25 @@ with filter_results_slot:
         st.warning(last_search["notice"] or "No notes match the filter.")
     if gathered and not answering:
         render_gathered_notes(gathered, library_folder, safe_lib, pick_ref)
+results_area = search_fold(fold_results and answering, "Search results", ":material/manage_search:",
+                           "wf_fold_results")
 if answering:
-    # Moved on to the LLM: the in-scope notes fold into one full-width bar, and the answer shows below in green.
-    if gathered:
-        kept = len(kept_gathered_notes(gathered))
-        with st.expander(f"In scope · {len(gathered['notes'])} note(s), {kept} kept", icon=":material/filter_list:",
-                         key="in_scope_folded"):
-            render_gathered_notes(gathered, library_folder, safe_lib, pick_ref)
-    with st.container(key=f"results_{last_search.get('route', 'semantic')}"):
-        render_search_results(
-            last_search,
-            library_folder,
-            safe_lib,
-            selected_ollama_model,
-            llm_max_tokens,
-            llm_temperature,
-            last_search.get("prompt_context", ""),
-            ollama_model_options,
-        )
+    with results_area:
+        # Moved on to the LLM: the in-scope notes fold into one full-width bar, and the answer shows below in green.
+        if gathered:
+            kept = len(kept_gathered_notes(gathered))
+            with st.expander(f"In scope · {len(gathered['notes'])} note(s), {kept} kept", icon=":material/filter_list:",
+                             key="in_scope_folded"):
+                render_gathered_notes(gathered, library_folder, safe_lib, pick_ref)
+        with st.container(key=f"results_{last_search.get('route', 'semantic')}"):
+            render_search_results(
+                last_search,
+                library_folder,
+                safe_lib,
+                selected_ollama_model,
+                llm_max_tokens,
+                llm_temperature,
+                last_search.get("prompt_context", ""),
+                ollama_model_options,
+            )
+finish_workflow_search(safe_lib, library_folder)  # a Note-Workflow's notes found: its panel moves on
