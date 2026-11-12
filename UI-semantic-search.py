@@ -2544,7 +2544,7 @@ def build_agent_task_prompt(prompts: list[dict], results: list) -> str:
     )
 
 
-# --- Links (Task executor settings on the Configure page): attached to prompts, shown under the question ------
+# --- Links (Connector and links on the Configure page): attached to prompts, shown under the question ------
 
 BEST_GUESS = "{best_guess}"  # in a link's address: replaced by the app's best guess at what you're looking for
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -5857,7 +5857,7 @@ def render_actions_page() -> None:
     render_outbox_status(link=False)
     render_page_title("Actions")
     outbox = get_outbox_dir()
-    # The task executor (defined in Task executor settings on the Configure page) processes what's listed here.
+    # The task executor (defined in Connector and links on the Configure page) processes what's listed here.
     executor = executor_link(load_prompt_library())
     if executor and executor.get("url"):
         st.markdown(
@@ -5865,7 +5865,7 @@ def render_actions_page() -> None:
             "the schedule."
         )
     else:
-        st.caption(f"Set the **Task executor** in **Task executor settings** on the [Configure]({CONFIGURE_PAGE_URL}) "
+        st.caption(f"Set the **Task executor** in **Connector and links** on the [Configure]({CONFIGURE_PAGE_URL}) "
                    "page to open it from here.")
     st.caption(
         f"Everything Agents have sent to the outbox (`{outbox}`) and what the connector did with it. "
@@ -6437,7 +6437,7 @@ def render_prompt_card(
                     placeholder="Links to show when this prompt is used",
                     label_visibility="collapsed",
                     help="Shown as links under the question in the Ask box while this prompt is injected. "
-                    "Add links in **Task executor settings** on the Configure page.",
+                    "Add links in **Connector and links** on the Configure page.",
                 )
             render_reference_docs_picker(
                 f"prompt_references_{prompt_id}", prompt.get("references"), save_prompt_field,
@@ -6839,7 +6839,8 @@ def index_all_corpora_here() -> None:
 
 def render_settings_transfer_section() -> None:
     """Configure page: export all settings to a file, or import them from one."""
-    with st.expander("Export and import settings", expanded=True, key="configure_transfer_open",
+    with st.expander("Export and import settings (backup / move to another Mac)", expanded=False,
+                     key="configure_transfer_open",
                      icon=":material/import_export:"):
         st.caption(
             "Settings only, for moving to another Mac or starting again: prompts (with About me and Agents), "
@@ -6905,18 +6906,111 @@ def render_settings_transfer_section() -> None:
             st.rerun()
 
 
+def render_notes_location_settings() -> Path | None:
+    """The notes folder (Browse…, or typed) and the corpus mode. In the sidebar's Configure dropdown and on the
+    Configure page (each page draws it once, so they share widget keys). Returns the corpus root, if set."""
+    sync_corpus_root_widget_from_settings()
+    st.markdown("**Notes location**")
+    if st.button("Browse…", key="browse_corpus_root", width="stretch"):
+        current = load_corpus_root_path()
+        picked = browse_for_directory(str(current) if current else None)
+        if picked:
+            picked = picked.strip()
+            save_app_settings({"corpus_root_path": picked})
+            st.session_state["corpus_root_path_input"] = picked
+            st.rerun()
+    st.text_input(
+        "Corpus root folder",  # its value comes from the saved setting (sync_corpus_root_widget_from_settings)
+        key="corpus_root_path_input",
+        on_change=persist_corpus_root_path,
+        help="Notes export folder. Multi-Corpus: one subfolder per library. Single-Corpus: index the whole tree.",
+        placeholder="Select or enter your notes export folder…",
+    )
+    corpus_root = get_corpus_root_path()
+    if not corpus_root:
+        st.info("Set the corpus root folder above to load your libraries.")
+    elif not corpus_root.exists():
+        st.warning(f"Folder not found:\n`{corpus_root}`")
+    else:
+        st.caption(f"Saved in `{APP_SETTINGS_PATH.name}`")
+        sync_corpus_mode_from_settings()
+        st.radio(
+            "Corpus mode",
+            options=[CORPUS_MODE_MULTI, CORPUS_MODE_SINGLE],
+            format_func=lambda mode: "Multi-Corpus" if mode == CORPUS_MODE_MULTI else "Single-Corpus",
+            key="corpus_mode_toggle",
+            horizontal=True,
+            on_change=persist_corpus_mode,
+            help=(
+                "**Multi-Corpus** — each immediate subfolder is a separate searchable library. "
+                "**Single-Corpus** — one library for all notes under the root (flat or mixed layouts)."
+            ),
+        )
+        if is_single_corpus_mode():
+            st.caption("Single-Corpus indexes every supported file under the root, including subfolders.")
+        else:
+            st.caption("Multi-Corpus treats each top-level subfolder as its own library.")
+    return corpus_root
+
+
+def render_note_dates_setting(widget_key: str) -> None:
+    """Configure: how date filters find a note's date."""
+    st.session_state.setdefault(widget_key, load_app_settings().get(NOTE_DATES_SETTING, "either"))
+    st.selectbox("Note dates", list(NOTE_DATES_OPTIONS), format_func=NOTE_DATES_OPTIONS.get, key=widget_key,
+                 on_change=lambda: save_app_settings({NOTE_DATES_SETTING: st.session_state[widget_key]}),
+                 help="How date filters (the quick dates, a Note-Workflow's week, 2026-11-05 typed as a term) find "
+                      "a note: by a date written in it or its title, by its file's creation date, or either.")
+
+
+def render_configure_notes_section() -> None:
+    """Configure page: where the notes are, how they're split into libraries, which are hidden, and note dates
+    (the same settings as the sidebar's Configure dropdown)."""
+    root = load_corpus_root_path()
+    mode = "Single-Corpus" if is_single_corpus_mode() else "Multi-Corpus"
+    with st.expander(f"Notes location and libraries · {mode}" + ("" if root and root.exists() else " · not set"),
+                     expanded=False, key="configure_notes_open", icon=":material/folder_open:"):
+        st.caption("Also in the sidebar's **Configure** dropdown on the search page. After changing the folder or "
+                   "the mode here, reload the search page's tab to pick it up.")
+        corpus_root = render_notes_location_settings()
+        render_note_dates_setting("note_dates_choice")
+        if corpus_root and corpus_root.exists():
+            folders = sorted(d.name for d in corpus_root.iterdir() if d.is_dir())
+            if folders:
+                render_corpus_visibility_controls(folders)
+
+
+def render_configure_models_section() -> None:
+    """Configure page: the default Chat model and the RAG selector model (also in the sidebar's dropdown)."""
+    settings = load_app_settings()
+    chat = settings.get(CHAT_DEFAULT_MODEL_SETTING) or "last used"
+    selector = settings.get(RAG_SELECTOR_SETTING) or "chat's model"
+    with st.expander(f"Models for Chat and notes searches · chat: {chat} · RAG selector: {selector}",
+                     expanded=False, key="configure_models_open", icon=":material/smart_toy:"):
+        st.caption("Which Ollama models Chat starts with, and which one reads a Chat message to decide whether it's "
+                   "a notes search. The model that **answers** from your notes is set per corpus, under **Ollama "
+                   "model details** in the Ask box (or when a notes search warns that it had to trim). Drafting's "
+                   f"model is in the [Prompt library]({PROMPT_LIBRARY_PAGE_URL}).")
+        render_default_chat_model("chat_default_model_configure")
+        render_rag_selector_model("rag_selector_model_configure")
+
+
 def render_configure_page() -> None:
     """Configure page (?page=configure): links, the outbox, the title marker, and export / import of settings."""
     library = load_prompt_library()
     render_outbox_status()
     render_page_title("Configure")
     st.caption(
-        "Where Agents send their drafts and what processes them. The prompts themselves are in the "
-        f"[Prompt library]({PROMPT_LIBRARY_PAGE_URL})."
+        "Every setting for the app, including those in the sidebar's **Configure** dropdown, grouped by kind: open a "
+        "section to change it. The prompts themselves are in the "
+        f"[Prompt library]({PROMPT_LIBRARY_PAGE_URL}); indexing and embeddings are under **Advanced** in the sidebar "
+        "of the search page."
     )
 
+    render_configure_notes_section()
+    render_configure_models_section()
     links = library.get("links", [])
-    with st.expander(f"Task executor settings · {len(links)} link{'' if len(links) == 1 else 's'}", expanded=True,
+    with st.expander(f"Connector and links (task executor) · {len(links)} link{'' if len(links) == 1 else 's'}",
+                     expanded=False,
                      key="prompt_page_links_open", icon=":material/link:"):
         # The task executor comes first and is defined here; it can't be removed, only cleared.
         executor = executor_link(library) or {}
@@ -6974,8 +7068,8 @@ def render_configure_page() -> None:
     outbox = get_outbox_dir()
     waiting = len(pending_outbox_files(outbox))
     with st.expander(
-        f"Outbox · {waiting} waiting",
-        expanded=True,
+        f"Outbox (where Agents' drafts wait to be sent) · {waiting} waiting",
+        expanded=False,
         key="prompt_page_outbox_open",
         icon=":material/outbox:",
     ):
@@ -7009,8 +7103,8 @@ def render_configure_page() -> None:
 
     marker = get_title_marker(library)
     with st.expander(
-        "Task title marker · " + (f"“{marker['text']}”" if marker["text"] else "off"),
-        expanded=True,
+        "Task title marker (tag on everything Agents send) · " + (f"“{marker['text']}”" if marker["text"] else "off"),
+        expanded=False,
         key="prompt_page_title_marker_open",
         icon=":material/label:",
     ):
@@ -13214,7 +13308,8 @@ export default function (component) {
   // Only when you're not looking at this tab (another tab, another app, or the window minimised).
   if (document.visibilityState === "visible" && document.hasFocus()) return
   if (Notification.permission !== "granted") return
-  const n = new Notification(note.title, { body: note.body, tag: "llm-notes-task" })
+  // A tag of its own: one shared with a notification still in Notification Centre replaces it silently (no banner).
+  const n = new Notification(note.title, { body: note.body, tag: "llm-notes-" + note.id, icon: data.icon || undefined })
   n.onclick = () => { window.focus(); n.close() }  // brings this tab (and its window) to the front
 }
 """
@@ -13273,7 +13368,8 @@ def render_task_notifier(enabled: bool) -> None:
     """In the sidebar: hands the browser the latest finished task. It refreshes by itself every few seconds (it
     waits for a running page to finish, never cutting it short), so a task that ends a page run is still shown."""
     note = st.session_state.pop(NOTIFY_PENDING_KEY, None)
-    _task_notifier(key="task_notifier", data={"enabled": enabled, "note": note if enabled else None})
+    _task_notifier(key="task_notifier", data={"enabled": enabled, "note": note if enabled else None,
+                                              "icon": notification_icon() if note and enabled else ""})
 
 
 def install_task_notifier() -> None:
@@ -13282,6 +13378,24 @@ def install_task_notifier() -> None:
         st.html("<style>.st-key-task_notifier_box { position: absolute !important; height: 0 !important; "
                 "overflow: hidden; pointer-events: none; }</style>")
         render_task_notifier(notifications_enabled() and bool(load_app_settings().get(NOTIFY_SETTING, True)))
+
+
+@lru_cache(maxsize=1)
+def notification_icon() -> str:
+    """The RAG logo for notifications, small (128 px) and inline, so the browser needs no file from the app."""
+    import base64
+    import io
+
+    try:
+        from PIL import Image
+
+        with Image.open(Path(__file__).resolve().parent / "LLM-RAG_logo.png") as logo:
+            small = logo.convert("RGBA").resize((128, 128), Image.LANCZOS)
+            buffer = io.BytesIO()
+            small.save(buffer, format="PNG", optimize=True)
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    except Exception:
+        return ""  # no logo: the notification shows without it
 
 
 def notifications_enabled() -> bool:
@@ -13307,7 +13421,7 @@ export default function (component) {
   if (!test || sent.has(test.id)) return
   sent.add(test.id)
   const show = () => {
-    const n = new Notification(test.title, { body: test.body, tag: "llm-notes-test" })
+    const n = new Notification(test.title, { body: test.body, tag: "llm-notes-" + test.id, icon: data.icon || undefined })
     n.onclick = () => { window.focus(); n.close() }
     say(test.delay ? "Sent." : states.granted)
   }
@@ -13347,7 +13461,7 @@ def send_test_notification(delay: int) -> None:
 def render_notification_settings_section() -> None:
     """Configure: Notifications — the app's off switch, when to notify, and test buttons."""
     on = notifications_enabled()
-    with st.expander("Notifications · " + ("on" if on else "off"), expanded=True, key="configure_notify_open",
+    with st.expander("Notifications · " + ("on" if on else "off"), expanded=False, key="configure_notify_open",
                      icon=":material/notifications:"):
         st.toggle("Notifications from this app", key="notifications_toggle_configure", value=on,
                   on_change=persist_app_toggle, args=(NOTIFICATIONS_SETTING, "notifications_toggle_configure"),
@@ -13371,7 +13485,8 @@ def render_notification_settings_section() -> None:
                       help=f"Wait {NOTIFY_TEST_DELAY} seconds, then send one: switch to another app meanwhile to see "
                            "it arrive as it would after a long task.")
         if on:
-            _notify_test(key="notify_test_component", data={"test": st.session_state.pop(NOTIFY_TEST_KEY, None)})
+            test = st.session_state.pop(NOTIFY_TEST_KEY, None)
+            _notify_test(key="notify_test_component", data={"test": test, "icon": notification_icon() if test else ""})
         else:
             st.caption(":material/notifications_off: Notifications are off: turn them on above to send a test.")
 
@@ -13897,8 +14012,9 @@ def render_voice_settings_section() -> None:
     """Configure: the dictate hotkey and its key, read-aloud, and which page the app opens on."""
     key = load_app_settings().get("dictate_hotkey") or "`"
     second = load_app_settings().get("dictate_hotkey_2") or ""
-    with st.expander("Dictation and Chat · hotkey " + (hotkeys_markdown(dictate_hotkeys()) if dictate_hotkey() else "off"),
-                     expanded=True, key="configure_voice_open", icon=":material/keyboard:"):
+    with st.expander("Dictation, read-aloud and start page · hotkey "
+                     + (hotkeys_markdown(dictate_hotkeys()) if dictate_hotkey() else "off"),
+                     expanded=False, key="configure_voice_open", icon=":material/keyboard:"):
         with st.container(horizontal=True, vertical_alignment="bottom"):
             st.selectbox("Dictate hotkey", list(DICTATE_HOTKEYS), index=list(DICTATE_HOTKEYS).index(key)
                          if key in DICTATE_HOTKEYS else 0, format_func=DICTATE_HOTKEYS.get,
@@ -15473,7 +15589,7 @@ def apply_notes_search(plan: dict) -> None:
     st.session_state[NOTES_RUN_KEY] = {
         "read": read, "plan": plan, "stage": "finding", "auto": first, "step_done": False, "at": time.time(), "own": time.time(),
         "log": [f"Finding notes ({plan['route'].capitalize()}, {plan['library'] or 'Single Corpus'})"],
-        "warnings": [], "chip": False,
+        "warnings": [], "chip": False, "started": time.time(),
     }
 
 
@@ -15661,14 +15777,7 @@ def advance_notes_run(run: dict, safe_lib: str) -> None:
                 return
             config = get_corpus_config(safe_lib)
             answer_model = config.get("ollama_model") or DEFAULT_OLLAMA_MODEL
-            answer_tokens = int(config.get("llm_max_tokens") or 512)
-            budget = notes_budget(safe_lib, answer_model, answer_tokens)
-            share = budget // count
-            if count > 1 and share < 800:
-                run["warnings"].append(
-                    f"{count} notes share the LLM's {budget:,}-character notes budget, about {share:,} characters "
-                    "each, so long notes are trimmed. Narrow the search (more exact words, a date), or: "
-                    + notes_budget_advice(safe_lib, answer_model, answer_tokens))
+            set_notes_run_budget_note(run, safe_lib, answer_model, int(config.get("llm_max_tokens") or 512), count)
             queue_notes_run_step(run, "scope", {"question_text": plan["intent"], "use_llm_answer": True},
                                  "answering", f"Asking: “{truncate_text(plan['intent'], 70)}”", plan.get("dictated"))
         elif run["stage"] == "finding" and plan["route"] == "literal":
@@ -15730,6 +15839,69 @@ def advance_notes_run(run: dict, safe_lib: str) -> None:
             run["log"].append("Rewritten for listening, and read out")
         run.update(stage="done", finished=time.time(), own=time.time())
         st.rerun()
+
+
+def set_notes_run_budget_note(run: dict, safe_lib: str, model: str, max_tokens: int, count: int) -> None:
+    """When the notes found share too small a notes budget (often because the model's context window cuts it), say
+    so in the run's pop-up, which then offers another model to answer with (render_notes_run_model_switch)."""
+    budget = notes_budget(safe_lib, model, max_tokens)
+    share = budget // max(count, 1)
+    cut = notes_budget_fit(model, max_tokens) < int(st.session_state.get(f"llm_notes_chars_{safe_lib}")
+                                                    or get_corpus_config(safe_lib).get("llm_notes_chars")
+                                                    or LLM_CONTEXT_MAX_CHARS)
+    run.pop("budget_note", None)
+    if (count > 1 and share < 800) or cut:
+        lead = (f"{count} notes share the LLM's {budget:,}-character notes budget, about {share:,} characters each, "
+                "so long notes are trimmed. Narrow the search (more exact words, a date), or: " if count > 1
+                else f"The note is trimmed to {budget:,} characters: ")
+        run["budget_note"] = {"text": lead + notes_budget_advice(safe_lib, model, max_tokens), "model": model,
+                              "tokens": max_tokens, "count": count}
+
+
+def rerun_notes_run_with_model(run: dict, safe_lib: str, model: str) -> None:
+    """Answer the run's question again with `model` (made this corpus's answer model, as Ollama model details
+    would), stopping an answer still being written."""
+    for token in (run.get("narrate_job"), (st.session_state.get(LAST_SEARCH_KEY) or {}).pop("answer_pending", None)):
+        job = background_answers().pop(token, None) if token else None
+        if job:
+            job["cancel"].set()
+    save_corpus_config(safe_lib, {"ollama_model": model})
+    note = run.get("budget_note") or {}
+    set_notes_run_budget_note(run, safe_lib, model, int(note.get("tokens") or get_corpus_config(safe_lib).get(
+        "llm_max_tokens") or 512), int(note.get("count") or 1))
+    run["warnings"] = []
+    run.pop("finished", None)
+    plan = run["plan"]
+    queue_notes_run_step(run, "scope", {"question_text": plan["intent"], "use_llm_answer": True}, "answering",
+                         f"Answering again with `{model}`", plan.get("dictated"))
+
+
+def render_notes_run_model_switch(run: dict, safe_lib: str) -> None:
+    """Under the notes-budget warning: pick another model (the most notes it can hold beside each) and run the
+    answer again with it, without opening Ollama model details."""
+    note = run.get("budget_note")
+    if not note:
+        return
+    st.warning(note["text"], icon=":material/warning:")
+    if not run["plan"].get("intent"):
+        return
+    ok, models = discover_ollama_models()
+    if not ok or not models:
+        st.caption("Ollama isn't answering, so the model can't be changed here.")
+        return
+    fits = {m: notes_budget_fit(m, note["tokens"]) for m in models}
+    options = sorted(models, key=lambda m: (-fits[m], m))
+    current = note["model"] if note["model"] in options else options[0]
+    with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key="notes_run_model_switch"):
+        choice = st.selectbox("Answer with", options, index=options.index(current),
+                              format_func=lambda m: f"{m} · notes up to {fits[m]:,} characters",
+                              key=f"notes_run_model_pick_{run.get('started', 0)}",
+                              help="Installed models, those that hold the most notes first (with **Max tokens** at "
+                                   f"{note['tokens']:,}). Re-running makes it this corpus's answer model, as picking "
+                                   "it in **Ollama model details** would.")
+        if st.button("Re-run with this model", key="notes_run_model_rerun", icon=":material/replay:", type="primary",
+                     disabled=choice == note["model"]):
+            rerun_notes_run_with_model(run, safe_lib, choice)
 
 
 def notes_run_status(run: dict) -> str:
@@ -15811,7 +15983,7 @@ def render_notes_run(safe_lib: str) -> None:
     run = st.session_state.get(NOTES_RUN_KEY)
     if not run:
         return
-    if run["stage"] == "done" and not run["warnings"] and time.time() - run.get("finished", 0) > 2.5:
+    if run["stage"] == "done" and not run["warnings"] and not run.get("budget_note") and time.time() - run.get("finished", 0) > 2.5:
         st.session_state.pop(NOTES_RUN_KEY, None)
         st.rerun(scope="fragment")
     st.html(themed_panel_style(NOTES_RUN_STYLE))
@@ -15836,6 +16008,7 @@ def render_notes_run(safe_lib: str) -> None:
             st.markdown(f":material/check_small: {line}")
         if working:
             st.markdown(f":material/progress_activity: {status}")
+        render_notes_run_model_switch(run, safe_lib)
         for warning in run["warnings"]:
             st.warning(warning, icon=":material/warning:")
         if working and shutil.which("say"):
@@ -19102,63 +19275,20 @@ configure_slot = st.sidebar.container()
 sync_corpus_root_widget_from_settings()
 _root_ok = bool(get_corpus_root_path() and get_corpus_root_path().exists())
 with configure_slot.expander("Configure", icon=":material/settings:", expanded=not _root_ok):
-    st.markdown("**Notes location**")
-    if st.button("Browse…", key="browse_corpus_root", width="stretch"):
-        current = load_corpus_root_path()
-        picked = browse_for_directory(str(current) if current else None)
-        if picked:
-            picked = picked.strip()
-            save_app_settings({"corpus_root_path": picked})
-            st.session_state["corpus_root_path_input"] = picked
-            st.rerun()
-    st.text_input(
-        "Corpus root folder",  # its value comes from the saved setting (sync_corpus_root_widget_from_settings)
-        key="corpus_root_path_input",
-        on_change=persist_corpus_root_path,
-        help="Notes export folder. Multi-Corpus: one subfolder per library. Single-Corpus: index the whole tree.",
-        placeholder="Select or enter your notes export folder…",
-    )
-    corpus_root_path = get_corpus_root_path()
-    if not corpus_root_path:
-        st.info("Set the corpus root folder above to load your libraries.")
-    elif not corpus_root_path.exists():
-        st.warning(f"Folder not found:\n`{corpus_root_path}`")
-    else:
-        st.caption(f"Saved in `{APP_SETTINGS_PATH.name}`")
-        sync_corpus_mode_from_settings()
-        st.radio(
-            "Corpus mode",
-            options=[CORPUS_MODE_MULTI, CORPUS_MODE_SINGLE],
-            format_func=lambda mode: "Multi-Corpus" if mode == CORPUS_MODE_MULTI else "Single-Corpus",
-            key="corpus_mode_toggle",
-            horizontal=True,
-            on_change=persist_corpus_mode,
-            help=(
-                "**Multi-Corpus** — each immediate subfolder is a separate searchable library. "
-                "**Single-Corpus** — one library for all notes under the root (flat or mixed layouts)."
-            ),
-        )
-        if is_single_corpus_mode():
-            st.caption("Single-Corpus indexes every supported file under the root, including subfolders.")
-        else:
-            st.caption("Multi-Corpus treats each top-level subfolder as its own library.")
+    corpus_root_path = render_notes_location_settings()
     st.link_button(
         "Configure page",
         CONFIGURE_PAGE_URL,
         icon=":material/open_in_new:",
         width="stretch",
-        help="Task executor settings (the connector and other links), the outbox, the task title marker and "
-        "settings export. Opens in a new tab.",
+        help="Every setting in one place, including all of these: notes location, models, the connector and "
+        "links, the outbox, the task title marker, dictation, notifications and settings export. Opens in a new tab.",
     )
     render_read_aloud_toggle("read_aloud_toggle")
     render_dictate_hotkey_toggle("dictate_hotkey_toggle")
     render_default_chat_model("chat_default_model_sidebar")
     render_rag_selector_model("rag_selector_model_sidebar")
-    st.session_state.setdefault("note_dates_choice", load_app_settings().get(NOTE_DATES_SETTING, "either"))
-    st.selectbox("Note dates", list(NOTE_DATES_OPTIONS), format_func=NOTE_DATES_OPTIONS.get, key="note_dates_choice",
-                 on_change=lambda: save_app_settings({NOTE_DATES_SETTING: st.session_state["note_dates_choice"]}),
-                 help="How date filters (the quick dates, a Note-Workflow's week, 2026-11-05 typed as a term) find "
-                      "a note: by a date written in it or its title, by its file's creation date, or either.")
+    render_note_dates_setting("note_dates_choice")
     corpus_visibility_slot = st.container()  # Manage corpus visibility, filled once the libraries are known
 if not corpus_root_path or not corpus_root_path.exists():
     st.stop()
