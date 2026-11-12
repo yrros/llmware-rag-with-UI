@@ -76,7 +76,8 @@ open_app() {
             start_in_background
             # Configure > Notifications > Notifications from this app: off sends none, this one included.
             if ! grep -Eq '"notifications_enabled"[[:space:]]*:[[:space:]]*false' \
-                    "$PROJECT_DIR/llmware_data/app_settings.json" 2>/dev/null; then
+                    "${LLM_NOTES_DATA_DIR:-$HOME/Library/Application Support/LLM-Notes}/llmware_data/app_settings.json" \
+                    2>/dev/null; then
                 osascript -e 'display notification "Starting LLM-Notes…" with title "LLM-Notes"' 2>/dev/null || true
             fi
         fi
