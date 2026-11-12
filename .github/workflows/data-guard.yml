@@ -1,0 +1,11 @@
+name: Data guard
+# Fails if the app's data, keys or email addresses are in the repo: a backstop for the pre-commit hook.
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check_no_data.sh --tracked

@@ -1,0 +1,3 @@
+#!/bin/bash
+# Installed by Installer.sh (git config core.hooksPath scripts/git-hooks): checks each commit for data and secrets.
+exec "$(git rev-parse --show-toplevel)/scripts/check_no_data.sh" --staged

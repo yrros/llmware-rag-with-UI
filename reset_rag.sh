@@ -4,6 +4,7 @@ set -euo pipefail
 # Reset the RAG environment: delete indexes, vector tables, histories and temp files so the
 # app starts clean (e.g. after an interrupted rebuild leaves the database unusable).
 # Downloaded models (llmware_data/model_repo, ~/.cache/huggingface) and the venv are kept.
+# The data is in ~/Library/Application Support/LLM-Notes/llmware_data (or $LLM_NOTES_DATA_DIR/llmware_data).
 #
 # Usage: ./reset_rag.sh [--yes] [--settings] [--dry-run]
 #   --yes       don't ask for confirmation
@@ -13,7 +14,12 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
-DATA_DIR="$PROJECT_DIR/llmware_data"
+# The app's data lives outside the code folder (LLM_NOTES_DATA_DIR, else ~/Library/Application Support/LLM-Notes);
+# a copy not moved yet (the app moves it on its next start) is still in the code folder.
+DATA_DIR="${LLM_NOTES_DATA_DIR:-$HOME/Library/Application Support/LLM-Notes}/llmware_data"
+if [ ! -d "$DATA_DIR" ] && [ -d "$PROJECT_DIR/llmware_data" ]; then
+    DATA_DIR="$PROJECT_DIR/llmware_data"
+fi
 
 ASSUME_YES=0
 RESET_SETTINGS=0

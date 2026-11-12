@@ -1,4 +1,5 @@
 import math
+import os
 import re
 import json
 import gc
@@ -38,9 +39,41 @@ DEFAULT_EMBEDDING_MODEL = "mini-lm-sbert"
 DEFAULT_DISTANCE_THRESHOLD = 0.55
 VECTOR_DB = "lancedb"
 # Local data directory — everything lives under the folder you run Streamlit from.
-PROJECT_DIR = Path.cwd()
-APP_DATA_DIR = PROJECT_DIR / "llmware_data"
+PROJECT_DIR = Path.cwd()  # the code (start_app.sh runs from here)
+# Your data (indexes, settings, prompts, chats, the actions log and the outbox) lives outside the code folder, so it
+# can't be committed by mistake: ~/Library/Application Support/LLM-Notes on a Mac, or LLM_NOTES_DATA_DIR if set.
+DATA_ROOT = Path(os.environ.get("LLM_NOTES_DATA_DIR") or (
+    Path.home() / "Library" / "Application Support" / "LLM-Notes" if sys.platform == "darwin"
+    else Path.home() / ".local" / "share" / "llm-notes")).expanduser()
+APP_DATA_DIR = DATA_ROOT / "llmware_data"
 LEGACY_APP_DATA_DIR = Path.home() / "llmware_data"
+
+
+def move_data_out_of_code_folder() -> list[str]:
+    """Once: data from before it moved (llmware_data/ and outbox/ inside the code folder) is moved to DATA_ROOT,
+    and the outbox paths recorded in the actions log and settings follow it. A folder already at DATA_ROOT is
+    never overwritten: then the old one stays put for you to sort out."""
+    moved = []
+    for name in ("llmware_data", "outbox"):
+        old, new = PROJECT_DIR / name, DATA_ROOT / name
+        if old.is_dir() and not old.is_symlink() and not new.exists() and old.resolve() != new.resolve():
+            DATA_ROOT.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old), str(new))  # a rename on the same disk: instant, nothing copied
+            moved.append(name)
+    if "outbox" in moved:
+        old_outbox, new_outbox = str(PROJECT_DIR / "outbox"), str(DATA_ROOT / "outbox")
+        for path in (DATA_ROOT / "llmware_data" / "actions_log.json", DATA_ROOT / "llmware_data" / "app_settings.json"):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            fixed = text.replace(json.dumps(old_outbox)[1:-1], json.dumps(new_outbox)[1:-1])
+            if fixed != text:
+                path.write_text(fixed, encoding="utf-8")
+    return moved
+
+
+_moved_out_of_code_folder = move_data_out_of_code_folder()
 LANCEDB_PATH = APP_DATA_DIR / "lancedb"
 LEGACY_LANCEDB_PATH = Path("/tmp/lancedb")
 EMBEDDING_POLL_SECONDS = 5
@@ -203,7 +236,7 @@ DEFAULT_CORPUS_CONFIG = {
 # - Ollama (Answer with LLM) uses its own Metal/GPU stack — independent of LLMWare config.
 # - LLMWare HF embedding models only check CUDA by default; patch below routes to CUDA or MPS when enabled.
 LLMWareConfig().set_config("hardware_accelerator", "mac_metal")
-LLMWareConfig().set_home(str(PROJECT_DIR))
+LLMWareConfig().set_home(str(DATA_ROOT))  # LLMWare keeps its files in <home>/llmware_data
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 LANCEDB_PATH.mkdir(parents=True, exist_ok=True)
 # SQLiteConfig captures get_library_path() at import time — refresh after set_home().
@@ -1986,7 +2019,7 @@ HANDOFF_SCHEMA_PATHS = {
     HANDOFF_SCHEMA_V2_ID: Path(__file__).resolve().parent / "schemas" / "handoff.v2.schema.json",
 }
 NEXT_STEP_LIMIT = 255  # characters an opportunity's Next Step can hold
-DEFAULT_OUTBOX_DIR = PROJECT_DIR / "outbox"
+DEFAULT_OUTBOX_DIR = DATA_ROOT / "outbox"
 HANDOFF_RESULT_DIRS = ("processed", "failed")  # where connectors move packages, with a receipt beside each
 # Sent packages wait here for their review time, out of connectors' reach (they only read the outbox's top level),
 # with a .hold.json beside each saying when it's released into the outbox.
@@ -19134,9 +19167,13 @@ if not corpus_root_path or not corpus_root_path.exists():
 # SIDEBAR — LIBRARY MANAGEMENT
 # ---------------------------------------------------------------------------
 
+if _moved_out_of_code_folder:
+    library_slot.info(f"Moved your data ({', '.join(_moved_out_of_code_folder)}) out of the code folder to `{DATA_ROOT}`, "
+                      "so it can't be committed by mistake. If the Salesforce connector reads the outbox, point it at "
+                      f"`{DATA_ROOT / 'outbox'}`.")
 if _migrated_legacy_app_data:
     library_slot.info(
-        "Copied previous data from `~/llmware_data` into `./llmware_data` "
+        f"Copied previous data from `~/llmware_data` into `{APP_DATA_DIR}` "
         f"({', '.join(_migrated_legacy_app_data)})."
     )
 if _migrated_tables:

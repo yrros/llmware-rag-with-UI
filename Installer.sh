@@ -88,9 +88,16 @@ for legacy_path in "${LEGACY_APP_PATHS[@]}"; do
     fi
 done
 
+# A clone: check each commit for your data and secrets (scripts/check_no_data.sh), whatever .gitignore says.
+if git -C "$PROJECT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    git -C "$PROJECT_DIR" config core.hooksPath scripts/git-hooks
+    echo "Commit guard on: commits holding your data or keys are refused."
+fi
+
 echo ""
 echo "Install complete."
 echo "  Project:  $PROJECT_DIR"
+echo "  Data:     ${LLM_NOTES_DATA_DIR:-$HOME/Library/Application Support/LLM-Notes} (kept out of the project folder)"
 echo "  Desktop:  $APP_PATH"
 echo ""
 echo "Double-click LLM-Notes on your Desktop to start the app (http://localhost:8510)."

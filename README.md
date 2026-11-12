@@ -29,7 +29,7 @@ Apple Notes export (markdown folders)
   LLMWare Library  ──►  SQLite blocks (text chunks)
         │
         ▼
-  Embedding model  ──►  LanceDB vectors  (./llmware_data/lancedb/)
+  Embedding model  ──►  LanceDB vectors  (llmware_data/lancedb/, in the data folder)
         │
         ▼
   Streamlit UI  ──►  Semantic search  ──►  Ollama (optional answer)
@@ -41,7 +41,7 @@ Apple Notes export (markdown folders)
 | LLMWare | Library management, parsing, embedding, query API |
 | LanceDB | Persistent vector store for semantic search |
 | Ollama | Local generative LLM for “Answer with LLM” |
-| `./llmware_data/` | All indexes, settings, and model cache (local to project) |
+| `~/Library/Application Support/LLM-Notes/` | All indexes, settings, prompts, chats, the actions log, model cache and the outbox: kept **outside** the code folder |
 
 ---
 
@@ -174,7 +174,7 @@ Creates `~/Desktop/LLM-Notes.app`, which opens Terminal, activates `venv`, and s
 
 ## Running the app
 
-Always start from the **project root** so data lands in `./llmware_data/`:
+Always start from the **project root** (the code). Your data goes to `~/Library/Application Support/LLM-Notes/` wherever you start it (see [Data storage](#data-storage)):
 
 ```bash
 cd /path/to/rag_llmware
@@ -370,7 +370,7 @@ Speak instead of typing in the **Ask** box (the mic in the question's title line
 
 **Chat with LLM**, at the very top of the left sidebar, opens a classic chat with any model installed in Ollama, in the same tab (**Back to search**, or the 🧠, returns to the search page with everything as you left it).
 
-- **Chats are saved** once they have a message, as `llmware_data/chats/<id>.json` on your machine only (`llmware_data/` is in `.gitignore`, so chats are never committed). They're listed in the sidebar, most recent first; click one to carry on, or click the **×** beside it to delete it straight away (no confirmation). **New chat** starts afresh. A chat is titled from its first message; **Rename** and **Delete** sit beside the title.
+- **Chats are saved** once they have a message, as `llmware_data/chats/<id>.json` in the data folder, on your machine only (outside the code folder, so chats are never committed). They're listed in the sidebar, most recent first; click one to carry on, or click the **×** beside it to delete it straight away (no confirmation). **New chat** starts afresh. A chat is titled from its first message; **Rename** and **Delete** sit beside the title.
 - **Open on Chat** (toggle in the Chat sidebar, or under **Configure > Dictation and Chat**): the app opens on Chat with LLM instead of the search page, so you can use it as your main page. **Back to search** still goes to the search page.
 - **Notifications** (**Configure > Notifications**): **Notifications from this app** (on by default) is the app's own off switch: off, it sends none at all, the *Starting LLM-Notes…* one from the Dock launcher included, whatever the switches under it say. **Test now** sends a test notification straight away (shown even while you're on the tab), and **Test in 10 s** waits 10 seconds first, so you can switch to another app and see one arrive as it would after a long task; the line under them says whether the browser allows them (a test asks it first if it hasn't been asked).
 - **Notify me when a task finishes while I'm away** (**Configure > Notifications**, on by default): when LLM work finishes while you're on another tab or app (an answer or Oneshot search, a Note-Workflow stage, an Agent's answer or **Execute**, a Chat reply, a dictation), or an index job finishes or fails (**Re-index (full rebuild)**, **Rescan (incremental)**, **Rescan all corpora**, **Rebuild all corpora**, or the first index from Getting started), a macOS notification says what finished and where, e.g. *Note-Workflow · List the actions is ready to check* or *Full rebuild of All notes has finished · 25,460 vectors*. It holds nothing from your notes. Click it to bring the app's tab back to the front. Work that takes under 8 seconds, or that finishes while you're looking at the tab, doesn't notify. The browser asks to allow notifications once, on your next click on the page; if none show, allow them for `localhost` in the browser's site settings, and for the browser in **System Settings > Notifications**.
@@ -585,9 +585,9 @@ Only likely pairs go to the model: items of the same kind on the same record, or
 
 Pick the **Model** beside the button. It starts on the largest model you have installed, because small ones judge poorly: in testing, `llama3.2:3b` missed rewordings and flagged different actions, while `qwen3:30b` got them right. Reasoning models are asked to answer without thinking, which is as accurate here and far faster (about 20 seconds for a handful of items with `qwen3:30b`).
 
-**Default location:** `outbox/` in the project folder, i.e. the folder you run Streamlit from, which is the project folder when you start with `start_app.sh` or the Desktop launcher. Change it under **Outbox** on the Prompt library page (saved as `outbox_path` in `app_settings.json`); the connector must read the same folder. The **Review time before sending** slider beside it sets how long a sent package is held in `held/` first (see the Agent steps above). The outbox is gitignored because sent drafts contain your notes, and `reset_rag.sh` leaves it alone.
+**Default location:** `outbox/` in the data folder, `~/Library/Application Support/LLM-Notes/outbox/` (outside the code folder). Change it under **Outbox** on the Prompt library page (saved as `outbox_path` in `app_settings.json`); the connector must read the same folder. The **Review time before sending** slider beside it sets how long a sent package is held in `held/` first (see the Agent steps above). The outbox is gitignored because sent drafts contain your notes, and `reset_rag.sh` leaves it alone.
 
-Each file is named `YYYYMMDD-HHMMSS-<note|task|email>-<first 8 characters of the package id>.json` and written atomically (a hidden `.<name>.tmp` file is renamed into place).
+Each file is named `YYYYMMDD-HHMMSS-<note|task|email>-<first 8 characters of the package id>.json` and written atomically (a hidden temporary file of its own is renamed into place).
 
 ### Advanced settings
 
@@ -623,7 +623,9 @@ Hidden corpora are skipped by every all-corpora action.
 
 ## Data storage
 
-All application data lives under **`./llmware_data/`** in the directory you run Streamlit from:
+All application data lives **outside the code folder**, so it can't be committed by mistake: in
+**`~/Library/Application Support/LLM-Notes/`** on a Mac (`~/.local/share/llm-notes/` elsewhere), or the folder in the
+`LLM_NOTES_DATA_DIR` environment variable if it's set. Under it, `llmware_data/` holds:
 
 ```
 llmware_data/
@@ -638,11 +640,21 @@ llmware_data/
 └── prompt_library.json   # About me, task and global prompts
 ```
 
-This folder is gitignored. To reset it, use `reset_rag.sh` (see [Resetting the environment](#resetting-the-environment)).
+To reset it, use `reset_rag.sh` (see [Resetting the environment](#resetting-the-environment)).
 
-Drafts you send are written to **`./outbox/`** next to it by default (also gitignored; see [Agents and the outbox](#agents-and-the-outbox)).
+Drafts you send are written to **`outbox/`** beside it (see [Agents and the outbox](#agents-and-the-outbox)); the
+Salesforce connector's `config.toml` must point its `outbox` there.
 
-On first run, the app may copy data from the legacy location `~/llmware_data/` if the project-local folder is empty.
+**Moving from an older version:** if `llmware_data/` or `outbox/` is still inside the code folder, the app moves it to
+the data folder on its next start (a rename, nothing is copied), updates the outbox paths in the actions log and
+settings, and says so in the sidebar. It never overwrites a folder already in the data folder. On first run, the app
+may also copy data from the older location `~/llmware_data/` if the data folder is empty.
+
+**Commit guard.** `scripts/check_no_data.sh` refuses commits holding the app's data (`llmware_data/`, `outbox/`,
+settings, prompts, chats, the actions log), databases and vector tables, keys and certificates, and text that looks
+like an email address or an access key, whatever `.gitignore` says. `Installer.sh` turns it on as the pre-commit hook
+(`git config core.hooksPath scripts/git-hooks`); the **Data guard** GitHub check runs it on every push as a backstop.
+A false alarm can be committed with `git commit --no-verify`.
 
 ---
 
@@ -665,7 +677,7 @@ On first run, the app may copy data from the legacy location `~/llmware_data/` i
 - `auto_rescan_enabled` — default `false`; text-only rescan every 3 minutes in the background
 - `auto_rescan_all_corpora` — default `false`; auto-rescan every visible corpus instead of just the selected one
 - `hide_corpora_enabled` — default `false`; hide corpora marked `hidden` in `corpus_settings.json` from the library list and all-corpora scans
-- `outbox_path` — folder that sent drafts are written to; empty means `outbox/` in the project folder
+- `outbox_path` — folder that sent drafts are written to; empty means `outbox/` in the data folder
 - `outbox_hold_minutes` — the default review time (5–120, default 10): how long a sent package waits in `held/` before it's released into the outbox for a connector
 - `actioned_filter` — the Filter box's **Actioned** control: `mode` (`all`, `hide` or `only`) and `agent` (a prompt id, or empty for any Agent)
 - `note_dates` — how date filters find a note: `text` (a date written in it), `created` (its file's creation date) or `either`
@@ -723,7 +735,8 @@ Use **Show all local embedding models** in Advanced to see the full catalog.
 | `schemas/handoff.v1.schema.json` | Format of the packages written to the outbox (`llm-notes-handoff/v1`), shared with connectors |
 | `schemas/handoff.v2.schema.json` | Package format v2 (`llm-notes-handoff/v2`): v1 plus update items (e.g. a Next Step) and mixed packages |
 | `schemas/reference.v1.schema.json` | Format of the read-only reference snapshot a connector writes to `outbox/reference/` (`llm-notes-reference/v1`) |
-| `.gitignore` | Excludes `llmware_data/`, `outbox/`, venvs, `__pycache__` |
+| `.gitignore` | Excludes `llmware_data/`, `outbox/`, venvs, `__pycache__`, keys and databases (the data itself lives outside the folder) |
+| `scripts/check_no_data.sh`, `scripts/git-hooks/pre-commit`, `.github/workflows/data-guard.yml` | The commit guard and its GitHub check |
 
 ---
 

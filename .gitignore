@@ -6,3 +6,19 @@ venv/
 .claude/
 
 outbox/
+
+# Your data lives in ~/Library/Application Support/LLM-Notes now, not here. These stay ignored in case an old
+# copy is left behind; scripts/check_no_data.sh (the pre-commit hook and the GitHub check) refuses them anyway.
+*.db
+*.sqlite
+*.sqlite3
+*.lance
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileconfig
+*.password
+.env
+.env.*
+config.toml
