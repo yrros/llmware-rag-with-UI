@@ -74,7 +74,11 @@ open_app() {
         # A second click while it's still starting just waits for it.
         if [[ -z "$(started_pid)$(app_pids)" ]]; then
             start_in_background
-            osascript -e 'display notification "Starting LLM-Notes…" with title "LLM-Notes"' 2>/dev/null || true
+            # Configure > Notifications > Notifications from this app: off sends none, this one included.
+            if ! grep -Eq '"notifications_enabled"[[:space:]]*:[[:space:]]*false' \
+                    "$PROJECT_DIR/llmware_data/app_settings.json" 2>/dev/null; then
+                osascript -e 'display notification "Starting LLM-Notes…" with title "LLM-Notes"' 2>/dev/null || true
+            fi
         fi
         if ! wait_up 180; then
             osascript -e "display alert \"LLM-Notes didn't start\" message \"See the log: $LOG
