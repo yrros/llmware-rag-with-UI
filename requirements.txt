@@ -12,6 +12,9 @@ tokenizers>=0.15
 pydub>=0.25
 jsonschema>=4.20
 audioop-lts>=0.2.2; python_version >= "3.13"
+anthropic>=2.8      # Claude, when cloud models are switched on (Configure > Models and providers)
+keyring>=25.7       # API keys in the macOS Keychain
+requests>=2.32
 
 # Security minimums for transitive dependencies (known vulnerabilities in older releases)
 urllib3>=2.8

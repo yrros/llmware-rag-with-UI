@@ -19,7 +19,8 @@ SECRETS='-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-
 
 if [ "$mode" = "--staged" ]; then
     files="$(git diff --cached --name-only --diff-filter=ACMR)"
-    added="$(git diff --cached -U0 --diff-filter=ACMR --no-color | grep -E '^\+' | grep -vE '^\+\+\+ ')"
+    # The diff's leading "+" is dropped, or a line starting with a Python decorator reads as an email address.
+    added="$(git diff --cached -U0 --diff-filter=ACMR --no-color | grep -E '^\+' | grep -vE '^\+\+\+ ' | sed 's/^+//')"
 elif [ "$mode" = "--tracked" ]; then
     files="$(git ls-files)"
     added="$(git grep -hI -e '' -- . 2>/dev/null)"

@@ -23,6 +23,7 @@ from functools import lru_cache
 import urllib.parse
 from urllib.parse import quote_plus, urlparse
 import streamlit as st
+import llm_providers as cloud
 import streamlit.components.v1 as components
 from pathlib import Path
 from llmware.library import Library, LibraryCatalog
@@ -477,22 +478,57 @@ def widget_value_missing(*keys: str) -> bool:
     return any(key not in st.session_state for key in keys)
 
 
+# Settings files are read and written from the page and from background threads. Writing in place empties a file
+# for a moment, and a reader catching that moment saw no settings, then saved defaults over all of them. So a write
+# goes to a temporary file that replaces the old one in one step, and read-modify-write runs under one lock.
+@st.cache_resource
+def _json_file_lock() -> threading.RLock:
+    return threading.RLock()  # one lock for the whole server: the script re-runs, background threads outlive a run
+
+
+JSON_FILE_LOCK = _json_file_lock()
+
+
+def write_json_atomic(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+    try:
+        temp.write_text(json.dumps(data, indent=2))
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def read_json_dict(path: Path, *, for_update: bool = False) -> dict:
+    """The JSON object in path, or {} when it's missing. A file that's there but can't be read gives {} for a plain
+    read; before an update it's set aside (as .unreadable-<time>) rather than silently replaced by a near-empty one."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        if for_update:
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            try:
+                shutil.copy2(path, path.with_name(f"{path.name}.unreadable-{stamp}"))
+            except OSError:
+                pass
+        return {}
+
+
 def load_app_settings() -> dict:
     settings = DEFAULT_APP_SETTINGS.copy()
-    if not APP_SETTINGS_PATH.exists():
-        return settings
-    try:
-        settings.update(json.loads(APP_SETTINGS_PATH.read_text()))
-    except Exception:
-        pass
+    settings.update(read_json_dict(APP_SETTINGS_PATH))
     return settings
 
 
 def save_app_settings(updates: dict) -> dict:
-    settings = load_app_settings()
-    settings.update(updates)
-    APP_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    APP_SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+    with JSON_FILE_LOCK:
+        settings = DEFAULT_APP_SETTINGS.copy()
+        settings.update(read_json_dict(APP_SETTINGS_PATH, for_update=True))
+        settings.update(updates)
+        write_json_atomic(APP_SETTINGS_PATH, settings)
     return settings
 
 
@@ -828,6 +864,25 @@ def saved_search_route() -> str:
 
 MAX_RESULTS_LIMITS = {"semantic": 200, "literal": 200}  # passages (Semantic) or notes listed (Literal): the slider
 ASK_NOTES_LIMIT = 50  # notes Ask (filtered only) answers from, whatever Max results says: the LLM reads few anyway
+
+
+# Filter and Ask sit side by side; on a narrow page Ask goes under Filter, full width, to scroll down to. Narrow:
+# a window under 1,000 px, or under 1,400 px while the sidebar is open.
+FILTER_ASK_ROW = ('[data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] .st-key-filter_box)'
+                  ':has(> [data-testid="stColumn"] .st-key-ask_box)')
+
+def filter_ask_stacked(prefix: str = "") -> str:
+    """CSS putting Ask under Filter, both full width (`prefix`: a condition on an ancestor, e.g. the sidebar)."""
+    row = f"{prefix} {FILTER_ASK_ROW}".strip()
+    return (f"{row} {{ flex-direction: column !important; flex-wrap: nowrap !important; }} "
+            f'{row} > [data-testid="stColumn"] {{ width: 100% !important; min-width: 100% !important; '
+            "flex: 1 1 auto !important; }")
+
+
+FILTER_ASK_STACKED = filter_ask_stacked()
+FILTER_ASK_NARROW_STYLE = (f"@media (max-width: 1000px) {{ {FILTER_ASK_STACKED} }} "
+                           "@media (max-width: 1400px) { "
+                           + filter_ask_stacked('body:has([data-testid="stSidebar"][data-collapsed="false"])') + " }")
 
 
 def max_results_key(literal: bool) -> str:
@@ -1619,12 +1674,7 @@ def format_embedding_model_option(model_id: str, model_labels: dict[str, str]) -
 
 
 def load_all_corpus_settings() -> dict:
-    if not CORPUS_SETTINGS_PATH.exists():
-        return {}
-    try:
-        return json.loads(CORPUS_SETTINGS_PATH.read_text())
-    except Exception:
-        return {}
+    return read_json_dict(CORPUS_SETTINGS_PATH)
 
 
 def get_corpus_config(safe_lib: str) -> dict:
@@ -1634,12 +1684,13 @@ def get_corpus_config(safe_lib: str) -> dict:
 
 
 def save_corpus_config(safe_lib: str, updates: dict) -> dict:
-    all_settings = load_all_corpus_settings()
-    config = get_corpus_config(safe_lib)
-    config.update(updates)
-    all_settings[safe_lib] = config
-    CORPUS_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CORPUS_SETTINGS_PATH.write_text(json.dumps(all_settings, indent=2))
+    with JSON_FILE_LOCK:
+        all_settings = read_json_dict(CORPUS_SETTINGS_PATH, for_update=True)
+        config = DEFAULT_CORPUS_CONFIG.copy()
+        config.update(all_settings.get(safe_lib, {}))
+        config.update(updates)
+        all_settings[safe_lib] = config
+        write_json_atomic(CORPUS_SETTINGS_PATH, all_settings)
     return config
 
 
@@ -1840,10 +1891,66 @@ def clean_reference_ids(library: dict) -> bool:
     return changed
 
 
+# Prompt versions: each task prompt and Agent keeps its history in "versions", oldest first, the last one being the
+# prompt as it is now: [{"at", "edited", "fields": {PROMPT_VERSION_FIELDS}, "kind": original|edit|restore,
+# "from"?: the version number restored}]. Saving records a version for what changed; edits within
+# PROMPT_VERSION_GROUP_SECONDS of the last one fold into it, so one sitting of editing is one version.
+PROMPT_VERSION_FIELDS = ("name", "text", "steps", "command", "output", "model", "references", "command_references",
+                         "links", "salesforce", "chase_task")
+PROMPT_VERSION_GROUP_SECONDS = 600
+
+
+def prompt_snapshot(prompt: dict | None) -> dict:
+    """The parts of a prompt that make what it does (not its stars, tags or when it was used)."""
+    prompt = prompt or {}
+    return json.loads(json.dumps({field: prompt.get(field) for field in PROMPT_VERSION_FIELDS}))
+
+
+def prompt_fingerprint(prompt: dict | None, fields=PROMPT_VERSION_FIELDS) -> str:
+    """A short hash of what the prompt says: kept with what it made, to tell when it's been edited since."""
+    data = json.dumps({field: (prompt or {}).get(field) for field in fields}, sort_keys=True, default=str)
+    return hashlib.sha1(data.encode()).hexdigest()[:16]
+
+
+def iso_seconds_ago(text: str | None) -> float:
+    """Seconds since an ISO time (with or without its time zone); very large if it can't be read."""
+    try:
+        when = datetime.datetime.fromisoformat(str(text))
+    except (TypeError, ValueError):
+        return float("inf")
+    if when.tzinfo is None:
+        when = when.astimezone()
+    return (datetime.datetime.now().astimezone() - when).total_seconds()
+
+
+def record_prompt_versions(library: dict, before: dict) -> None:
+    """Add a version to each prompt whose content changed from `before` (the library as saved last)."""
+    old = {p.get("id"): p for p in before.get("prompts") or [] if isinstance(p, dict)}
+    now = now_iso()
+    for prompt in library.get("prompts") or []:
+        snapshot = prompt_snapshot(prompt)
+        versions = prompt.setdefault("versions", [])
+        if not versions:  # its history starts here: the prompt as it was before this save (or as it is, if new)
+            if not isinstance(old.get(prompt.get("id"), {}).get("versions"), list) or not old[prompt["id"]]["versions"]:
+                base = old.get(prompt.get("id"))
+                versions.append({"at": prompt.get("created") or now, "fields": prompt_snapshot(base) if base
+                                 else snapshot, "kind": "original"})
+            else:  # the history was dropped on the way (a copy without it): keep the saved one
+                versions.extend(old[prompt["id"]]["versions"])
+        head = versions[-1]
+        if snapshot == head.get("fields"):
+            continue
+        if head.get("kind") == "edit" and iso_seconds_ago(head.get("edited") or head.get("at")) < PROMPT_VERSION_GROUP_SECONDS:
+            head.update(fields=snapshot, edited=now)
+        else:
+            versions.append({"at": now, "edited": now, "fields": snapshot, "kind": "edit"})
+
+
 def save_prompt_library(library: dict) -> dict:
     clean_reference_ids(library)
-    PROMPT_LIBRARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PROMPT_LIBRARY_PATH.write_text(json.dumps(library, indent=2))
+    with JSON_FILE_LOCK:
+        record_prompt_versions(library, read_json_dict(PROMPT_LIBRARY_PATH))
+        write_json_atomic(PROMPT_LIBRARY_PATH, library)
     return library
 
 
@@ -3506,8 +3613,14 @@ def next_step_text(text: str, short_name: str, today: datetime.date, marker: dic
     return marked_title(f"{signed}: {text.strip()}", marker)
 
 
-def expand_next_steps(entries: list[dict], marker: dict, short_name: str, today: datetime.date) -> list[dict]:
-    """Each model entry becomes a Next Step update and a task to chase it, both on the same opportunity.
+def next_step_chases(prompt: dict | None) -> bool:
+    """A Next Step Agent's Chase task switch: a task to chase each Next Step too (on unless switched off)."""
+    return (prompt or {}).get("chase_task") is not False
+
+
+def expand_next_steps(entries: list[dict], marker: dict, short_name: str, today: datetime.date,
+                      chase: bool = True) -> list[dict]:
+    """Each model entry becomes a Next Step update and (with `chase`) a task to chase it, on the same opportunity.
 
     The update carries `previous` (the Next Step in the reference snapshot) so the connector only overwrites
     what the user saw; without a snapshot entry it's left out.
@@ -3531,13 +3644,13 @@ def expand_next_steps(entries: list[dict], marker: dict, short_name: str, today:
             update["previous"] = record.get("next_step", "")
             if entry.get("already_said") is True:
                 update["_already_said"] = True  # the model's view; staging only, never sent
-        chase = normalise_draft_item("task", {
+        chase_task = normalise_draft_item("task", {
             "subject": str(entry.get("chase_subject", "") or "").strip() or f"Chase: {text}",
             "description": str(entry.get("chase_description", "") or "").strip() or text,
             "due_date": entry.get("chase_due_date", ""),
             "related_to": related,
         })
-        items += [update, apply_title_marker(chase, marker)]
+        items += [update, apply_title_marker(chase_task, marker)] if chase else [update]
     return items
 
 
@@ -3658,7 +3771,8 @@ def stage_agent_items(
     marker = get_title_marker(library)
     entries = [item for item in data.get("items", []) if isinstance(item, dict)]
     if item_type == "next_step":
-        items = expand_next_steps(entries, marker, profile_short_name(library), datetime.date.today())
+        items = expand_next_steps(entries, marker, profile_short_name(library), datetime.date.today(),
+                                  chase=next_step_chases(prompt))
     else:
         items = [apply_title_marker(normalise_draft_item(item_type, item), marker) for item in entries]
     # Salesforce knows people by their full name: a nickname from the notes (e.g. an owner) becomes the full
@@ -3684,7 +3798,7 @@ def stage_agent_items(
         flag_duplicate_items(items, prior + open_tasks_list, embed)
     return {
         "id": uuid.uuid4().hex,  # the package id if this is sent; each staging is a new package
-        "type": "mixed" if item_type == "next_step" else item_type,
+        "type": "mixed" if item_type == "next_step" else item_type,  # as the connector has always had it
         "summary": str(data.get("summary", "")).strip(),
         "items": items,
         "model": model_name,
@@ -6036,7 +6150,7 @@ def save_prompt_field(prompt_id: str, field: str) -> None:
     value = st.session_state.get(f"prompt_{field}_{prompt_id}")
     if field == "tags":
         value = clean_filter_terms(value)
-    elif field in ("global", "starred", "agent", "salesforce", "edit_space", "hold_manual"):
+    elif field in ("global", "starred", "agent", "salesforce", "edit_space", "hold_manual", "chase_task"):
         value = bool(value)
     elif field == "output":
         value = value if value in DRAFT_OUTPUT_TYPES else DEFAULT_AGENT_OUTPUT
@@ -6231,6 +6345,16 @@ def render_agent_workflow_editor(prompt: dict) -> None:
             "(the Configure page's review time) so you can drop items or Recall them before a connector sees them."
         ),
     )
+    if get_prompt_output_type(prompt) == "next_step":
+        st.toggle(
+            "Chase task",
+            value=next_step_chases(prompt),
+            key=f"prompt_chase_task_{prompt_id}",
+            on_change=save_prompt_field,
+            args=(prompt_id, "chase_task"),
+            help="Also create a task to chase each Next Step (due when the notes say), on the same opportunity. "
+                 "Off: only the opportunity's **Next Step** is updated.",
+        )
     st.toggle(
         "Edit space",
         value=bool(prompt.get("edit_space")),
@@ -6302,6 +6426,158 @@ def prompt_card_label(prompt: dict) -> str:
     return agent_prompt_label(prompt) + markers
 
 
+def format_version_time(text: str | None) -> str:
+    try:
+        when = datetime.datetime.fromisoformat(str(text))
+    except (TypeError, ValueError):
+        return "?"
+    return (when.astimezone() if when.tzinfo else when).strftime("%d %b %Y, %H:%M")
+
+
+def prompt_version_label(versions: list[dict], index: int) -> str:
+    """'v3 · 13 Nov 2026, 14:02 · restored from v1 (current)'."""
+    version = versions[index]
+    when = format_version_time(version.get("at"))
+    edited = version.get("edited")
+    if edited and format_version_time(edited) != when:
+        when += f" to {format_version_time(edited)[-5:]}" if format_version_time(edited)[:11] == when[:11] \
+            else f" to {format_version_time(edited)}"
+    kind = {"original": "first kept", "restore": f"restored from v{version.get('from', '?')}"}.get(version.get("kind"), "")
+    return f"v{index + 1} · {when}" + (f" · {kind}" if kind else "") + (" (current)" if index == len(versions) - 1 else "")
+
+
+def prompt_version_parts(fields: dict, library: dict) -> dict[str, str]:
+    """A version as readable parts, to compare: {part: text}."""
+    refs = {r.get("id"): r.get("title", "?") for r in library.get("references") or []}
+    links = {l.get("id"): l.get("title", "?") for l in library.get("links") or []}
+    steps = fields.get("steps") or []
+    agent_parts = bool(fields.get("command") or steps)
+    return {
+        "Name": str(fields.get("name") or ""),
+        "Step 1 · Collection" if agent_parts else "Prompt": str(fields.get("text") or ""),
+        "Steps": "\n\n".join(f"{n}. {step.get('name', '')}\n{step.get('text', '')}" for n, step in enumerate(steps, 2)),
+        "Action Command": str(fields.get("command") or ""),
+        "Output": OUTPUT_TYPES.get(fields.get("output"), str(fields.get("output") or "")) if agent_parts else "",
+        "Model": format_prompt_model(str(fields.get("model") or "")),
+        "Reference documents": ", ".join(refs.get(r, "(removed)") for r in fields.get("references") or []),
+        "Action Command documents": ", ".join(refs.get(r, "(removed)") for r in fields.get("command_references") or []),
+        "Links": ", ".join(links.get(l, "(removed)") for l in fields.get("links") or []),
+        "Salesforce records": "Sent" if fields.get("salesforce") else "",
+    }
+
+
+DIFF_TOKENS = re.compile(r"\s+|\w+|[^\w\s]")
+DIFF_STYLE = ("<style>.pdiff { white-space: pre-wrap; font-size: 0.9rem; line-height: 1.5; padding: 0.5rem 0.75rem; "
+              "border-radius: 0.5rem; background: rgba(128, 128, 128, 0.08); min-height: 2rem; } "
+              ".pdiff del { background: rgba(255, 75, 75, 0.28); text-decoration: line-through; } "
+              ".pdiff ins { background: rgba(40, 200, 100, 0.3); text-decoration: none; }</style>")
+
+
+def word_diff_html(old: str, new: str) -> tuple[str, str]:
+    """Two HTML versions of a word-level diff: the old text with what went struck through in red, the new one
+    with what came highlighted in green."""
+    a, b = DIFF_TOKENS.findall(old), DIFF_TOKENS.findall(new)
+    left, right = [], []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        before, after = html.escape("".join(a[i1:i2])), html.escape("".join(b[j1:j2]))
+        if op == "equal":
+            left.append(before)
+            right.append(after)
+        else:
+            if before:
+                left.append(f"<del>{before}</del>")
+            if after:
+                right.append(f"<ins>{after}</ins>")
+    return "".join(left), "".join(right)
+
+
+def prompt_widget_keys(prompt: dict, *more: dict) -> list[str]:
+    """Session keys of a prompt card's widgets (by the prompt's and its steps' ids), so they show restored text."""
+    ids = {prompt["id"], *(str(step.get("id")) for p in (prompt, *more) for step in p.get("steps") or [])}
+    return [key for key in st.session_state if isinstance(key, str) and key.startswith("prompt_")
+            and not key.startswith("prompt_open_") and any(key.endswith(f"_{i}") for i in ids)]
+
+
+def restore_prompt_version(prompt_id: str, index: int) -> None:
+    """Make an old version the current one: its content comes back as a new version (nothing is lost)."""
+    library = load_prompt_library()
+    prompt = find_prompt(library, prompt_id)
+    versions = (prompt or {}).get("versions") or []
+    if not prompt or not 0 <= index < len(versions) - 1:
+        return
+    before = dict(prompt)
+    for field, value in json.loads(json.dumps(versions[index]["fields"])).items():
+        prompt[field] = value
+    now = now_iso()
+    versions.append({"at": now, "edited": now, "fields": prompt_snapshot(prompt), "kind": "restore", "from": index + 1})
+    save_prompt_library(library)
+    # The card's boxes show the restored text: set (a box only dropped from Session State would keep what it showed).
+    shown = {f"prompt_{field}_{prompt_id}": prompt.get(field) for field in ("name", "text", "command", "model", "output")}
+    for step in prompt.get("steps") or []:
+        shown[f"prompt_step_name_{step.get('id')}"] = step.get("name", "")
+        shown[f"prompt_step_text_{step.get('id')}"] = step.get("text", "")
+    for key in prompt_widget_keys(prompt, before):
+        if key in shown and shown[key] is not None:
+            st.session_state[key] = shown[key]
+        else:
+            st.session_state.pop(key, None)
+
+
+@st.dialog("Prompt history", width="large")
+def prompt_history_dialog(prompt_id: str) -> None:
+    """A prompt's versions with their dates; any two compared side by side (what changed highlighted); any old
+    version made the current one again (as a new version)."""
+    library = load_prompt_library()
+    prompt = find_prompt(library, prompt_id)
+    versions = (prompt or {}).get("versions") or []
+    if not prompt or not versions:
+        st.caption("No history yet: a version is kept each time this prompt is changed.")
+        return
+    count = len(versions)
+    st.markdown(f"**{prompt['name']}** · {count} version{'s' if count != 1 else ''}. Edits within "
+                f"{PROMPT_VERSION_GROUP_SECONDS // 60} minutes of each other count as one version.")
+    with st.expander("All versions", icon=":material/history:", expanded=count <= 6):
+        for index in range(count - 1, -1, -1):
+            st.caption(prompt_version_label(versions, index))
+    if count < 2:
+        st.caption("Only one version so far: nothing to compare yet.")
+        return
+    numbers = list(range(count))
+    with st.container(horizontal=True, gap="small", vertical_alignment="bottom"):
+        old = st.selectbox("Compare", numbers, index=count - 2, key=f"history_old_{prompt_id}",
+                           format_func=lambda i: prompt_version_label(versions, i))
+        new = st.selectbox("with", numbers, index=count - 1, key=f"history_new_{prompt_id}",
+                           format_func=lambda i: prompt_version_label(versions, i))
+    old_parts = prompt_version_parts(versions[old]["fields"], library)
+    new_parts = prompt_version_parts(versions[new]["fields"], library)
+    changed = [part for part in new_parts if old_parts.get(part, "") != new_parts[part]]
+    st.html(DIFF_STYLE)
+    if old == new or not changed:
+        st.info("These two versions are the same.", icon=":material/check:")
+    else:
+        head_left, head_right = st.columns(2, gap="small")
+        head_left.markdown(f"**v{old + 1}** · removed text struck through")
+        head_right.markdown(f"**v{new + 1}** · added text highlighted")
+        for part in changed:
+            left, right = word_diff_html(old_parts.get(part, ""), new_parts[part])
+            st.markdown(f"**{part}**")
+            col_left, col_right = st.columns(2, gap="small")
+            col_left.html(f'<div class="pdiff">{left or "<i>(empty)</i>"}</div>')
+            col_right.html(f'<div class="pdiff">{right or "<i>(empty)</i>"}</div>')
+        unchanged = [part for part in new_parts if part not in changed and new_parts[part]]
+        if unchanged:
+            st.caption("Unchanged: " + ", ".join(unchanged) + ".")
+    with st.container(horizontal=True, gap="small"):
+        for index in dict.fromkeys((old, new)):
+            if index != count - 1:
+                if st.button(f"Make v{index + 1} the current version", key=f"history_restore_{prompt_id}_{index}",
+                             icon=":material/restore:", type="primary",
+                             help=f"Bring back v{index + 1} as v{count + 1}: the versions in between are kept."):
+                    restore_prompt_version(prompt_id, index)
+                    st.toast(f"v{index + 1} is back, as v{count + 1}.", icon=":material/restore:")
+                    st.rerun()
+
+
 def render_prompt_card(
     prompt: dict, model_options: list[str], links: list[dict] = (), references: list[dict] = ()
 ) -> None:
@@ -6323,6 +6599,13 @@ def render_prompt_card(
                     args=(prompt_id, "name"),
                     label_visibility="collapsed",
                 )
+                versions = prompt.get("versions") or []
+                if st.button(f"v{len(versions)}" if len(versions) > 1 else "History", icon=":material/history:",
+                             key=f"prompt_history_{prompt_id}", type="tertiary",
+                             help="This prompt's versions with their dates: compare any two, or make an old one "
+                                  "current again." + (f"\n\nLatest: {prompt_version_label(versions, len(versions) - 1)}"
+                                                      if versions else "")):
+                    prompt_history_dialog(prompt_id)
                 with st.popover(":material/delete:", type="tertiary", help="Delete this prompt"):
                     st.markdown(f"Delete **{prompt['name']}**? This can't be undone.")
                     st.button(
@@ -6984,14 +7267,187 @@ def render_configure_models_section() -> None:
     settings = load_app_settings()
     chat = settings.get(CHAT_DEFAULT_MODEL_SETTING) or "last used"
     selector = settings.get(RAG_SELECTOR_SETTING) or "chat's model"
-    with st.expander(f"Models for Chat and notes searches · chat: {chat} · RAG selector: {selector}",
+    with st.expander(f"Models for Chat and notes searches · chat: {chat} · {chat_default_max_tokens():,} tokens · "
+                     f"RAG selector: {selector}",
                      expanded=False, key="configure_models_open", icon=":material/smart_toy:"):
         st.caption("Which Ollama models Chat starts with, and which one reads a Chat message to decide whether it's "
                    "a notes search. The model that **answers** from your notes is set per corpus, under **Ollama "
                    "model details** in the Ask box (or when a notes search warns that it had to trim). Drafting's "
                    f"model is in the [Prompt library]({PROMPT_LIBRARY_PAGE_URL}).")
         render_default_chat_model("chat_default_model_configure")
+        render_default_chat_max_tokens("chat_default_max_tokens_configure")
         render_rag_selector_model("rag_selector_model_configure")
+
+
+def save_claude_key() -> None:
+    value = str(st.session_state.get("claude_key_input") or "").strip()
+    st.session_state["claude_key_input"] = ""
+    if value:
+        cloud.set_key(cloud.key_account("claude"), value)
+        claude_key_source.clear()
+        st.toast("Claude API key saved in the Keychain.", icon=":material/key:")
+
+
+def remove_claude_key() -> None:
+    cloud.set_key(cloud.key_account("claude"), "")
+    claude_key_source.clear()
+
+
+def save_endpoints(endpoints: list[dict]) -> None:
+    save_app_settings({OPENAI_ENDPOINTS_SETTING: endpoints})
+    endpoint_model_ids.clear()
+
+
+def endpoint_name(raw: str) -> str:
+    """A name usable in model names: no slashes, trimmed."""
+    return re.sub(r"\s+", " ", str(raw or "").replace("/", "-")).strip()[:40]
+
+
+def add_endpoint() -> None:
+    endpoints = cloud_settings()["endpoints"]
+    taken = {e.get("name") for e in endpoints}
+    name = next(f"Endpoint {n}" for n in range(1, 100) if f"Endpoint {n}" not in taken)
+    save_endpoints(endpoints + [{"name": name, "base_url": "", "context": cloud.OPENAI_DEFAULT_CONTEXT,
+                                 "enabled": True}])
+
+
+def update_endpoint(index: int, field: str, widget_key: str) -> None:
+    endpoints = cloud_settings()["endpoints"]
+    if index >= len(endpoints):
+        return
+    value = st.session_state.get(widget_key)
+    if field == "name":
+        value = endpoint_name(value)
+        old = endpoints[index].get("name", "")
+        if not value or value in {e.get("name") for i, e in enumerate(endpoints) if i != index}:
+            st.toast("Each endpoint needs its own name.", icon=":material/error:")
+            return
+        key = cloud.get_key(cloud.key_account("openai", old))
+        if key and old != value:  # the key follows the endpoint
+            cloud.set_key(cloud.key_account("openai", value), key)
+            cloud.set_key(cloud.key_account("openai", old), "")
+    elif field == "base_url":
+        value = str(value or "").strip()
+    elif field == "context":
+        value = int(value or cloud.OPENAI_DEFAULT_CONTEXT)
+    elif field == "key":
+        cloud.set_key(cloud.key_account("openai", endpoints[index].get("name", "")), str(value or "").strip())
+        st.session_state[widget_key] = ""
+        endpoint_model_ids.clear()
+        return
+    endpoints[index][field] = value
+    save_endpoints(endpoints)
+
+
+def remove_endpoint(index: int) -> None:
+    endpoints = cloud_settings()["endpoints"]
+    if index < len(endpoints):
+        cloud.set_key(cloud.key_account("openai", endpoints[index].get("name", "")), "")
+        save_endpoints(endpoints[:index] + endpoints[index + 1:])
+
+
+def test_cloud_model(name: str) -> None:
+    """A tiny request to `name` (a fraction of a cent), with the result in a toast."""
+    try:
+        reply = cloud.complete(name, {"messages": [{"role": "user", "content": "Reply with the single word OK."}],
+                                      "think": False, "options": {"num_predict": 16}}, cloud_settings(), 60)
+        st.toast(f"{cloud.describe(name)} answered: {reply.strip()[:40]}", icon=":material/check_circle:")
+    except Exception as exc:
+        st.toast(f"{cloud.describe(name)}: {exc}", icon=":material/error:")
+
+
+def render_configure_providers_section() -> None:
+    """Configure page: Local models only, the local fallback, Claude (key and effort) and OpenAI-compatible
+    endpoints."""
+    local_only = local_models_only()
+    settings = load_app_settings()
+    with st.expander("Models and providers (local, Claude, OpenAI-compatible) · "
+                     + ("local models only" if local_only else "cloud models on"),
+                     expanded=False, key="configure_providers_open", icon=":material/cloud:"):
+        st.caption("Cloud models appear in every model list (marked ☁) next to your Ollama models, so you pick one "
+                   "wherever you pick a model. **A cloud model is sent your question and the note text that goes "
+                   "with it.** In-confidence chats always stay on this Mac. When a cloud model can't be reached or "
+                   "fails, the local fallback answers instead and the answer says so.")
+        st.toggle("Local models only", key="local_only_toggle", value=local_only,
+                  on_change=persist_app_toggle, args=(LOCAL_ONLY_SETTING, "local_only_toggle"),
+                  help="On: only Ollama models are offered and used; anything set to a cloud model is answered by "
+                       "the local fallback. Turn it off to use the cloud models set up below.")
+        ok, local = discover_local_models()
+        fallback = local_fallback_model()
+        options = list(dict.fromkeys([fallback, *local]))
+        st.selectbox("Local fallback model", options, index=0, key="local_fallback_choice",
+                     on_change=lambda: save_app_settings({LOCAL_FALLBACK_SETTING: st.session_state["local_fallback_choice"]}),
+                     help="The Ollama model that answers when a cloud model can't: offline, Local models only on, an "
+                          "in-confidence chat, or an error. Also used for anything still set to a cloud model.")
+        if not ok:
+            st.caption(":material/warning: Ollama isn't answering, so the fallback can't run until it is.")
+
+        st.markdown("**Claude** (Anthropic)")
+        source = claude_key_source()
+        st.caption({"keychain": ":material/key: API key saved in the macOS Keychain.",
+                    "environment": ":material/key: Using the API key in the ANTHROPIC_API_KEY environment variable.",
+                    "profile": ":material/key: Using your `ant auth login` profile.",
+                    "": "No API key yet: add one to offer "
+                        + " and ".join(f"**{label}**" for label in cloud.CLAUDE_MODELS.values()) + "."}[source])
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+            st.text_input("Claude API key", type="password", key="claude_key_input", placeholder="sk-ant-…",
+                          help="Stored in the macOS Keychain (service “LLM-Notes”), never in the app's settings "
+                               "files or settings export.")
+            st.button("Save key", key="claude_key_save", on_click=save_claude_key, icon=":material/save:")
+            if source == "keychain":
+                st.button("Remove", key="claude_key_remove", on_click=remove_claude_key, type="tertiary")
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+            effort = settings.get(CLAUDE_EFFORT_SETTING) or "medium"
+            st.segmented_control("Thinking effort", cloud.CLAUDE_EFFORTS, default=effort, key="claude_effort_choice",
+                                 format_func=str.capitalize,
+                                 on_change=lambda: save_app_settings(
+                                     {CLAUDE_EFFORT_SETTING: st.session_state.get("claude_effort_choice") or "medium"}),
+                                 help="How hard Claude thinks before answering: higher is more thorough, slower and "
+                                      "costs more. Quick jobs (drafting, the RAG selector) always use Low.")
+            if source and not local_only:
+                for model in cloud.CLAUDE_MODELS:
+                    st.button(f"Test {model.split('-')[1].capitalize()}", key=f"claude_test_{model}",
+                              on_click=test_cloud_model, args=(cloud.claude_ref(model),), type="tertiary",
+                              help="Send a one-word request (a fraction of a cent) to check the key works.")
+
+        st.markdown("**OpenAI-compatible endpoints**")
+        st.caption("Any service with an OpenAI-style `/v1/chat/completions`: LM Studio (`http://localhost:1234/v1`), "
+                   "llama.cpp server, vLLM, OpenRouter (`https://openrouter.ai/api/v1`), Groq, a company gateway. "
+                   "Its models are listed from `/models` (refreshed every minute) as ☁ *name*/*model*. Renaming an "
+                   "endpoint changes its models' names, so re-pick them where they were chosen.")
+        for index, endpoint in enumerate(cloud_settings()["endpoints"]):
+            name = endpoint.get("name", "")
+            with st.container(border=True, key=f"endpoint_box_{index}"):
+                with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+                    st.text_input("Name", value=name, key=f"endpoint_name_{index}", width=170,
+                                  on_change=update_endpoint, args=(index, "name", f"endpoint_name_{index}"))
+                    st.text_input("Base URL", value=endpoint.get("base_url", ""), key=f"endpoint_url_{index}",
+                                  placeholder="https://…/v1",
+                                  on_change=update_endpoint, args=(index, "base_url", f"endpoint_url_{index}"))
+                    st.toggle("On", value=bool(endpoint.get("enabled", True)), key=f"endpoint_on_{index}",
+                              on_change=update_endpoint, args=(index, "enabled", f"endpoint_on_{index}"))
+                with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+                    has_key = bool(cloud.get_key(cloud.key_account("openai", name)))
+                    st.text_input("API key" + (" (saved)" if has_key else ""), type="password",
+                                  key=f"endpoint_key_{index}", placeholder="Saved: type to replace" if has_key else "",
+                                  on_change=update_endpoint, args=(index, "key", f"endpoint_key_{index}"),
+                                  help="Stored in the macOS Keychain. Leave empty for local servers that need none.")
+                    st.number_input("Context window (tokens)", min_value=2048, step=1024,
+                                    value=int(endpoint.get("context") or cloud.OPENAI_DEFAULT_CONTEXT),
+                                    key=f"endpoint_ctx_{index}", width=200,
+                                    on_change=update_endpoint, args=(index, "context", f"endpoint_ctx_{index}"),
+                                    help="How much the app sends these models at most (notes budget and fit checks).")
+                    st.button("Remove", key=f"endpoint_remove_{index}", on_click=remove_endpoint, args=(index,),
+                              type="tertiary", icon=":material/delete:")
+                models = endpoint_model_ids(name, endpoint.get("base_url", "")) if endpoint.get("base_url") else []
+                if not endpoint.get("base_url"):
+                    st.caption("Add its base URL to list its models.")
+                elif models:
+                    st.caption(f":material/check_circle: {len(models)} model{'' if len(models) == 1 else 's'}: "
+                               + ", ".join(f"`{m}`" for m in models[:8]) + (" …" if len(models) > 8 else ""))
+                else:
+                    st.caption(":material/error: No models listed: check the URL (usually ending in `/v1`) and key.")
+        st.button("Add endpoint", key="endpoint_add", icon=":material/add:", on_click=add_endpoint)
 
 
 def render_configure_page() -> None:
@@ -7008,6 +7464,7 @@ def render_configure_page() -> None:
 
     render_configure_notes_section()
     render_configure_models_section()
+    render_configure_providers_section()
     links = library.get("links", [])
     with st.expander(f"Connector and links (task executor) · {len(links)} link{'' if len(links) == 1 else 's'}",
                      expanded=False,
@@ -7754,12 +8211,7 @@ def render_corpus_visibility_controls(all_libraries: list[str]) -> None:
 
 
 def load_all_job_statuses() -> dict:
-    if not JOB_STATUS_PATH.exists():
-        return {}
-    try:
-        return json.loads(JOB_STATUS_PATH.read_text())
-    except Exception:
-        return {}
+    return read_json_dict(JOB_STATUS_PATH)
 
 
 def get_persisted_job_status(safe_lib: str) -> dict | None:
@@ -7768,10 +8220,10 @@ def get_persisted_job_status(safe_lib: str) -> dict | None:
 
 
 def save_persisted_job_status(safe_lib: str, status: dict) -> dict:
-    all_statuses = load_all_job_statuses()
-    all_statuses[safe_lib] = status
-    JOB_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    JOB_STATUS_PATH.write_text(json.dumps(all_statuses, indent=2))
+    with JSON_FILE_LOCK:
+        all_statuses = read_json_dict(JOB_STATUS_PATH, for_update=True)
+        all_statuses[safe_lib] = status
+        write_json_atomic(JOB_STATUS_PATH, all_statuses)
     return status
 
 
@@ -8153,6 +8605,8 @@ def follow_up_with_ollama(
     assistant = {"role": "assistant", "content": reply}
     if (usage or {}).get("tokens_per_second"):
         assistant["tokens_per_second"] = round(usage["tokens_per_second"], 1)
+    if usage.get("processing_time"):
+        assistant["seconds"] = round(usage["processing_time"], 1)
     return {"user": user_turn, "assistant": assistant}
 
 
@@ -8699,8 +9153,7 @@ def render_discussion_body(
             with st.chat_message(turn["role"]):
                 st.markdown(link_opportunity_names(turn["content"]))
                 if turn.get("model"):
-                    st.caption(f"`{turn['model']}`" + (f" · {turn['tokens_per_second']:.1f} tokens/s"
-                                                        if turn.get("tokens_per_second") else ""))
+                    st.caption(f"`{turn['model']}`" + speed_and_time(turn.get("tokens_per_second"), turn.get("seconds")))
                 if turn.get("fit_note"):
                     st.caption(f":material/content_cut: {turn['fit_note']}")
                 # Every turn can be copied. When the model was sent more than is shown (a step's prompt, or
@@ -9632,7 +10085,8 @@ def edit_space_types(prompts: list[dict]) -> list[str]:
     types = []
     for prompt in prompts:
         output = get_prompt_output_type(prompt)
-        for item_type in (["update", "task"] if output == "next_step" else [output]):
+        kinds = (["update", "task"] if next_step_chases(prompt) else ["update"]) if output == "next_step" else [output]
+        for item_type in kinds:
             if item_type not in types:
                 types.append(item_type)
     return types
@@ -9742,7 +10196,18 @@ def corpus_prompt_for(lib_key: str | None) -> str:
     return str(get_corpus_config(str(lib_key)).get("corpus_prompt") or "")
 
 
-def render_edit_space_tools(staged: dict, model: str, corpus_text: str) -> None:
+def agent_redraft(search_state: dict, model: str, max_tokens: int, temperature: float, corpus_prompt: str):
+    """LLM Redraft for the Agent edit space: the discussion the cards were drafted from (with its notes), then the
+    passage and the corrections."""
+    def redraft(passage: str, whole: bool, label: str, instruction: str, _current: str):
+        messages = build_discussion_messages(search_state, max_tokens, temperature, corpus_prompt)
+        messages.append({"role": "user", "content": f"From this conversation you drafted records for Salesforce; "
+                         f"this is from one of them ({label}). " + redraft_request(passage, whole, label, instruction)})
+        return messages, model, ""
+    return redraft
+
+
+def render_edit_space_tools(staged: dict, model: str, corpus_text: str, redraft=None) -> None:
     """Under the cards, for all of them: Dictate (into the box the cursor was in, else asks where), and LLM
     Drafting Help (the box the cursor was in, else the first card's main box; the suggestion shows under that
     box's card)."""
@@ -9758,7 +10223,7 @@ def render_edit_space_tools(staged: dict, model: str, corpus_text: str) -> None:
     main = EDIT_CARD_MAIN_BOX[first] if len(items) == 1 else f"{EDIT_CARD_MAIN_BOX[first]} (1)"
     render_edit_dictation(f"agent_edit_dictate_{staged['id']}", "agent_staging", boxes=boxes)
     render_drafting_help("agent_staging", boxes, main, model, corpus_text,
-                         suggestion_scope=lambda widget_key: cards.get(widget_key, "agent_staging"))
+                         suggestion_scope=lambda widget_key: cards.get(widget_key, "agent_staging"), redraft=redraft)
 
 
 def render_edit_space_card(agent: dict, index: int, item: dict) -> None:
@@ -9935,7 +10400,7 @@ def render_agent_panel(
                           on_click=add_edit_space_item, args=(search_state, prompts),
                           help=f"Skip the LLM: a blank card to write the {EDIT_SPACE_NAMES[edit_space_types(prompts)[0]]} "
                                "in, with its opportunity picked from a list. **Send** sends it, held for review first.")
-        if clicked or auto_execute:
+        if clicked or auto_execute or agent.pop("redraft", False):
             agent["auto_drafted"] = True
             if (agent.get("staged") or {}).get("held"):
                 finish_held(agent)  # the one already held stays held, and is listed under Sent
@@ -9963,6 +10428,8 @@ def render_agent_panel(
                     st.error(f"Couldn't stage the {item_kind}: {exc}")
                 else:
                     agent.pop("drafting", None)
+                    agent["staged"]["prompt_fps"] = {prompt["id"]: prompt_fingerprint(prompt, AGENT_DRAFT_FIELDS)
+                                                     for prompt in prompts}  # to tell when they're edited since
                     if edit:  # into the edit space: nothing sent until Send
                         agent["staged"]["edit"] = True
                         if not agent["staged"]["items"]:
@@ -9976,6 +10443,45 @@ def render_agent_panel(
     # Under Execute, in the dock (which scrolls within itself when it's taller than the window).
     with review:
         render_agent_review(search_state, prompts, source_notes, model_name, max_tokens, temperature, corpus_prompt)
+
+
+# "Made by" a stored prompt: wherever something was made from a prompt you keep (the Agent edit space, a Note-
+# Workflow stage, LLM Drafting, a Chat with a library prompt), a link opens that prompt to correct it at source, and
+# a re-run button shows once it's been changed since. It checks every few seconds, so the button turns up when you
+# come back from editing the prompt in its own tab.
+AGENT_DRAFT_FIELDS = ("command", "output", "command_references", "model", "chase_task")  # what drafting the cards uses
+
+
+def prompt_changed_since(prompt_id: str, fingerprint: str | None, fields=PROMPT_VERSION_FIELDS) -> bool:
+    prompt = find_prompt(load_prompt_library(), prompt_id)
+    return bool(prompt and fingerprint and prompt_fingerprint(prompt, fields) != fingerprint)
+
+
+def render_made_by(key: str, links: list[tuple[str, str, str]], changed: bool, rerun_label: str, rerun_help: str,
+                   on_rerun, scope: str = "app") -> None:
+    """The prompts something was made by, as links ((label, url, help)), and the re-run button if one changed.
+    `on_rerun` is called on the click, then the page runs again."""
+    with st.container(horizontal=True, gap="small", vertical_alignment="center", key=key):
+        st.caption(":material/link: Made by", width="content")
+        for label, url, link_help in links:
+            st.link_button(label, url, icon=":material/open_in_new:", type="tertiary", help=link_help)
+        if changed and st.button(rerun_label, icon=":material/refresh:", key=f"{key}_rerun", type="primary",
+                                 help=rerun_help):
+            on_rerun()
+            st.rerun(scope=scope)
+
+
+@st.fragment(run_every="5s")
+def render_made_by_live(key: str, links: list[tuple[str, str, str]], changed, rerun_label: str, rerun_help: str,
+                        on_rerun, scope: str = "app") -> None:
+    """render_made_by, checking `changed()` again every few seconds."""
+    render_made_by(key, links, changed(), rerun_label, rerun_help, on_rerun, scope)
+
+
+def prompt_link(prompt: dict, what: str = "") -> tuple[str, str, str]:
+    return (prompt.get("name") or "the prompt", f"{PROMPT_LIBRARY_PAGE_URL}&prompt={prompt['id']}",
+            f"Open {what or 'this prompt'} in the Prompt library (a new tab), to correct it at source. Its versions "
+            "are kept there (**History**).")
 
 
 EDIT_SPACE_ADD_LABELS = {"note": "Add a note for a different opportunity", "task": "Add another task",
@@ -10059,6 +10565,16 @@ def render_agent_review(
                             + "Nothing is sent until you press **Send with Agent**.")
                 if staged.get("summary") and staged.get("model"):
                     st.caption(staged["summary"])
+                if staged.get("prompt_fps"):  # drafted by the Agent(s): link to them, re-draft once edited
+                    fps = staged["prompt_fps"]
+                    render_made_by_live(
+                        "agent_made_by", [prompt_link(prompt, "this Agent's Action Command") for prompt in prompts],
+                        lambda: any(prompt_changed_since(pid, fp, AGENT_DRAFT_FIELDS) for pid, fp in fps.items()),
+                        "Re-draft with the edited prompt",
+                        "The Agent's Action Command (or its output, documents or model) has changed since these "
+                        "cards were drafted: draft them again with it. **Replaces the cards and your edits to them.** "
+                        "(Changes to the collection prompt or steps apply when you ask again.)",
+                        lambda: agent.update(redraft=True))
             else:
                 st.markdown(f"**Staged — not sent**  \n{staged['summary']}")
             if any(i["type"] == "update" for i in staged["items"]) and not profile_short_name(load_prompt_library()):
@@ -10103,7 +10619,10 @@ def render_agent_review(
                     )
             if editing and not held:  # the tools: Dictate, About me, Corpus prompt, LLM Drafting
                 with st.container(horizontal=True, gap="small", vertical_alignment="center"):
-                    render_edit_space_tools(staged, model_name, corpus_prompt_for(search_state.get("library")))
+                    render_edit_space_tools(staged, model_name, corpus_prompt_for(search_state.get("library")),
+                                            redraft=agent_redraft(search_state, model_name, max_tokens, temperature,
+                                                                  corpus_prompt))
+                render_redraft_box("agent_staging", "the Agent's discussion and its notes")
             with st.container(horizontal=True, gap="small"):
                 if held:
                     st.button("Send now", key=f"agent_release_{staged['id']}", type="primary", icon=":material/send:",
@@ -10295,6 +10814,7 @@ def render_search_results(
                 st.subheader("Answer", width="content")
                 render_copy_buttons([("Copy all output", full_llm_output(search_state))])
             st.markdown(link_opportunity_names(search_state["answer"]))
+            render_served_by(search_state.get("usage"), search_state.get("model") or "")
             if search_state.get("agent"):  # an Agent's answer leads to its drafts: Narrate rewrites it, no re-ask
                 ask_model = search_state.get("model") or DEFAULT_OLLAMA_MODEL
                 ask_key = f"ask_voice_{search_state.get('id', '')}"
@@ -10337,9 +10857,8 @@ def render_search_results(
             if processing_time is not None:
                 st.caption(
                     f"Model: `{search_state['model']}` · "
-                    f"{usage.get('total', '?')} tokens · "
-                    f"{processing_time:.1f}s"
-                    + (f" · {usage['tokens_per_second']:.1f} tokens/s" if usage.get("tokens_per_second") else "")
+                    f"{usage.get('total', '?')} tokens"
+                    + speed_and_time(usage.get("tokens_per_second"), processing_time)
                     + "".join(f" · {part}" for part in search_state.get("prompt_parts", []))
                 )
             if search_state.get("fit_note"):
@@ -11669,6 +12188,108 @@ def get_last_updated(corpus_folder: Path) -> str | None:
 
 
 def discover_ollama_models(host: str = OLLAMA_HOST, port: int = OLLAMA_PORT) -> tuple[bool, list[str]]:
+    """Every model the app can answer with: Ollama's installed models, then the cloud models set up under
+    Configure > Models and providers (none while Local models only is on). True if any of them can be used."""
+    ok, local = discover_local_models(host, port)
+    remote = cloud_model_names()
+    return ok or bool(remote), local + remote
+
+
+LOCAL_ONLY_SETTING = "local_models_only"  # app setting: answer with Ollama models only (default on)
+LOCAL_FALLBACK_SETTING = "local_fallback_model"  # app setting: the Ollama model used when a cloud model can't answer
+CLAUDE_EFFORT_SETTING = "claude_effort"  # app setting: how hard Claude thinks (low / medium / high)
+OPENAI_ENDPOINTS_SETTING = "openai_endpoints"  # app setting: [{name, base_url, context, enabled}]; keys in Keychain
+
+
+def local_models_only() -> bool:
+    return bool(load_app_settings().get(LOCAL_ONLY_SETTING, True))
+
+
+def cloud_settings() -> dict:
+    settings = load_app_settings()
+    return {"effort": settings.get(CLAUDE_EFFORT_SETTING) or "medium",
+            "endpoints": list(settings.get(OPENAI_ENDPOINTS_SETTING) or [])}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def claude_key_source() -> str:
+    return cloud.claude_key_source()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def endpoint_model_ids(name: str, base_url: str) -> list[str]:
+    """An OpenAI-compatible endpoint's models (checked at most every minute); [] if it can't be reached."""
+    try:
+        return [m["id"] for m in cloud.openai_models(base_url, cloud.get_key(cloud.key_account("openai", name)))]
+    except Exception:
+        return []
+
+
+def cloud_model_names() -> list[str]:
+    """The cloud models to offer in model lists: both Claude models once a key is set, and each enabled
+    OpenAI-compatible endpoint's models. None while Local models only is on."""
+    if local_models_only():
+        return []
+    names = [cloud.claude_ref(model) for model in cloud.CLAUDE_MODELS] if claude_key_source() else []
+    for endpoint in cloud_settings()["endpoints"]:
+        if endpoint.get("enabled", True) and endpoint.get("name") and endpoint.get("base_url"):
+            names += [cloud.openai_ref(endpoint["name"], m) for m in endpoint_model_ids(endpoint["name"],
+                                                                                       endpoint["base_url"])]
+    return names
+
+
+def local_fallback_model() -> str:
+    """The Ollama model that answers when a cloud model can't: the one set in Configure, else the default chat
+    model, else the app's default, else the first installed."""
+    settings = load_app_settings()
+    ok, local = discover_local_models()
+    saved = settings.get(LOCAL_FALLBACK_SETTING) or ""
+    if saved and (saved in local or not ok):
+        return saved
+    for model in (settings.get(CHAT_DEFAULT_MODEL_SETTING) or "", DEFAULT_OLLAMA_MODEL):
+        if model and not cloud.is_cloud(model) and model in local:
+            return model
+    return local[0] if local else DEFAULT_OLLAMA_MODEL
+
+
+def route_model(model: str, local_only: bool = False) -> tuple[str, str]:
+    """(the model to ask, a note when it isn't the one picked). A cloud model goes to the local fallback when
+    `local_only` (an in-confidence chat), when Local models only is on, or when its service can't be reached."""
+    if not cloud.is_cloud(model):
+        return model, ""
+    if local_only:
+        why = "in-confidence chats stay on this Mac"
+    elif local_models_only():
+        why = "**Local models only** is on"
+    elif not cloud.is_reachable(model, cloud_settings()):
+        why = "it can't be reached just now (offline?)"
+    else:
+        return model, ""
+    fallback = local_fallback_model()
+    return fallback, f"Answered by the local fallback `{fallback}` instead of {cloud.describe(model)}: {why}."
+
+
+def fallback_note(model: str, error: Exception, fallback: str) -> str:
+    return f"{cloud.describe(model)} couldn't answer ({error}), so the local fallback `{fallback}` did."
+
+
+def open_chat_stream(model: str, payload: dict, host: str = OLLAMA_HOST, port: int = OLLAMA_PORT):
+    """A streamed reply from `model`, cloud or Ollama, as Ollama /api/chat lines (see OllamaChatStream)."""
+    if cloud.is_cloud(model):
+        return cloud.CloudChatStream(model, {**payload, "model": model}, cloud_settings())
+    return OllamaChatStream(host, port, {**payload, "model": model})
+
+
+def render_served_by(usage: dict | None, model: str) -> None:
+    """Under an answer: which model wrote it when it was a cloud model or the local fallback."""
+    usage = usage or {}
+    if usage.get("fallback_note"):
+        st.caption(":material/cloud_off: " + usage["fallback_note"])
+    elif cloud.is_cloud(usage.get("model") or model or ""):
+        st.caption(f":material/cloud: Written by {cloud.describe(usage.get('model') or model)} (cloud).")
+
+
+def discover_local_models(host: str = OLLAMA_HOST, port: int = OLLAMA_PORT) -> tuple[bool, list[str]]:
     """Return whether Ollama is reachable and which models are installed locally."""
     try:
         import requests
@@ -11857,6 +12478,107 @@ def cancel_llm() -> None:
     st.session_state[LLM_CANCELLED_KEY] = True
 
 
+# Read aloud when ready: beside Cancel Query in Chat with LLM, two switches that only mark this browser tab (a
+# click on a real widget would rerun the page, which stops the answer being written). The answer's voice tools
+# then read the mark (READ_READY_HOOK_JS): "focus" plays it once you're back on this tab, "now" plays it at once,
+# even while you're elsewhere.
+READ_READY_STORE = "llmNotesReadWhenReady"
+READ_READY_CSS = """
+.rr { font: inherit; font-size: 0.85rem; font-weight: 600; min-height: 2.5rem; padding: 0 12px; cursor: pointer;
+      border-radius: var(--st-button-radius, 0.5rem); white-space: nowrap; margin-right: 6px;
+      color: #fff; background: rgb(60, 60, 70); border: 1px solid rgb(110, 110, 125);
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); }
+.rr:hover { background: rgb(80, 80, 92); }
+.rr.on { background: rgb(28, 131, 225); border-color: rgb(28, 131, 225); }
+"""
+READ_READY_JS = """
+export default function (component) {
+  const { data, parentElement } = component
+  const KEY = "%s"
+  const read = () => { try { return JSON.parse(sessionStorage.getItem(KEY) || "null") } catch (e) { return null } }
+  const buttons = [...parentElement.querySelectorAll("button")]
+  const paint = () => {
+    const arm = read()
+    for (const b of buttons) {
+      const on = !!arm && arm.call === data.call && arm.mode === b.dataset.mode
+      b.classList.toggle("on", on)
+      b.textContent = (on ? "\\u2713 " : "") + b.dataset.label
+    }
+  }
+  for (const b of buttons) {
+    b.onmousedown = (event) => event.preventDefault()
+    b.onclick = () => {
+      const arm = read()
+      try {
+        if (arm && arm.call === data.call && arm.mode === b.dataset.mode) sessionStorage.removeItem(KEY)
+        else sessionStorage.setItem(KEY, JSON.stringify({ call: data.call, mode: b.dataset.mode }))
+      } catch (e) {}
+      paint()
+    }
+  }
+  paint()
+}
+""" % READ_READY_STORE
+READ_READY_HOOK_JS = """
+export default function (component) {
+  const { data, setTriggerValue } = component
+  const KEY = "%s"
+  let arm = null
+  try { arm = JSON.parse(sessionStorage.getItem(KEY) || "null") } catch (e) {}
+  if (!arm || arm.call !== data.call) return
+  const fire = () => { try { sessionStorage.removeItem(KEY) } catch (e) {} setTriggerValue("play", data.call) }
+  if (arm.mode === "now" || (document.visibilityState === "visible" && document.hasFocus())) { fire(); return }
+  const back = () => { if (document.visibilityState === "visible") { cleanup(); fire() } }
+  const cleanup = () => { window.removeEventListener("focus", back); document.removeEventListener("visibilitychange", back) }
+  window.addEventListener("focus", back)
+  document.addEventListener("visibilitychange", back)
+  return cleanup
+}
+""" % READ_READY_STORE
+_read_ready = st.components.v2.component(
+    "read_ready",
+    html='<button type="button" class="rr" data-mode="focus" data-label="Read aloud when ready" '
+         'title="When the answer is ready, read it aloud once you\'re back on this tab. Go elsewhere meanwhile."></button>'
+         '<button type="button" class="rr" data-mode="now" data-label="Read aloud now, don\'t wait" '
+         'title="Read the answer aloud as soon as it\'s ready, even while you\'re in another tab or app."></button>',
+    css=READ_READY_CSS, js=READ_READY_JS)
+_read_ready_hook = st.components.v2.component("read_ready_hook", html="<span></span>", js=READ_READY_HOOK_JS)
+LLM_CALL_ID_KEY = "llm_call_id"  # the Cancel Query bar on screen now: which call it's for
+FRESH_ANSWERS_KEY = "llm_fresh_answers"  # {call id: {"text", "at"}}: answers just written, for Read aloud when ready
+FRESH_ANSWER_SECONDS = 1800
+
+
+def answer_key_text(text: str) -> str:
+    """An answer's text, comparable however it's shown (thinking dropped, spacing evened out)."""
+    text = re.sub(r"<think>.*?</think>", "", str(text or ""), flags=re.DOTALL)
+    return re.sub(r"\s+", " ", text).strip()[:160]
+
+
+def remember_fresh_answer(answer: str) -> None:
+    """An LLM call with a Cancel Query bar has finished: its answer can be read aloud when ready."""
+    call = st.session_state.get(LLM_CALL_ID_KEY)
+    if not call or not answer_key_text(answer):
+        return
+    fresh = {c: v for c, v in (st.session_state.get(FRESH_ANSWERS_KEY) or {}).items()
+             if time.time() - v["at"] < FRESH_ANSWER_SECONDS}
+    fresh[call] = {"text": answer_key_text(answer), "at": time.time()}
+    st.session_state[FRESH_ANSWERS_KEY] = fresh
+
+
+def fresh_answer_call(text: str) -> str | None:
+    """The call that just wrote this answer, if it was written lately."""
+    key = answer_key_text(text)
+    for call, value in (st.session_state.get(FRESH_ANSWERS_KEY) or {}).items():
+        if key and time.time() - value["at"] < FRESH_ANSWER_SECONDS and (key in value["text"] or value["text"] in key):
+            return call
+    return None
+
+
+def play_ready_answer(target: str, text: str, call: str) -> None:
+    (st.session_state.get(FRESH_ANSWERS_KEY) or {}).pop(call, None)
+    play_answer(target, text)
+
+
 def show_llm_cancel_button(extra=None):
     """A floating orange Cancel Query for the LLM call about to run; returns its slot, to clear when the call ends.
 
@@ -11869,6 +12591,10 @@ def show_llm_cancel_button(extra=None):
         st.html(LLM_CANCEL_STYLE)
         if extra:
             extra()
+        call = uuid.uuid4().hex[:12]
+        st.session_state[LLM_CALL_ID_KEY] = call
+        if st.query_params.get("page") == CHAT_PAGE and shutil.which("say"):  # Chat: read the reply when ready
+            _read_ready(key=f"read_ready_{number}", data={"call": call}, width="content")
         dictated = bool(st.session_state.get(DICTATED_KEY))
         st.button(
             "Stop and edit" if dictated else "Cancel Query",
@@ -11921,7 +12647,29 @@ class OllamaChatStream:
         self.conn.close()
 
 
-def chat_with_ollama(
+def chat_with_ollama(messages: list[dict], model_name: str, *args, local_only: bool = False, **kwargs) -> tuple[str, dict]:
+    """Send a chat conversation to `model_name` and return (reply, usage): an Ollama model, or a cloud model
+    (Claude, an OpenAI-compatible endpoint). A cloud model that can't be used or fails goes to the local fallback
+    (see route_model); usage then has "fallback_note", and "model" is the model that answered. `local_only` keeps
+    it on this Mac (in-confidence chats). Everything else as chat_once."""
+    picked = model_name
+    model_name, note = route_model(model_name, local_only)
+    if note and not local_only and not local_models_only():  # offline: say so (the setting needs no reminder)
+        st.toast(note, icon=":material/cloud_off:")
+    try:
+        answer, usage = chat_once(messages, model_name, *args, **kwargs)
+    except cloud.CloudError as exc:
+        fallback = local_fallback_model()
+        note = fallback_note(picked, exc, fallback)
+        st.toast(note, icon=":material/cloud_off:")
+        # Without the extra controls beside Cancel: they were drawn for the first attempt in this page run.
+        answer, usage = chat_once(messages, fallback, *args, **{**kwargs, "cancel_extra": None})
+        model_name = fallback
+    usage.update(model=usage.get("served_by") or model_name, fallback_note=note)
+    return answer, usage
+
+
+def chat_once(
     messages: list[dict],
     model_name: str,
     host: str = OLLAMA_HOST,
@@ -11936,7 +12684,8 @@ def chat_with_ollama(
     on_text=None,
     extra_options: dict | None = None,
 ) -> tuple[str, dict]:
-    """Send a chat conversation to a local Ollama model and return (reply, usage).
+    """Send a chat conversation to one model (no fallback) and return (reply, usage). A cloud model's failure
+    raises cloud.CloudError.
 
     `response_format` is a JSON schema; Ollama then constrains the reply to match it.
     `think=False` asks a reasoning model (e.g. Qwen3) to answer without thinking first; other models ignore it.
@@ -11969,7 +12718,7 @@ def chat_with_ollama(
         payload["think"] = think
 
     try:
-        stream = OllamaChatStream(host, port, payload)
+        stream = open_chat_stream(model_name, payload, host, port)
     except OSError as exc:
         raise RuntimeError(
             f"Could not reach Ollama at `{host}:{port}`. "
@@ -11992,6 +12741,8 @@ def chat_with_ollama(
                 status, body = value
                 raise RuntimeError(f"Ollama returned HTTP {status} for model `{model_name}`: {body}")
             if kind == "error":
+                if isinstance(value, cloud.CloudError):
+                    raise value
                 raise RuntimeError(
                     f"Lost the connection to Ollama while `{model_name}` was answering: {value}"
                 ) from value
@@ -12034,6 +12785,8 @@ def chat_with_ollama(
             f"Ollama model `{model_name}` used its whole token budget thinking and gave no answer. "
             "Raise **Max tokens** and try again."
         )
+    if not answer and cloud.is_cloud(model_name):
+        raise cloud.CloudError("it returned an empty answer")
     if not answer:
         raise RuntimeError(
             f"Ollama model `{model_name}` returned an empty answer. "
@@ -12058,8 +12811,10 @@ def chat_with_ollama(
         if data.get("prompt_eval_duration") else None,
         "num_ctx": options["num_ctx"],
         "done_reason": data.get("done_reason"),  # "length" when Max tokens cut it short
+        "served_by": data.get("served_by"),  # a cloud model's own name for itself
     }
     queue_task_notification(seconds=time.monotonic() - call_started)
+    remember_fresh_answer(answer)
     return answer, usage
 
 
@@ -12139,6 +12894,7 @@ def record_llm_speed(model: str, usage: dict | None) -> None:
     speeds[model] = {
         "tokens_per_second": round(tokens_per_second, 1),
         "tokens": (usage or {}).get("output"),
+        "seconds": round((usage or {}).get("processing_time") or 0, 1) or None,
         "at": datetime.datetime.now().isoformat(timespec="seconds"),
     }
     save_app_settings({LLM_SPEED_KEY: speeds})
@@ -12156,7 +12912,8 @@ def describe_llm_speed(model: str) -> str:
     tokens_per_second = record["tokens_per_second"]
     when = datetime.datetime.fromisoformat(record["at"]).strftime("%d %b %H:%M")
     return (
-        f"Last run with `{model}` ({when}): {tokens_per_second:.1f} tokens/s · "
+        f"Last run with `{model}` ({when}): {tokens_per_second:.1f} tokens/s"
+        + (f", took {format_seconds(record['seconds'])}" if record.get("seconds") else "") + " · "
         f"**{SPEED_BENCHMARK_TOKENS:,} tokens ≈ {format_duration(SPEED_BENCHMARK_TOKENS / tokens_per_second)}**"
     )
 
@@ -13280,6 +14037,40 @@ export default function () {
 """
 _full_text_tooltips = st.components.v2.component("full_text_tooltips", html="<span></span>", js=FULL_TEXT_TOOLTIPS_JS)
 
+# Fold the sidebar when the window is narrow: on opening the page that narrow, and when it's narrowed past the
+# line. You can open it again while narrow; it isn't folded again until the window has been wider in between.
+NARROW_SIDEBAR_WIDTH = 1100
+NARROW_SIDEBAR_JS = """
+export default function (component) {
+  const narrowAt = (component.data && component.data.width) || 1100
+  if (window.__llmNotesNarrowSidebar) return
+  window.__llmNotesNarrowSidebar = true
+  let wasNarrow = false
+  let timer = null
+  const fold = () => {
+    const bar = document.querySelector('[data-testid="stSidebar"]')
+    if (!bar || bar.getAttribute("data-collapsed") === "true") return
+    const button = document.querySelector('[data-testid="stSidebarCollapseButton"] button')
+      || document.querySelector('[data-testid="stSidebarCollapseButton"]')
+    if (button) button.click()
+  }
+  const check = () => {
+    const narrow = window.innerWidth < narrowAt
+    if (narrow && !wasNarrow) fold()
+    wasNarrow = narrow
+  }
+  setTimeout(check, 300)  // once the sidebar is drawn
+  window.addEventListener("resize", () => { clearTimeout(timer); timer = setTimeout(check, 250) })
+}
+"""
+_narrow_sidebar = st.components.v2.component("narrow_sidebar", html="<span></span>", js=NARROW_SIDEBAR_JS)
+
+
+def install_narrow_sidebar() -> None:
+    """Every page: fold the sidebar when the window is narrow (see NARROW_SIDEBAR_JS)."""
+    with st.sidebar:
+        _narrow_sidebar(key="narrow_sidebar", data={"width": NARROW_SIDEBAR_WIDTH})
+
 
 # --- Notifications: LLM work that finishes while you're away from the tab --------------------------------------
 NOTIFY_SETTING = "notify_when_away"
@@ -13562,6 +14353,8 @@ export default function (component) {
       const box = event.target
       if (!(box && box.matches && box.matches("textarea, input[type=text]"))) return
       window.__llmNotesLastBox = box
+      // LLM Drafting refines the last box typed or selected in that isn't a corrections box (for LLM Redraft)
+      if (!box.closest('[class*="_redraft_text"]')) window.__llmNotesLastDraftBox = box
       box.__caret = [box.selectionStart, box.selectionEnd]
     }
     for (const type of ["focusin", "keyup", "mouseup", "select", "input"]) document.addEventListener(type, remember, true)
@@ -13617,26 +14410,42 @@ export default function (component) {
       const box = event.target
       if (!(box && box.matches && box.matches("textarea, input[type=text]"))) return
       window.__llmNotesLastBox = box
+      // LLM Drafting refines the last box typed or selected in that isn't a corrections box (for LLM Redraft)
+      if (!box.closest('[class*="_redraft_text"]')) window.__llmNotesLastDraftBox = box
       box.__caret = [box.selectionStart, box.selectionEnd]
     }
     for (const type of ["focusin", "keyup", "mouseup", "select", "input"]) document.addEventListener(type, remember, true)
   }
+  if (!window.__llmRedraftButtons) {  // typing in a corrections box makes its button LLM Redraft (and back, emptied)
+    window.__llmRedraftButtons = {}
+    document.addEventListener("input", (event) => {
+      for (const [cls, entry] of Object.entries(window.__llmRedraftButtons)) {
+        if (event.target.closest && event.target.closest("." + cls)) entry.show(!!event.target.value.trim())
+      }
+    }, true)
+  }
   const button = parentElement.querySelector("button")
-  button.textContent = data.label || "LLM Drafting"
-  button.title = data.help || ""
+  const show = (redraft) => {
+    button.textContent = redraft ? (data.redraftLabel || "LLM Redraft") : (data.label || "LLM Drafting")
+    button.title = (redraft ? data.redraftHelp : data.help) || ""
+  }
+  show(!!(data.redraft && data.hasText))
+  if (data.redraft) window.__llmRedraftButtons[data.redraft] = { show }
   button.disabled = !!data.disabled
   button.onmousedown = (event) => event.preventDefault()  // the box keeps its selection
   button.onclick = () => {
     const scope = document.querySelector("." + data.scope)
     if (!scope) return
-    const last = window.__llmNotesLastBox
-    const box = last && scope.contains(last) ? last : scope.querySelector(data.fallback || "textarea")
+    const last = window.__llmNotesLastDraftBox
+    const box = last && scope.contains(last) ? last
+      : [...scope.querySelectorAll(data.fallback || "textarea")].find((b) => !b.closest('[class*="_redraft_text"]'))
     if (!box) return
     const [start, end] = box.__caret || [0, 0]
     const holder = box.closest('[class*="st-key-"]')
     const keyClass = holder ? [...holder.classList].find((c) => c.startsWith("st-key-")) : ""
+    const corrections = data.redraft ? document.querySelector("." + data.redraft + " textarea") : null
     setTriggerValue("ask", { label: box.getAttribute("aria-label") || "", key: (keyClass || "").slice(7),
-                             start, end, value: box.value || "" })
+                             start, end, value: box.value || "", instruction: corrections ? corrections.value : "" })
   }
 }
 """
@@ -13704,13 +14513,81 @@ def drafting_reply(messages: list[dict], model: str, passage: str) -> str:
     return split_inline_thinking(reply)[1].strip()
 
 
+# LLM Redraft: with corrections typed in the box under an edit space, LLM Drafting becomes LLM Redraft, which asks
+# again with the context the draft was written from (its notes, prompt and conversation) instead of only the LLM
+# Drafting Prompt, plus the corrections and the saved Semantic Fixes.
+def redraft_key(scope: str) -> str:
+    return f"{scope}_redraft_text"  # its CSS class has "_redraft_text": the drafting button never refines it
+
+
+def render_redraft_box(scope: str, what: str) -> None:
+    """The corrections box for `scope`'s LLM Redraft (emptied after Replace mine). `what`: the context it uses."""
+    key = redraft_key(scope)
+    if st.session_state.pop(f"{key}_clear", False):
+        st.session_state[key] = ""  # set (not dropped), so the box on screen empties too
+    st.text_area("Corrections for LLM Redraft", key=key, height="content", label_visibility="collapsed",
+                 placeholder="Corrections for LLM Redraft, e.g. Acme is one word; we agreed Tuesday, not Monday",
+                 help=f"Type what's wrong or should change and **LLM Drafting** becomes **LLM Redraft**: it redrafts "
+                      f"the passage selected (or the whole box) with {what}, these corrections and your saved "
+                      "**Semantic Fixes**. Empty, the button only polishes the wording, with the LLM Drafting Prompt.")
+
+
+def redraft_request(passage: str, whole: bool, label: str, instruction: str) -> str:
+    """The last message of an LLM Redraft: the passage, the corrections, and the saved Semantic Fixes."""
+    fixes = [str(f.get("text", "")).strip() for f in semantic_fixes() if str(f.get("text", "")).strip()]
+    piece = "text" if whole else "passage"
+    return (f"Redraft {'the' if whole else 'this passage from the'} {label.lower()} you wrote, applying my "
+            f"corrections. Use the notes and everything above for the facts.\n\nThe {piece}:\n{passage}\n\n"
+            f"My corrections:\n{instruction.strip()}"
+            + ("\n\nStanding corrections (apply any that are relevant):\n" + "\n".join(f"- {fix}" for fix in fixes)
+               if fixes else "")
+            + "\n\nKeep everything the corrections don't touch, in the same style and about the same length. "
+              f"Return only the redrafted {piece}: no preamble, quotes or notes about what you changed.")
+
+
+def redraft_reply(messages: list[dict], model: str, passage: str) -> str:
+    """Ask for the redrafted passage: the context window sized to fit, with room for a longer passage."""
+    reply, _usage = chat_with_ollama(messages, model, max_tokens=max(len(passage) // 2 + 1024, 1024),
+                                     temperature=0.2, think=False)
+    return split_inline_thinking(reply)[1].strip()
+
+
+def drafting_fingerprint() -> str:
+    """What LLM Drafting does now (its prompt, what to refine, its model): to tell when it's edited since."""
+    library = load_prompt_library()
+    config = library.get("drafting_prompt") or {}
+    return text_fingerprint(json.dumps([drafting_prompt(library), config.get("aspect"), config.get("aspect_other"),
+                                        config.get("model")]))
+
+
+def redo_drafting_suggestion(pending: dict) -> None:
+    """Refine the same passage again, with the LLM Drafting Prompt as it is now."""
+    config = load_prompt_library().get("drafting_prompt") or {}
+    model = str(config.get("model") or "") or pending.get("fallback_model") or pending["model"]
+    aspect = config.get("aspect") if config.get("aspect") in DRAFTING_ASPECTS else "all"
+    focus = str(config.get("aspect_other") or "") if aspect == "other" else DRAFTING_ASPECTS[aspect][1]
+    messages = drafting_messages(pending["passage"], pending.get("about_me", False), pending.get("corpus_text", ""),
+                                 focus)
+    with st.spinner(f"`{model}` is refining it again…"):
+        try:
+            suggestion = drafting_reply(messages, model, pending["passage"])
+        except RuntimeError as exc:
+            st.toast(f"Couldn't refine it again: {exc}", icon=":material/error:")
+            return
+    if suggestion:
+        pending.update(suggestion=suggestion, model=model, drafting_fp=drafting_fingerprint(),
+                       messages=messages + [{"role": "assistant", "content": suggestion}])
+
+
 def render_drafting_help(scope: str, boxes: dict[str, tuple[str, tuple]], main: str, model: str,
-                         corpus_text: str, suggestion_scope=None) -> None:
+                         corpus_text: str, suggestion_scope=None, redraft=None) -> None:
     """LLM Drafting for an edit space (the container keyed `scope`), with About me and Corpus prompt toggles.
     `boxes` is {box label: (its widget key, how it's saved: see save_drafted_box)}; `main` the label used with no
     box picked. The box is found by its widget key, else by its label.
     The suggestion shows side by side with yours under the box (render_drafting_suggestion), under the scope
-    `suggestion_scope(widget key)` gives (e.g. that box's card), else `scope`."""
+    `suggestion_scope(widget key)` gives (e.g. that box's card), else `scope`.
+    `redraft(passage, whole, label, corrections, box text) -> (messages, model, note)`: with corrections typed in
+    the box render_redraft_box(scope) draws, the button is LLM Redraft and asks with those messages."""
     settings = load_app_settings()
     toggles = {}
     for name, (label, setting) in DRAFTING_TOGGLES.items():
@@ -13723,7 +14600,14 @@ def render_drafting_help(scope: str, boxes: dict[str, tuple[str, tuple]], main: 
         key=f"{scope}_drafting", width="content",
         data={"scope": f"st-key-{scope}", "fallback": "textarea", "label": "LLM Drafting",
               "help": "Select a passage in a box to refine just that, or leave nothing selected for the whole box. "
-                      "Only that text goes to the LLM, with the LLM Drafting Prompt (Prompt library)."},
+                      "Only that text goes to the LLM, with the LLM Drafting Prompt (Prompt library). Type "
+                      "corrections in the box below to redraft with the notes instead.",
+              **({"redraft": f"st-key-{redraft_key(scope)}", "redraftLabel": "LLM Redraft",
+                  "hasText": not st.session_state.get(f"{redraft_key(scope)}_clear")  # emptied further down
+                             and bool(str(st.session_state.get(redraft_key(scope)) or "").strip()),
+                  "redraftHelp": "Redraft the selected passage (or the whole box) with your corrections, using the "
+                                 "notes and context the draft was written from, and your saved Semantic Fixes."}
+                 if redraft else {})},
         on_ask_change=lambda: None,
     )
     st.link_button("Drafting prompt and model", f"{PROMPT_LIBRARY_PAGE_URL}&open=drafting", type="tertiary",
@@ -13743,17 +14627,28 @@ def render_drafting_help(scope: str, boxes: dict[str, tuple[str, tuple]], main: 
     if not passage.strip():
         st.toast("Nothing to refine there: write something first, or select a passage.", icon=":material/edit_note:")
         return
-    config = load_prompt_library().get("drafting_prompt") or {}
-    model = str(config.get("model") or "") or model
-    aspect = config.get("aspect") if config.get("aspect") in DRAFTING_ASPECTS else "all"
-    focus = str(config.get("aspect_other") or "") if aspect == "other" else DRAFTING_ASPECTS[aspect][1]
-    messages = drafting_messages(passage, toggles["about_me"], corpus_text if toggles["corpus"] else "", focus)
-    with st.spinner(f"`{model}` is refining {'the passage' if not whole else label.lower()}…"):
+    instruction = str(ask.get("instruction") or "").strip() if redraft else ""
+    note = ""
+    if instruction:  # LLM Redraft: the draft's own context, with the corrections
         try:
-            suggestion = drafting_reply(messages, model, passage)
+            messages, model, note = redraft(passage, whole, label, instruction, value)
+            with st.spinner(f"`{model}` is redrafting {'the passage' if not whole else label.lower()}…"):
+                suggestion = redraft_reply(messages, model, passage)
         except RuntimeError as exc:
-            st.error(f"Couldn't refine it: {exc}")
+            st.error(f"Couldn't redraft it: {exc}")
             return
+    else:
+        config = load_prompt_library().get("drafting_prompt") or {}
+        model = str(config.get("model") or "") or model
+        aspect = config.get("aspect") if config.get("aspect") in DRAFTING_ASPECTS else "all"
+        focus = str(config.get("aspect_other") or "") if aspect == "other" else DRAFTING_ASPECTS[aspect][1]
+        messages = drafting_messages(passage, toggles["about_me"], corpus_text if toggles["corpus"] else "", focus)
+        with st.spinner(f"`{model}` is refining {'the passage' if not whole else label.lower()}…"):
+            try:
+                suggestion = drafting_reply(messages, model, passage)
+            except RuntimeError as exc:
+                st.error(f"Couldn't refine it: {exc}")
+                return
     if not suggestion:
         st.toast(f"`{model}` didn't return anything. Try again, or pick another model in the LLM Drafting Prompt.",
                  icon=":material/warning:")
@@ -13761,9 +14656,12 @@ def render_drafting_help(scope: str, boxes: dict[str, tuple[str, tuple]], main: 
     st.session_state[f"{suggestion_scope(widget_key) if suggestion_scope else scope}_suggestion"] = {
         "label": label, "widget_key": widget_key, "save": save, "value": value, "passage": passage,
         "whole": whole, "start": start, "end": end, "suggestion": suggestion, "messages": messages + [
-            {"role": "assistant", "content": suggestion}], "model": model}
+            {"role": "assistant", "content": suggestion}], "model": model,
+        **({"instruction": instruction, "note": note, "redraft_key": redraft_key(scope)} if instruction else
+           {"drafting_fp": drafting_fingerprint(), "about_me": toggles["about_me"],
+            "corpus_text": corpus_text if toggles["corpus"] else "", "fallback_model": model})}
     st.session_state[DRAFTING_OPEN_KEY] = suggestion_scope(widget_key) if suggestion_scope else scope
-    drafting_suggestion_dialog()  # yours and the suggestion side by side, in a popup
+    open_drafting_dialog()  # yours and the suggestion side by side, in a popup
 
 
 def replace_with_suggestion(scope: str, edit_key: str) -> None:
@@ -13783,6 +14681,8 @@ def replace_with_suggestion(scope: str, edit_key: str) -> None:
         new = pending["value"][:pending["start"]] + suggestion + pending["value"][pending["end"]:]
     st.session_state[pending["widget_key"]] = new
     save_drafted_box(pending["save"], pending["widget_key"])
+    if pending.get("redraft_key"):  # done with: the corrections box empties (before it's drawn next run)
+        st.session_state[f"{pending['redraft_key']}_clear"] = True
 
 
 def save_drafted_box(spec: tuple, widget_key: str) -> None:
@@ -13814,6 +14714,17 @@ def render_drafting_suggestion(scope: str) -> None:
     isn't drawn again) until Replace mine, Keep mine or ✕."""
     if st.session_state.get(f"{scope}_suggestion") and st.session_state.get(DRAFTING_OPEN_KEY) in (None, scope):
         st.session_state[DRAFTING_OPEN_KEY] = scope
+        open_drafting_dialog()
+
+
+_drafting_dialog_drawn = []  # emptied each run (the script runs again from the top)
+
+
+def open_drafting_dialog() -> None:
+    """The popup, drawn once a run: LLM Drafting opens it as it finishes, and the box's render_drafting_suggestion
+    (further down the page) keeps it open on later runs. Drawn twice, its widgets' keys clashed."""
+    if not _drafting_dialog_drawn:
+        _drafting_dialog_drawn.append(True)
         drafting_suggestion_dialog()
 
 
@@ -13829,7 +14740,18 @@ def drafting_suggestion_dialog() -> None:
     edit_key = f"{scope}_suggested_{nonce}"
     st.session_state.setdefault(edit_key, pending["suggestion"])
     st.caption(("Your " + pending["label"].lower() if pending["whole"] else "The passage you selected")
-               + f" · `{pending['model']}`")
+               + f" · `{pending['model']}`"
+               + (" · redrafted with your corrections and the draft's notes" if pending.get("instruction") else ""))
+    if pending.get("note"):
+        st.caption(f":material/content_cut: {pending['note']}")
+    if pending.get("drafting_fp"):  # made by the LLM Drafting Prompt: link to it, and refine again once it's edited
+        fingerprint = pending["drafting_fp"]
+        render_made_by_live(f"{scope}_made_by", [("LLM Drafting Prompt", f"{PROMPT_LIBRARY_PAGE_URL}&open=drafting",
+                                             "Open the LLM Drafting Prompt (its text, what to refine and model) in "
+                                             "the Prompt library, a new tab, to correct it at source.")],
+                            lambda: drafting_fingerprint() != fingerprint, "Refine again with the edited prompt",
+                            "The LLM Drafting Prompt has changed since this suggestion: refine the passage again "
+                            "with it.", lambda: redo_drafting_suggestion(pending))
     lines = max(pending["passage"].count("\n"), pending["suggestion"].count("\n")) + 1
     height = max(260, min(560, 24 * lines + len(pending["passage"]) // 3))
     mine_col, theirs_col = st.columns(2, gap="small")
@@ -13849,6 +14771,17 @@ def drafting_suggestion_dialog() -> None:
         replace = st.button("Replace mine", key=f"{scope}_replace", type="primary", icon=":material/swap_horiz:",
                             help="Put the suggestion in place of " + ("your text." if pending["whole"] else "the passage."))
         keep = st.button("Keep mine", key=f"{scope}_keep", icon=":material/close:")
+        if pending.get("instruction"):
+            fix = st.button("Saved as a Semantic Fix" if pending.get("fix_saved") else "Save as Semantic Fix",
+                            key=f"{scope}_save_fix", icon=":material/bookmark_add:", type="tertiary",
+                            disabled=bool(pending.get("fix_saved")),
+                            help="Keep your corrections in the Prompt library's **Agent Semantic Fixes**, so every "
+                                 f"Agent and LLM Redraft applies them from now on:\n\n{pending['instruction']}")
+            if fix:
+                add_semantic_fix(pending["instruction"])
+                pending["fix_saved"] = True
+                st.toast("Saved as a Semantic Fix.", icon=":material/bookmark_added:")
+                st.rerun(scope="fragment")
     if replace:
         replace_with_suggestion(scope, edit_key)
         st.session_state.pop(DRAFTING_OPEN_KEY, None)
@@ -13865,7 +14798,8 @@ def drafting_suggestion_dialog() -> None:
                                                                      "the passage."}]
         with st.spinner(f"`{pending['model']}` is changing it…"):
             try:
-                pending["suggestion"] = drafting_reply(messages, pending["model"], pending["passage"])
+                reply = redraft_reply if pending.get("instruction") else drafting_reply
+                pending["suggestion"] = reply(messages, pending["model"], pending["passage"])
             except RuntimeError as exc:
                 st.error(f"Couldn't change it: {exc}")
                 return
@@ -14177,6 +15111,10 @@ def render_voice_tools(target: str, index: int | None, text: str, *, narrated: b
     playing = can_speak and queued.get("target") == target and queued.get("text") == text
     editing_key = f"{key}_editing"
     with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        ready_call = fresh_answer_call(text) if can_speak and not playing else None
+        if ready_call:  # Read aloud when ready was pressed while it was written: plays now, or when you're back
+            _read_ready_hook(key=f"{key}_ready_{ready_call}", data={"call": ready_call}, width=1,
+                             on_play_change=lambda: play_ready_answer(target, text, ready_call))
         if playing:
             render_read_aloud(target, text, remember=remember, width=340)
         elif can_speak:
@@ -14286,7 +15224,7 @@ def render_rewritten_narration(target: str, holder: dict, text: str, model: str 
     if not narration:
         return
     with st.container(border=True):
-        speed = f" · {narration['tokens_per_second']:.1f} tokens/s" if narration.get("tokens_per_second") else ""
+        speed = speed_and_time(narration.get("tokens_per_second"), narration.get("seconds"))
         st.caption(f":material/record_voice_over: Rewritten for listening · `{narration.get('model', '?')}`{speed}")
         st.markdown(narration["content"])
         with st.container(horizontal=True, vertical_alignment="center", gap="small"):
@@ -14309,7 +15247,7 @@ def render_answer_variant(target: str, index: int | None, variant: dict | None, 
             kind = "Another model" + (" (narrated)" if variant.get("narrated") else "")
         else:
             kind = "Narrated version" if variant.get("narrated") else "Text version"
-        speed = f" · {variant['tokens_per_second']:.1f} tokens/s" if variant.get("tokens_per_second") else ""
+        speed = speed_and_time(variant.get("tokens_per_second"), variant.get("seconds"))
         st.caption(f":material/subdirectory_arrow_right: {kind} · `{variant.get('model', '?')}`{speed}")
         if variant.get("edited_prompt") is not None:
             st.caption(f"**Asked:** {variant['edited_prompt']}")
@@ -14329,7 +15267,8 @@ def finish_variant(target: str, reply: str, narrate: bool, model: str, usage: di
     `edited_prompt`: from Edit question)."""
     _thinking, text = split_inline_thinking(reply or "")
     variant = {"content": text.strip(), "narrated": narrate, "model": model, "at": now_iso(),
-               "tokens_per_second": (usage or {}).get("tokens_per_second"), "other_model": other_model}
+               "tokens_per_second": (usage or {}).get("tokens_per_second"), "other_model": other_model,
+               "seconds": (usage or {}).get("processing_time")}
     if edited_prompt is not None:
         variant["edited_prompt"] = edited_prompt
     if narrate and variant["content"] and shutil.which("say"):
@@ -14365,7 +15304,7 @@ CHAT_MODEL_SETTING = "chat_model"  # app setting: the model last used in Chat
 CHAT_DEFAULT_MODEL_SETTING = "chat_default_model"  # app setting (Configure): the model new chats start with; '' = last used
 CHAT_NOTES_MAX_CHARS = 24000  # notes text attached to a chat, shared between the notes
 CHAT_DEFAULTS = {
-    "max_tokens": 4096,  # room for a reasoning model to think, then answer
+    "max_tokens": 12288,  # 12k: room for a reasoning model to think, then answer
     "temperature": 0.7,
     "num_ctx": 0,  # context window: 0 is Auto (sized to the chat, up to the model's limit)
     "think": "auto",  # auto (the model's default), on or off, for models that can think
@@ -14530,10 +15469,35 @@ def set_session_chat_model(model: str) -> None:
         save_app_settings({CHAT_MODEL_SETTING: model})  # the last model used, for "Last model used" after a restart
 
 
+CHAT_MAX_TOKENS_SETTING = "chat_max_tokens"  # app setting (Configure): the Max tokens new chats start with
+
+
+def chat_default_max_tokens() -> int:
+    """Max tokens for a new chat: set on the Configure page, else 12,288."""
+    chosen = load_app_settings().get(CHAT_MAX_TOKENS_SETTING)
+    if isinstance(chosen, int) and TOKEN_STEPS[0] <= chosen <= LLM_MAX_TOKENS_LIMIT:
+        return chosen
+    return CHAT_DEFAULTS["max_tokens"]
+
+
+def render_default_chat_max_tokens(widget_key: str) -> None:
+    """Configure: the Max tokens new Chat with LLM chats start with (a chat's own slider changes only that chat)."""
+    current = chat_default_max_tokens()
+    st.session_state.setdefault(widget_key, current)
+    st.select_slider("Max tokens for new chats", options=max_tokens_options(current), key=widget_key,
+                     format_func=format_max_tokens,
+                     on_change=lambda: save_app_settings({CHAT_MAX_TOKENS_SETTING: int(st.session_state[widget_key])}),
+                     help="The longest reply a new chat allows, thinking included (reasoning models need room to "
+                          f"think). {CHAT_DEFAULTS['max_tokens']:,} to start. Each chat can change its own in **Model "
+                          "options**; that doesn't change this.")
+    st.caption(describe_answer_length(st.session_state[widget_key]))
+
+
 def new_chat_record() -> dict:
+    """A new chat: the defaults, with the Max tokens set on the Configure page."""
     return {"id": uuid.uuid4().hex, "title": "New chat", "titled": False, "created": now_iso(), "updated": now_iso(),
-            "model": session_chat_model(), "about_me": False,
-            "prompt_id": "", "notes": None, "messages": [], **CHAT_DEFAULTS}
+            "model": session_chat_model(), "about_me": False, "prompt_id": "", "notes": None, "messages": [],
+            **CHAT_DEFAULTS, "max_tokens": chat_default_max_tokens()}
 
 
 def render_default_chat_model(widget_key: str) -> None:
@@ -14617,6 +15581,8 @@ def change_chat_setting(field: str, widget_key: str) -> None:
         return
     chat = current_chat()
     chat[field] = st.session_state.get(widget_key)
+    if field in CHAT_DEFAULTS:  # Model options: the other copy (settings row or message editor) shows it too
+        set_chat_option(chat["id"], field, chat[field], skip=widget_key)
     if field == "model":
         set_session_chat_model(chat["model"])  # every chat uses it until the app restarts
     msgs = chat["messages"]
@@ -14628,6 +15594,39 @@ def change_chat_setting(field: str, widget_key: str) -> None:
         st.session_state[REPLY_AGAIN_KEY] = {"dictated": {"target": "chat", "text": asked["content"]}
                                              if asked.get("dictated") else None}
     keep_chat(chat)
+
+
+def chat_prompt_stamp(chat: dict) -> dict:
+    """With a Chat reply: the library prompt it was written with, to tell when that prompt is edited since."""
+    prompt = find_prompt(load_prompt_library(), chat.get("prompt_id"))
+    return {"prompt_id": prompt["id"], "prompt_fp": prompt_fingerprint(prompt)} if prompt else {}
+
+
+def ask_last_chat_message_again() -> None:
+    """The last reply is replaced: the message before it is asked again (as changing About me does)."""
+    chat = current_chat()
+    msgs = chat["messages"]
+    if len(msgs) >= 2 and msgs[-1]["role"] == "assistant" and msgs[-2]["role"] == "user":
+        msgs.pop()
+        asked = msgs[-1]
+        st.session_state[REPLY_AGAIN_KEY] = {"dictated": {"target": "chat", "text": asked["content"]}
+                                             if asked.get("dictated") else None}
+        keep_chat(chat)
+
+
+def render_chat_made_by(chat: dict) -> None:
+    """A chat with a library prompt: link to it, and once it's edited, ask the last message again with it."""
+    prompt = find_prompt(load_prompt_library(), chat.get("prompt_id"))
+    if not prompt:
+        return
+    last = chat["messages"][-1] if chat["messages"] else {}
+    stamped = last.get("role") == "assistant" and last.get("prompt_id") == prompt["id"] and not last.get("notes_search")
+    prompt_id, fingerprint = prompt["id"], last.get("prompt_fp") if stamped else None
+    render_made_by_live(f"chat_made_by_{chat['id']}", [prompt_link(prompt, "the prompt this chat sends")],
+                        lambda: prompt_changed_since(prompt_id, fingerprint),
+                        "Ask again with the edited prompt",
+                        "The prompt has changed since the last reply: ask your last message again with it (the "
+                        "reply is replaced).", ask_last_chat_message_again)
 
 
 def rename_chat(widget_key: str) -> None:
@@ -14701,6 +15700,9 @@ def split_inline_thinking(content: str) -> tuple[str, str]:
 @st.cache_data(ttl=600, show_spinner=False)
 def ollama_model_info(model: str) -> dict:
     """{"context_length": the model's maximum context window or None, "thinking": whether it can think}."""
+    if cloud.is_cloud(model):
+        return {"context_length": cloud.context_length(model, cloud_settings()),
+                "thinking": cloud.parse(model)[0] == "claude"}
     try:
         conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=10)
         conn.request("POST", "/api/show", body=json.dumps({"model": model}), headers={"Content-Type": "application/json"})
@@ -14726,6 +15728,12 @@ def chat_ollama_settings(chat: dict, messages: list[dict]) -> tuple[dict, bool |
 
 def format_seconds(seconds: float | None) -> str:
     return "?" if seconds is None else f"{seconds:.1f}s" if seconds < 60 else format_duration(seconds)
+
+
+def speed_and_time(tokens_per_second: float | None, seconds: float | None) -> str:
+    """" · 12.3 tokens/s · took 41.2s" (each part only when known), for the lines under an answer."""
+    return ((f" · {tokens_per_second:.1f} tokens/s" if tokens_per_second else "")
+            + (f" · took {format_seconds(seconds)}" if seconds else ""))
 
 
 def describe_reply_stats(message: dict) -> tuple[str, str]:
@@ -14799,7 +15807,7 @@ def generate_chat_reply(chat: dict) -> None:
             reply, usage = chat_with_ollama(
                 messages, chat["model"], max_tokens=int(chat.get("max_tokens", CHAT_DEFAULTS["max_tokens"])),
                 temperature=float(chat.get("temperature", CHAT_DEFAULTS["temperature"])), on_text=show,
-                extra_options=options, think=think,
+                extra_options=options, think=think, local_only=is_in_confidence(chat),
                 cancel_extra=lambda: render_reply_controls(chat),
             )
         except RuntimeError as exc:
@@ -14810,11 +15818,12 @@ def generate_chat_reply(chat: dict) -> None:
     seconds = (state["think_ended"] or time.monotonic()) - state["think_started"] if state["think_started"] else None
     chat["messages"].append({
         "role": "assistant", "content": reply, "thinking": state["thinking"], "thought_seconds": seconds,
-        "model": chat["model"], "tokens_per_second": usage.get("tokens_per_second"), "at": now_iso(),
+        "model": usage.get("model") or chat["model"], "tokens_per_second": usage.get("tokens_per_second"), "at": now_iso(),
         "input_tokens": usage.get("input"), "output_tokens": usage.get("output"),
         "total_seconds": usage.get("processing_time"), "load_seconds": usage.get("load_seconds"),
         "prompt_seconds": usage.get("prompt_seconds"), "prompt_tokens_per_second": usage.get("prompt_tokens_per_second"),
         "num_ctx": usage.get("num_ctx"), "narrated": narrated,
+        **chat_prompt_stamp(chat),
     })
     queue_read_aloud("chat", reply)
     keep_chat(chat)
@@ -14883,7 +15892,7 @@ def make_chat_variant(chat: dict, index: int, narrate: bool, other_model: str | 
             reply, usage = chat_with_ollama(
                 messages, model, max_tokens=int(chat.get("max_tokens", CHAT_DEFAULTS["max_tokens"])),
                 temperature=float(chat.get("temperature", CHAT_DEFAULTS["temperature"])), extra_options=options,
-                think=think,
+                think=think, local_only=is_in_confidence(chat),
             )
     except RuntimeError as exc:
         st.error(str(exc))
@@ -14899,8 +15908,15 @@ def make_chat_variant(chat: dict, index: int, narrate: bool, other_model: str | 
     st.rerun()
 
 
+def drop_chat_prompt() -> None:
+    chat = current_chat()
+    chat["prompt_id"] = ""
+    keep_chat(chat)
+
+
 def render_chat_settings(chat: dict) -> None:
-    """Model, About me, a prompt and attached notes for this chat, on one wrapping row, plus the model's tuning."""
+    """About me and Model options for this chat on one wrapping row (plus, for an older chat, its prompt or attached
+    notes, to drop), then the model's speed and the context meter."""
     library = load_prompt_library()
     prompts = {p["id"]: agent_prompt_label(p) for p in library["prompts"]}
     key = chat["id"]
@@ -14915,31 +15931,40 @@ def render_chat_settings(chat: dict) -> None:
                   args=("about_me", f"chat_about_me_{key}"), disabled=not profile,
                   help=(profile + "\n\nChanging it asks the last message again, with or without About me (its "
                         "reply is replaced).") if profile else "Write About me in the Prompt library first.")
-        st.selectbox("Prompt", ["", *prompts], format_func=lambda pid: prompts.get(pid, "No prompt"),
-                     key=f"chat_prompt_id_{key}", on_change=change_chat_setting,
-                     args=("prompt_id", f"chat_prompt_id_{key}"), label_visibility="collapsed", width=240,
-                     help="A prompt from your library, sent as standing instructions with every message.")
-        count, _text, _names = in_scope_notes_context()
+        # No prompt picker or Attach notes here any more; a chat that already has either can drop it.
+        if chat.get("prompt_id") in prompts:
+            st.button(f"Prompt: {prompts[chat['prompt_id']]}", icon=":material/close:", key=f"chat_drop_prompt_{key}",
+                      on_click=drop_chat_prompt,
+                      help="This chat sends that library prompt as standing instructions with every message. Click "
+                           "to stop sending it.")
         if chat.get("notes"):
             st.button(f"Notes attached ({chat['notes']['count']})", icon=":material/attach_file:",
                       key=f"chat_detach_{key}", on_click=detach_notes,
                       help="Sent with every message:  \n" + "  \n".join(chat["notes"].get("names", [])[:30])
                       + "  \n\nClick to remove them from this chat.")
-        else:
-            st.button(f"Attach notes in scope ({count})", icon=":material/attach_file:", key=f"chat_attach_{key}",
-                      on_click=attach_in_scope_notes, disabled=not count,
-                      help="Attach a copy of the notes kept in scope on the search page (up to "
-                      f"{CHAT_NOTES_MAX_CHARS:,} characters, shared between them). Gather them there first."
-                      if count else "Gather notes on the search page first (a search, Find notes or Filter search).")
         with st.popover("Model options", icon=":material/tune:"):
             render_chat_model_options(chat)
+    render_chat_made_by(chat)
     st.caption(describe_llm_speed(chat["model"]))
     render_context_meter(chat)
 
 
-def setting_widget(widget, label: str, chat: dict, field: str, **kwargs):
+# Model options show in two places: the settings row's popover, and (suffix "_ed") the message editor, to try
+# versions of an answer. Each copy has its own widget keys; a change in one is copied to the other.
+CHAT_OPTION_COPIES = ("", "_ed")
+
+
+def set_chat_option(chat_id: str, field: str, value, skip: str = "") -> None:
+    """Show a chat setting's new value in every copy of its widget (except `skip`, the one just changed)."""
+    for suffix in CHAT_OPTION_COPIES:
+        key = f"chat_{field}_{chat_id}{suffix}"
+        if key != skip:
+            st.session_state[key] = value
+
+
+def setting_widget(widget, label: str, chat: dict, field: str, suffix: str = "", **kwargs):
     """A chat setting's widget, saved with the chat when changed."""
-    key = f"chat_{field}_{chat['id']}"
+    key = f"chat_{field}_{chat['id']}{suffix}"
     return widget(label, key=key, on_change=change_chat_setting, args=(field, key), **kwargs)
 
 
@@ -14947,23 +15972,127 @@ def reset_chat_model_options(chat_id: str) -> None:
     chat = current_chat()
     for field in ("num_ctx", "think", *CHAT_SAMPLING_OPTIONS):
         chat[field] = CHAT_DEFAULTS[field]
-        st.session_state[f"chat_{field}_{chat_id}"] = CHAT_DEFAULTS[field]
+        set_chat_option(chat_id, field, CHAT_DEFAULTS[field])
     keep_chat(chat)
 
 
-def render_chat_model_options(chat: dict) -> None:
-    """Max tokens, temperature, context window, thinking and sampling options, for this chat."""
+# Advanced sampling presets, like a graphic equaliser's: each sets Temperature, Top P, Top K and Repeat penalty
+# together (fine-tune after). {key: (label, icon, values, what it's like)}; None leaves it to the model.
+CHAT_SAMPLING_PRESETS = {
+    "default": ("Model default", ":material/tune:",
+                {"temperature": 0.7, "top_p": None, "top_k": None, "repeat_penalty": None},
+                "What the model was tuned for: usually the safe choice."),
+    "precise": ("Precise", ":material/target:",
+                {"temperature": 0.1, "top_p": 0.5, "top_k": 10, "repeat_penalty": 1.05},
+                "Facts and extraction: sticks closely to the notes, picks the likeliest words, little variety."),
+    "concise": ("Concise", ":material/short_text:",
+                {"temperature": 0.3, "top_p": 0.8, "top_k": 30, "repeat_penalty": 1.15},
+                "Tight summaries: focused, and discouraged from repeating itself or waffling."),
+    "balanced": ("Balanced", ":material/balance:",
+                 {"temperature": 0.6, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.1},
+                 "Everyday answers: natural wording, still grounded."),
+    "creative": ("Creative", ":material/palette:",
+                 {"temperature": 1.0, "top_p": 0.95, "top_k": 80, "repeat_penalty": 1.1},
+                 "Ideas and drafts: more varied wording and less obvious choices."),
+    "brainstorm": ("Brainstorm", ":material/bolt:",
+                   {"temperature": 1.3, "top_p": 0.98, "top_k": 150, "repeat_penalty": 1.2},
+                   "Wild: many angles and surprises, but more likely to drift or invent; check the facts."),
+}
+REPEATABLE_SEED = 42
+
+
+def chat_sampling_preset(chat: dict) -> str | None:
+    """The preset the chat's settings match, if any."""
+    def same(have, want) -> bool:
+        return have is None and want is None or (
+            have is not None and want is not None and abs(float(have) - float(want)) < 1e-6)
+
+    for name, (_label, _icon, values, _about) in CHAT_SAMPLING_PRESETS.items():
+        if all(same(chat.get(field), value) for field, value in values.items()):
+            return name
+    return None
+
+
+def apply_chat_sampling_preset(chat_id: str, name: str) -> None:
+    chat = current_chat()
+    for field, value in CHAT_SAMPLING_PRESETS[name][2].items():
+        chat[field] = value
+        set_chat_option(chat_id, field, value)
+    keep_chat(chat)
+
+
+def set_chat_seed(chat_id: str, seed: int | None) -> None:
+    chat = current_chat()
+    chat["seed"] = seed
+    set_chat_option(chat_id, "seed", seed)
+    keep_chat(chat)
+
+
+def render_chat_sampling(chat: dict, suffix: str = "") -> None:
+    """Advanced sampling: the presets, then the four settings to fine-tune. Ollama models only."""
+    provider = cloud.parse(chat["model"])[0]
+    if provider == "claude":
+        st.caption("Claude chooses its own sampling: these settings (and Temperature) don't apply to it.")
+        return
+    if provider == "openai":
+        st.caption("Only **Temperature** is sent to an OpenAI-compatible endpoint: these don't apply.")
+        return
+    for field in CHAT_SAMPLING_OPTIONS:  # through Session State only (a preset sets them), so no value= below
+        st.session_state.setdefault(f"chat_{field}_{chat['id']}{suffix}", chat.get(field))
+    active = chat_sampling_preset(chat)
+    st.caption("Presets set **Temperature**, **Top P**, **Top K** and **Repeat penalty** together, from strict to "
+               "wild; fine-tune them below. Empty boxes leave a setting to the model.")
+    with st.container(horizontal=True, gap="small"):
+        for name, (label, icon, values, about) in CHAT_SAMPLING_PRESETS.items():
+            detail = ", ".join(f"{field.replace('_', ' ')} {value}" for field, value in values.items() if value is not None)
+            st.button(label, icon=icon, key=f"chat_preset_{name}_{chat['id']}{suffix}",
+                      type="primary" if name == active else "secondary",
+                      on_click=apply_chat_sampling_preset, args=(chat["id"], name), help=f"{about}\n\n{detail}")
+    st.caption((f"Now: **{CHAT_SAMPLING_PRESETS[active][0]}**. {CHAT_SAMPLING_PRESETS[active][3]}" if active
+                else "Now: your own mix."))
+    setting_widget(st.number_input, "Top P", chat, "top_p", suffix, min_value=0.0, max_value=1.0,
+                   step=0.05, placeholder="Model default", help="Only consider the most likely words that together "
+                   "make up this share of the probability (e.g. 0.9). Lower is more focused.")
+    setting_widget(st.number_input, "Top K", chat, "top_k", suffix, min_value=1, max_value=200,
+                   step=1, placeholder="Model default", help="Only consider this many of the most likely words (e.g. 40).")
+    setting_widget(st.number_input, "Repeat penalty", chat, "repeat_penalty", suffix,
+                   min_value=0.5, max_value=2.0, step=0.05, placeholder="Model default",
+                   help="Above 1 discourages repeating itself (e.g. 1.1).")
+    with st.container(horizontal=True, gap="small", vertical_alignment="bottom"):
+        setting_widget(st.number_input, "Seed", chat, "seed", suffix, min_value=0, step=1,
+                       placeholder="Random", help="The same seed, prompt and settings give the same reply: useful to "
+                       "compare models or options.")
+        repeatable = chat.get("seed") is not None
+        st.button("Random" if repeatable else "Repeatable", key=f"chat_seed_toggle_{chat['id']}{suffix}",
+                  icon=":material/shuffle:" if repeatable else ":material/repeat:",
+                  on_click=set_chat_seed, args=(chat["id"], None if repeatable else REPEATABLE_SEED),
+                  help="Back to a different reply each time." if repeatable else
+                  f"Fix the seed ({REPEATABLE_SEED}), so asking again gives the same reply: for comparing models.")
+
+
+def render_chat_model_options(chat: dict, suffix: str = "") -> None:
+    """Max tokens, temperature, context window, thinking and sampling options, for this chat. `suffix`: another
+    copy of them (the message editor's), kept in step with the settings row's."""
     info = ollama_model_info(chat["model"])
     limit = info["context_length"]
-    setting_widget(st.number_input, "Max tokens", chat, "max_tokens", min_value=256, max_value=LLM_MAX_TOKENS_LIMIT,
-                   step=256, help="The longest reply, thinking included. Reasoning models need room to think.")
-    setting_widget(st.slider, "Temperature", chat, "temperature", min_value=0.0, max_value=1.5, step=0.1,
+    if suffix:
+        for field, default in CHAT_DEFAULTS.items():
+            if field not in CHAT_SAMPLING_OPTIONS:
+                st.session_state.setdefault(f"chat_{field}_{chat['id']}{suffix}", chat.get(field, default))
+    tokens = setting_widget(st.select_slider, "Max tokens", chat, "max_tokens", suffix,
+                            options=max_tokens_options(st.session_state.get(f"chat_max_tokens_{chat['id']}{suffix}")
+                                                       or chat.get("max_tokens") or CHAT_DEFAULTS["max_tokens"]),
+                            format_func=format_max_tokens,
+                            help="The longest reply, thinking included: reasoning models need room to think. The "
+                            "stops include book lengths for scale.")
+    st.caption(describe_answer_length(tokens))
+    setting_widget(st.slider, "Temperature", chat, "temperature", suffix, min_value=0.0, max_value=1.5, step=0.1,
                    help="Lower is more focused, higher more varied.")
     sizes = [0, *(size for size in CHAT_CONTEXT_SIZES if not limit or size <= limit)]
     if chat.get("num_ctx") and chat["num_ctx"] not in sizes:
         sizes.append(chat["num_ctx"])
     setting_widget(
-        st.selectbox, "Context window", chat, "num_ctx", options=sizes,
+        st.selectbox, "Context window", chat, "num_ctx", suffix, options=sizes,
         format_func=lambda size: f"Auto (fits the chat, up to {limit:,})" if size == 0 and limit else
         "Auto (fits the chat)" if size == 0 else f"{size:,} tokens",
         help="How much of the chat (and attached notes) the model can see at once, in tokens (about ¾ of a word "
@@ -14972,22 +16101,13 @@ def render_chat_model_options(chat: dict) -> None:
         "the chat outgrows the window, the model no longer sees the oldest messages."
         + (f"\n\n`{chat['model']}` can take up to {limit:,} tokens." if limit else ""),
     )
-    setting_widget(st.segmented_control, "Thinking", chat, "think", options=list(CHAT_THINK_CHOICES),
+    setting_widget(st.segmented_control, "Thinking", chat, "think", suffix, options=list(CHAT_THINK_CHOICES),
                    format_func=CHAT_THINK_CHOICES.get, disabled=not info["thinking"],
                    help="Whether a reasoning model thinks before answering. **Off** is much faster; **On** is better "
                    "for hard questions." if info["thinking"] else f"`{chat['model']}` doesn't think before answering.")
-    st.caption("Sampling: empty means the model's own default, which usually suits it best.")
-    setting_widget(st.number_input, "Top P", chat, "top_p", value=chat.get("top_p"), min_value=0.0, max_value=1.0, step=0.05,
-                   placeholder="Model default", help="Only consider the most likely words that together make up this "
-                   "share of the probability (e.g. 0.9). Lower is more focused.")
-    setting_widget(st.number_input, "Top K", chat, "top_k", value=chat.get("top_k"), min_value=1, max_value=200, step=1,
-                   placeholder="Model default", help="Only consider this many of the most likely words (e.g. 40).")
-    setting_widget(st.number_input, "Repeat penalty", chat, "repeat_penalty", value=chat.get("repeat_penalty"), min_value=0.5,
-                   max_value=2.0, step=0.05, placeholder="Model default",
-                   help="Above 1 discourages repeating itself (e.g. 1.1).")
-    setting_widget(st.number_input, "Seed", chat, "seed", value=chat.get("seed"), min_value=0, step=1, placeholder="Random",
-                   help="The same seed, prompt and settings give the same reply: useful to compare models or options.")
-    st.button("Reset to defaults", icon=":material/restart_alt:", key=f"chat_reset_options_{chat['id']}",
+    with st.expander("Advanced sampling", icon=":material/graphic_eq:", key=f"chat_sampling_{chat['id']}{suffix}"):
+        render_chat_sampling(chat, suffix)
+    st.button("Reset to defaults", icon=":material/restart_alt:", key=f"chat_reset_options_{chat['id']}{suffix}",
               on_click=reset_chat_model_options, args=(chat["id"],),
               help="Context window Auto, thinking as the model does by default, and sampling left to the model.")
 
@@ -15170,9 +16290,14 @@ def finish_hotkey_job() -> str:
 CHAT_EDITING_KEY = "chat_editing_message"  # {"chat", "index"}: a sent message being fixed in place
 
 
+def chat_inplace_key(chat_id: str, index: int) -> str:
+    """Edit on an answered message: its question editor, opened where the message is (index: the message's)."""
+    return f"chat_inplace_{chat_id}_{index + 1}"
+
+
 def edit_chat_message(chat_id: str, index: int, answered: bool) -> None:
-    if answered:
-        st.session_state[f"chat_voice_{chat_id}_{index + 1}_editing"] = True
+    if answered:  # the editor opens in place of the message (under a long reply it was out of sight)
+        st.session_state[f"{chat_inplace_key(chat_id, index)}_editing"] = True
     else:  # this click also stopped the reply being written
         st.session_state[CHAT_EDITING_KEY] = {"chat": chat_id, "index": index}
 
@@ -15210,8 +16335,20 @@ def render_user_message(chat: dict, index: int) -> None:
                                       args=(chat["id"], index))
                 st.form_submit_button("Cancel", on_click=cancel_message_edit)
         return
-    st.markdown(message["content"])
     answered = index + 1 < len(chat["messages"]) and chat["messages"][index + 1]["role"] == "assistant"
+    inplace = chat_inplace_key(chat["id"], index)
+    if answered and st.session_state.get(f"{inplace}_editing"):
+        reply = chat["messages"][index + 1]
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            st.caption("Edit and **Re-run**: the conversation up to here is sent with your edited message, using these "
+                       "**Model options** (the chat's own, so try a preset, then another). Each new answer goes under "
+                       "the reply, indented; the original stays.", width="stretch")
+            with st.popover("Model options", icon=":material/tune:"):
+                render_chat_model_options(chat, "_ed")
+        render_question_editor("chat", index + 1, message["content"], reply.get("model") or chat["model"],
+                               bool(reply.get("narrated")), inplace)
+        return
+    st.markdown(message["content"])
     last = index == len(chat["messages"]) - 1
     with st.container(horizontal=True, gap="small"):
         if answered or last:
@@ -15226,6 +16363,7 @@ def render_user_message(chat: dict, index: int) -> None:
                       help="Meant for your notes? Run this message as a **Oneshot search** on the search page (no "
                            "check first): it's put in the Oneshot box, the notes are found, and asked your question. "
                            "**Back to chat** returns here.")
+        render_copy_buttons([("Copy", message["content"])], fit=True)  # your message, as sent
 
 
 def push_to_notes(chat_id: str, index: int) -> None:
@@ -15373,9 +16511,19 @@ def notes_libraries() -> list[str]:
 
 
 def ollama_json(model: str, messages: list[dict], schema: dict, timeout: int = 120) -> dict | None:
-    """One quick, non-streamed Ollama call that must answer in `schema`'s JSON; None if it can't."""
+    """One quick, non-streamed call that must answer in `schema`'s JSON; None if it can't. A cloud model that
+    can't be used or fails goes to the local fallback."""
     import requests
 
+    model, _note = route_model(model)
+    if cloud.is_cloud(model):
+        try:
+            reply = cloud.complete(model, {"messages": messages, "format": schema, "think": False,
+                                           "options": {"temperature": 0, "num_predict": 2048}},
+                                   cloud_settings(), timeout)
+            return json.loads(split_inline_thinking(reply)[1] or "{}")
+        except Exception:
+            model = local_fallback_model()
     try:
         response = requests.post(
             f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/chat",
@@ -15606,38 +16754,67 @@ def background_answers() -> dict:
     return {}
 
 
-def stream_answer(job: dict, messages: list[dict], model: str, max_tokens: int, temperature: float) -> None:
-    """Worker thread: stream an Ollama answer into `job` (text, tokens, then answer and usage, or error)."""
-    import requests
+class _JobStopped(Exception):
+    pass
 
+
+def stream_job(job: dict, messages: list[dict], model: str, options: dict) -> dict:
+    """Stream `model`'s reply into `job` (text, tokens, rate); returns the last line (usage). Cancel raises
+    _JobStopped; a cloud model's failure raises cloud.CloudError."""
+    stream = open_chat_stream(model, {"messages": messages, "stream": True, "options": options})
+    first = None
+    try:
+        while True:
+            if job["cancel"].is_set():
+                raise _JobStopped()
+            try:
+                kind, value = stream.lines.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if kind == "http_error":
+                raise RuntimeError(f"`{model}` returned HTTP {value[0]}: {value[1]}")
+            if kind == "error":
+                if isinstance(value, cloud.CloudError):
+                    raise value
+                raise RuntimeError(f"Lost the connection while `{model}` was answering: {value}")
+            if kind == "end":
+                return {}
+            if not value.strip():
+                continue
+            chunk = json.loads(value)
+            if chunk.get("error"):
+                raise RuntimeError(f"`{model}`: {chunk['error']}")
+            message = chunk.get("message") or {}
+            piece = message.get("content") or ""
+            if message.get("thinking"):
+                job["thinking"] = job.get("thinking", 0) + 1
+            if piece:
+                first = first or time.monotonic()
+                job["text"] += piece
+                job["tokens"] += 1
+                job["rate"] = job["tokens"] / max(time.monotonic() - first, 0.001)
+            if chunk.get("done"):
+                return chunk
+    finally:
+        stream.close()
+
+
+def stream_answer(job: dict, messages: list[dict], model: str, max_tokens: int, temperature: float) -> None:
+    """Worker thread: stream an answer into `job` (text, tokens, then answer and usage, or error). A cloud model
+    that fails goes to the local fallback, saying so in job["notice"]."""
     options = {"num_predict": max_tokens, "temperature": temperature,
                "num_ctx": context_window_for(messages, max_tokens)}
     started = time.monotonic()
-    first = None
+    job["started"] = started
     try:
-        with requests.post(f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/chat", stream=True, timeout=(10, 900),
-                           json={"model": model, "messages": messages, "stream": True, "options": options}) as response:
-            response.raise_for_status()
-            data = {}
-            for line in response.iter_lines():
-                if job["cancel"].is_set():
-                    job["error"] = "Stopped."
-                    return
-                if not line:
-                    continue
-                chunk = json.loads(line)
-                message = chunk.get("message") or {}
-                piece = message.get("content") or ""
-                if message.get("thinking"):
-                    job["thinking"] = job.get("thinking", 0) + 1
-                if piece:
-                    first = first or time.monotonic()
-                    job["text"] += piece
-                    job["tokens"] += 1
-                    job["rate"] = job["tokens"] / max(time.monotonic() - first, 0.001)
-                if chunk.get("done"):
-                    data = chunk
-                    break
+        try:
+            data = stream_job(job, messages, model, options)
+        except cloud.CloudError as exc:
+            fallback = local_fallback_model()
+            job["notice"] = fallback_note(model, exc, fallback)
+            job.update(text="", tokens=0, thinking=0, model=fallback)
+            model = fallback
+            data = stream_job(job, messages, model, options)
         answer = re.sub(r"<think>.*?</think>", "", job["text"], flags=re.DOTALL).strip()
         if not answer and job.get("thinking"):
             raise RuntimeError(f"`{model}` used its whole token budget thinking (**Max tokens** {max_tokens:,}) and "
@@ -15650,8 +16827,11 @@ def stream_answer(job: dict, messages: list[dict], model: str, max_tokens: int, 
             "processing_time": (data["total_duration"] / 1e9) if data.get("total_duration") else time.monotonic() - started,
             "tokens_per_second": (out / (data["eval_duration"] / 1e9)) if data.get("eval_duration") else None,
             "num_ctx": options["num_ctx"], "done_reason": data.get("done_reason"),
+            "model": data.get("served_by") or model, "fallback_note": job.get("notice") or "",
         }
         job["answer"] = answer
+    except _JobStopped:
+        job["error"] = "Stopped."
     except Exception as exc:
         job["error"] = str(exc) if not job["cancel"].is_set() else "Stopped."
     finally:
@@ -15664,8 +16844,9 @@ def start_background_answer(search_state: dict, question: str, results: list, mo
     """The run's answer, written on a worker thread; the page shows it when it's done."""
     full_prompt = build_llm_prompt(question, results, max_tokens, temperature, corpus_prompt, task_prompt, notes_chars)
     token = uuid.uuid4().hex
+    model, note = route_model(model)
     job = {"text": "", "tokens": 0, "rate": None, "done": False, "answer": None, "usage": None, "error": None,
-           "cancel": threading.Event(), "model": model, "max_tokens": max_tokens,
+           "cancel": threading.Event(), "model": model, "max_tokens": max_tokens, "notice": note,
            "narrated": bool(read_aloud_instruction("ask")),
            "read_aloud": (st.session_state.get(DICTATED_KEY) or {}).get("target") == "ask" and wants_read_aloud()}
     background_answers()[token] = job
@@ -15677,8 +16858,9 @@ def start_background_answer(search_state: dict, question: str, results: list, mo
 def start_listening_rewrite(run: dict, answer: str, model: str) -> None:
     """The run's second step: rewrite the answer for listening on a worker thread (as Narrate does)."""
     token = uuid.uuid4().hex
+    model, note = route_model(model)
     job = {"text": "", "tokens": 0, "rate": None, "done": False, "answer": None, "usage": None, "error": None,
-           "cancel": threading.Event(), "model": model, "max_tokens": max(1024, len(answer) // 2)}
+           "cancel": threading.Event(), "model": model, "max_tokens": max(1024, len(answer) // 2), "notice": note}
     background_answers()[token] = job
     threading.Thread(target=stream_answer, args=(job, listening_rewrite_messages(answer), model, job["max_tokens"],
                                                  0.3), daemon=True).start()
@@ -15803,7 +16985,9 @@ def advance_notes_run(run: dict, safe_lib: str) -> None:
             last["answer_error"] = job["error"]
             run["warnings"].append(job["error"] if "token budget" in job["error"] else f"The answer failed: {job['error']}")
         else:
-            last.update(answer=job["answer"], usage=job["usage"], narrated=job["narrated"])
+            last.update(answer=job["answer"], usage=job["usage"], narrated=job["narrated"], model=job["model"])
+            if job.get("notice"):
+                run["warnings"].append(job["notice"])
             record_llm_speed(job["model"], job["usage"])
             if job["read_aloud"]:
                 play_answer("ask", job["answer"])
@@ -15833,7 +17017,8 @@ def advance_notes_run(run: dict, safe_lib: str) -> None:
         else:
             last["answer_narration"] = {"content": job["answer"], "narrated": True, "model": job["model"],
                                         "at": now_iso(), "rewritten": True,
-                                        "tokens_per_second": (job["usage"] or {}).get("tokens_per_second")}
+                                        "tokens_per_second": (job["usage"] or {}).get("tokens_per_second"),
+                                        "seconds": (job["usage"] or {}).get("processing_time")}
             if run.get("read"):
                 play_answer("ask", job["answer"])
             run["log"].append("Rewritten for listening, and read out")
@@ -15910,7 +17095,8 @@ def notes_run_status(run: dict) -> str:
         token = (st.session_state.get(LAST_SEARCH_KEY) or {}).get("answer_pending")
         job = background_answers().get(token) if token else None
         if job:
-            rate = f" · {job['rate']:.1f} tokens/s" if job.get("rate") else ""
+            rate = (f" · {job['rate']:.1f} tokens/s" if job.get("rate") else "") \
+                + (f" · {format_seconds(time.monotonic() - job['started'])} so far" if job.get("started") else "")
             return (f"Writing the answer with `{job['model']}` · {job['tokens']:,} tokens{rate}" if job["tokens"]
                     else f"`{job['model']}` is reading the notes…")
         return "Asking the LLM…"
@@ -16800,7 +17986,7 @@ def publish_workflow_output(workflow: dict, run: dict, index: int, model: str, s
         run["error"] = f"`{model}` returned nothing; try again, or write it yourself."
         return False
     output["published"] = {"text": text, "model": model, "at": now_iso(), "prompt": request,
-                           "tokens_per_second": usage.get("tokens_per_second")}
+                           "tokens_per_second": usage.get("tokens_per_second"), "seconds": usage.get("processing_time")}
     output["phase"] = "published"
     output["fit_note"] = fit_note
     if stage_saves_emails(stage):
@@ -16916,6 +18102,64 @@ def pick_output_version(index: int, widget_key: str) -> None:
     sync_workflow_email(workflow, run, index)
 
 
+def workflow_redraft(workflow: dict, run: dict, index: int, model: str, safe_lib: str, corpus_config: dict):
+    """LLM Redraft for a Written output stage: the stage asked again as when it wrote the draft (its prompt, notes
+    and reference documents; a published version without the notes, as Revise does), the box's text as its
+    answer, then the passage and the corrections. Notes too big for the model are trimmed to fit."""
+    def redraft(passage: str, whole: bool, label: str, instruction: str, current: str):
+        stage = workflow["stages"][index]
+        output = run["outputs"][str(index)]
+        doc = review_doc(output)
+        published = doc is not output
+        task = (f"You wrote {'the published version of ' if published else ''}stage {index + 1} of the note "
+                f"workflow “{workflow['name']}”: {stage['name']}. Now redraft part of it, as asked below."
+                + (f"\n\n{WORKFLOW_EMAIL_INSTRUCTION}" if published and stage_saves_emails(stage) else ""))
+
+        def build(notes: str, _refs, preamble: str) -> list[dict]:
+            return [{"role": "system", "content": f"{preamble}\n\n{task}"},
+                    {"role": "user", "content": (doc.get("prompt") or "") + (f"\n\nThe notes:\n{notes}" if notes else "")},
+                    {"role": "assistant", "content": current},
+                    {"role": "user", "content": redraft_request(passage, whole, label, instruction)}]
+
+        messages, _trimmed, note = workflow_request(workflow, run, index, model, safe_lib,
+                                                    workflow_max_tokens(corpus_config), build, "trim", "redraft",
+                                                    with_notes=not published)
+        if messages is None:
+            raise RuntimeError(run.pop("error", "") or "it didn't fit the model")
+        return messages, model, note
+    return redraft
+
+
+def text_fingerprint(text: str) -> str:
+    return hashlib.sha1(str(text or "").encode()).hexdigest()[:16]
+
+
+def render_stage_made_by(workflow: dict, run: dict, index: int, prompt_key: str) -> None:
+    """A Note-Workflow stage's Made by: its library prompt (if it uses one) and the workflow, where its own prompt
+    text (or the note it's read from) is set; Re-run once the prompt has changed since the stage ran."""
+    stage = workflow["stages"][index]
+    base = stage_library_prompt(stage)
+    links = [prompt_link(base, "the library prompt this stage uses")] if base else []
+    where = ("reads its prompt from a note: open the note to change it, or " if stage.get("source") == "note" else "")
+    links.append((f"{workflow['name']} · {stage['name']}", f"{PROMPT_LIBRARY_PAGE_URL}&workflow={workflow['id']}",
+                  f"This stage {where}open the workflow's stages in the Prompt library (a new tab) to change it."))
+    fingerprint = run["prompt_fps"][str(index)]
+    workflow_id = workflow["id"]
+
+    def changed() -> bool:
+        current = find_workflow(workflow_id)
+        stages = (current or {}).get("stages") or []
+        return index < len(stages) and text_fingerprint(stage_prompt_text(stages[index])) != fingerprint
+
+    def rerun() -> None:
+        st.session_state.pop(prompt_key, None)  # filled in again from the edited prompt
+        run["rerun_stage"] = index
+
+    render_made_by_live(f"wf_made_by_{index}", links, changed, "Re-run with the edited prompt",
+                        "This stage's prompt has changed since it ran: run it again with the new one (the output is "
+                        "replaced, as **Run again** does).", rerun)
+
+
 def render_written_output(workflow: dict, run: dict, index: int, output: dict, model: str, safe_lib: str,
                           corpus_config: dict, week, progress) -> None:
     """A Written output stage's result, to review like an Agent's answer: the draft on the left, edited in place
@@ -16990,7 +18234,9 @@ def render_written_output(workflow: dict, run: dict, index: int, output: dict, m
             render_edit_dictation(f"wf_dictate_{index}", f"wf_draft_box_{index}",
                                   boxes={title: (text_key, ("written", index))})
             render_drafting_help(f"wf_draft_box_{index}", {title: (text_key, ("written", index))}, title, model,
-                                 corpus_prompt_for(safe_lib))
+                                 corpus_prompt_for(safe_lib),
+                                 redraft=workflow_redraft(workflow, run, index, model, safe_lib, corpus_config)
+                                 if model else None)
             render_copy_buttons([("Copy", doc.get("text") or "")], fit=True)
             chat_title = workflow["name"] + (f" · {describe_week(week)}" if week else "")
             st.button("Send to LLM Chat", key=f"wf_chat_{index}", icon=":material/forum:",
@@ -17007,6 +18253,9 @@ def render_written_output(workflow: dict, run: dict, index: int, output: dict, m
             elif working and output.get("published"):
                 st.button("Show the published version", key=f"wf_to_published_{index}", icon=":material/redo:",
                           type="tertiary", on_click=show_working_draft, args=(index, "published"))
+        if model:
+            render_redraft_box(f"wf_draft_box_{index}", "the stage's prompt, notes and reference documents"
+                               if not published else "the stage's prompt and the working draft")
         render_drafting_suggestion(f"wf_draft_box_{index}")
         if published and not output.get("by_hand"):
             with st.expander("Working draft", icon=":material/draft:", key=f"wf_working_view_{index}_{doc.get('at')}"):
@@ -17144,7 +18393,8 @@ def run_workflow_stage(workflow: dict, run: dict, index: int, prompt: str, model
             return
     answer = split_inline_thinking(answer)[1].strip()
     output = {"model": model, "prompt": prompt, "trimmed": trimmed, "at": now_iso(), "fit_note": fit_note,
-              "tokens_per_second": usage.get("tokens_per_second"), "done_reason": usage.get("done_reason")}
+              "tokens_per_second": usage.get("tokens_per_second"), "done_reason": usage.get("done_reason"),
+              "seconds": usage.get("processing_time")}
     if stage.get("kind") == "pick":
         try:
             groups = [g for g in json.loads(answer or "{}").get("groups") or [] if g.get("items")]
@@ -17755,10 +19005,8 @@ def render_workflow_validation(run: dict, workflow: dict, safe_lib: str, folder:
 def render_workflow_selecting(run: dict, workflow: dict, safe_lib: str, folder: Path | None, count: int) -> None:
     """Change selection: the Filter is open below; pick the notes here (ticked take part), then Continue."""
     single = workflow_one_note_only(workflow, run)
-    # The LLM side (Ask) isn't used while picking notes: greyed out and not clickable, so it doesn't confuse.
-    st.html("<style>.st-key-ask_box { opacity: 0.4; filter: grayscale(1); pointer-events: none; user-select: none; }"
-            ".st-key-ask_box::before { content: 'Not used while you pick the workflow\\2019s notes'; display: block; "
-            "font-size: 0.875rem; font-weight: 600; padding: 0.25rem 0.5rem; }</style>")
+    # The LLM side (Ask) isn't used while picking notes: hidden, and the Filter box takes the full width.
+    st.html(f"<style>.st-key-ask_box {{ display: none !important; }} {FILTER_ASK_STACKED}</style>")
     st.info(("Pick the note to run on" if single else "Tick the notes to run on")
             + ". To look elsewhere, change the filter in **Filter and Ask** below: the notes are rescanned and listed "
             "again by themselves. Then **Continue** (or **Select … and Continue** under the list).",
@@ -18224,7 +19472,11 @@ def render_workflow_panel(safe_lib: str, corpus_config: dict) -> None:
             if fit and fit["action"] == "run":  # too big for the model before: again, as chosen in the alert
                 run.pop("fit")
                 run_clicked = True
+            if run.pop("rerun_stage", None) == index:  # Re-run with the edited prompt (Made by, below)
+                run_clicked = True
             running = bool(run_clicked) and not (empty_routes and index)
+            if running:  # what its prompt was, to tell when it's edited since
+                run.setdefault("prompt_fps", {})[str(index)] = text_fingerprint(template)
             with step_row, st.container(horizontal=True, vertical_alignment="center", gap="small", width="content",
                                         key="wf_step_controls"):
                 approve_key = f"wf_approve_{stage['id']}"
@@ -18253,6 +19505,9 @@ def render_workflow_panel(safe_lib: str, corpus_config: dict) -> None:
                           on_click=cancel_llm, type="secondary",
                           help="Stop this step now (the same as **Cancel**), to correct the list or edit the prompt, "
                                "then press **Run**." if running else "Shows while this step runs.")
+            if output is not None and not running and stage.get("kind") != "agent" \
+                    and (run.get("prompt_fps") or {}).get(str(index)):
+                render_stage_made_by(workflow, run, index, prompt_key)
             if empty_routes and index:
                 st.info(f"Nothing is routed to **{' or '.join(empty_routes)}**, so there's nothing for this stage: go on "
                         "to the next one, or go **Back** and route some items here.", icon=":material/alt_route:")
@@ -18304,10 +19559,10 @@ def render_workflow_panel(safe_lib: str, corpus_config: dict) -> None:
             if output:
                 usage = output.get("usage") or {}
                 if usage.get("processing_time") is not None:  # an Agent stage's answer, as the Ask answer shows it
-                    st.caption(f"`{output.get('model')}` · {usage.get('total', '?')} tokens · {usage['processing_time']:.1f}s"
-                               + (f" · {usage['tokens_per_second']:.1f} tokens/s" if usage.get("tokens_per_second") else ""))
+                    st.caption(f"`{output.get('model')}` · {usage.get('total', '?')} tokens"
+                               + speed_and_time(usage.get("tokens_per_second"), usage["processing_time"]))
                 elif output.get("tokens_per_second"):
-                    st.caption(f"`{output.get('model')}` · {output['tokens_per_second']:.1f} tokens/s")
+                    st.caption(f"`{output.get('model')}`" + speed_and_time(output["tokens_per_second"], output.get("seconds")))
                 if output.get("trimmed"):
                     st.caption(f"{output['trimmed']} notes were trimmed to fit the **Notes budget** (Ollama model details).")
                 if output.get("fit_note"):
@@ -18946,16 +20201,22 @@ def render_stage_editor(wid: str, workflow: dict, n: int, stage: dict, models: l
                                "scope doesn't run by itself.")
                 st.session_state.setdefault(f"{base}_edit_space", stage.get("edit_space") or "agent")
                 st.session_state.setdefault(f"{base}_hold_manual", stage.get("hold_manual") or "agent")
+                stage_agent = find_prompt(load_prompt_library(), stage.get("agent") or "") or {}
+
+                def agents_setting(field: str):  # "Agent's setting (Off)": what following the Agent means now
+                    return lambda option: (f"Agent's setting ({'On' if stage_agent.get(field) else 'Off'})"
+                                           if option == "agent" and stage_agent else STAGE_EDIT_SPACE_OPTIONS[option])
+
                 st.segmented_control(
                     "Hold until I release it", list(STAGE_EDIT_SPACE_OPTIONS), key=f"{base}_hold_manual",
-                    format_func=STAGE_EDIT_SPACE_OPTIONS.get, on_change=set_stage_field,
+                    format_func=agents_setting("hold_manual"), on_change=set_stage_field,
                     args=(wid, sid, "hold_manual", f"{base}_hold_manual"),
                     help="**On:** what this stage's Agent sends waits in the outbox's held area until you press **Send "
                          "now**. **Off:** released after the review time. **Agent's setting:** as the Agent's own "
                          "switch says.")
                 st.segmented_control(
                     "Edit space", list(STAGE_EDIT_SPACE_OPTIONS), key=f"{base}_edit_space",
-                    format_func=STAGE_EDIT_SPACE_OPTIONS.get, on_change=set_stage_field,
+                    format_func=agents_setting("edit_space"), on_change=set_stage_field,
                     args=(wid, sid, "edit_space", f"{base}_edit_space"),
                     help="**On:** the Agent drafts into editable cards (or you write them) and nothing is sent until "
                          "**Send**; the workflow waits for it. **Off:** Execute stages and sends, as usual. **Agent's "
@@ -19217,6 +20478,7 @@ if not st.session_state.get("landing_page_chosen"):
 if st.session_state.pop(TRANSCRIPTION_CANCELLED_KEY, False):
     st.toast("Cancelled. Nothing was sent.", icon=":material/close:")
 install_task_notifier()  # before the pages split, so every page has it
+install_narrow_sidebar()
 if st.query_params.get("page") == CHAT_PAGE:
     render_chat_page()
     st.stop()
@@ -19781,6 +21043,7 @@ fold_search, fold_results = workflow_search_fold(safe_lib) if pick_ref is None e
 search_area = search_fold(fold_search, "Filter and Ask", ":material/filter_list:", "wf_fold_search")
 
 # Pick mode is one column: Filter box, the document being filled, then the results to add from.
+st.html(f"<style>{FILTER_ASK_NARROW_STYLE}</style>")
 with search_area:
     filter_box_col, ask_box_col = (st.container(), st.container()) if pick_ref is not None else st.columns(2, gap="medium")
 
@@ -19937,14 +21200,15 @@ with filter_box_col:
                         f"{_max_limit} (30 to start). **Ask (filtered only)** answers from at most "
                         f"{ASK_NOTES_LIMIT} notes; **Filter search only** lists up to the full number. Each "
                         "route's value is saved.")
-            result_limit = st.slider(
+            result_limit = st.number_input(
                 "Max results",
                 min_value=1,
                 max_value=_max_limit,
+                step=5,
                 key=_max_key,
                 on_change=persist_max_results,
                 args=(_max_key,),
-                width=240,
+                width=110,
                 label_visibility="collapsed",
             )
             result_limit = int(result_limit or saved_max_results(_max_key))
@@ -20063,7 +21327,8 @@ with filter_box_col:
 ollama_ok, installed_ollama_models = discover_ollama_models()
 ollama_model_options = installed_ollama_models if ollama_ok and installed_ollama_models else SUGGESTED_OLLAMA_MODELS
 default_ollama = corpus_config.get("ollama_model", DEFAULT_OLLAMA_MODEL)
-if ollama_ok and installed_ollama_models and default_ollama not in installed_ollama_models:
+if ollama_ok and installed_ollama_models and default_ollama not in installed_ollama_models \
+        and not cloud.is_cloud(default_ollama):  # a cloud model goes to the local fallback when it can't be used
     # The library's saved model isn't installed (any more): answer with one that is, and say so once.
     _missing = default_ollama
     _chat_model = load_app_settings().get(CHAT_MODEL_SETTING)
@@ -20230,6 +21495,15 @@ with ask_box_col:
                         f"Ollama is not reachable at `{OLLAMA_HOST}:{OLLAMA_PORT}`. "
                         "Run `./start_app.sh` or `ollama serve`, then `ollama pull llama3.2:3b`."
                     )
+                elif cloud.is_cloud(selected_ollama_model):
+                    _routed, _route_note = route_model(selected_ollama_model)
+                    if _route_note:  # Local models only, or offline: say who answers instead of asking for a pull
+                        st.info(_route_note.replace("Answered by", "Answers will come from", 1),
+                                icon=":material/cloud_off:")
+                    elif not claude_key_source() and cloud.parse(selected_ollama_model)[0] == "claude":
+                        st.warning(f"No Claude API key is set, so {cloud.describe(selected_ollama_model)} can't "
+                                   f"answer and the local fallback `{local_fallback_model()}` will. Add the key in "
+                                   "**Configure → Models and providers**.")
                 elif selected_ollama_model not in installed_ollama_models:
                     st.warning(
                         f"Model `{selected_ollama_model}` is not installed locally. "
